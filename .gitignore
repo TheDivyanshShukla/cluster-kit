@@ -1,2 +1,6 @@
 __pycache__
 .venv
+rust/target
+.playwright-mcp
+examples/primes
+examples/primes.exe

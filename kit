@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Cluster Kit launcher (Linux / macOS). Run `./kit help`.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+CK="$ROOT/rust/target/release/ck"
+
+usage() {
+  cat <<'EOF'
+Cluster Kit
+
+  ./kit setup [all|py|rs]      one-time install on this PC (default: all)
+
+  Python engine (Dask, dashboard :8787)
+  ./kit py head                master PC
+  ./kit py worker              every other PC (auto-discovers the head)
+  ./kit py status              who is connected
+  ./kit py bench               1 -> N PC scaling benchmark (CSV + chart)
+  ./kit py run examples/dask_sha256.py --n 1e7    run a Dask job script (see examples/)
+
+  Rust engine (raw TCP, dashboard :7702)
+  ./kit rs head [--gpu]        master PC (--gpu: SHA jobs on the GPU)
+  ./kit rs worker [--gpu]      every other PC
+  ./kit rs run --n 1e9 --sha 00000          built-in SHA-256 prefix search
+  ./kit rs run --n 1e8 --cmd examples/primes  any language: prog START END per chunk (see examples/)
+  ./kit rs ping --head IP                   round-trip latency
+  ./kit rs build               rebuild after changing rust/
+
+  ./kit fw-clean               remove leftover firewall rules (both engines)
+  ./kit tune [on|off]          low-latency network tuning (Linux; until reboot or "off")
+
+Options go after the command, e.g. ./kit py worker --head 192.168.1.10 --procs 4
+EOF
+}
+
+py() { uv --project "$ROOT/python" run "$@"; }  # runs from the repo root
+
+need_uv() { command -v uv >/dev/null || { echo "uv missing. Run: ./kit setup"; exit 1; }; }
+need_ck() { [ -x "$CK" ] || { echo "ck not built. Run: ./kit setup rs"; exit 1; }; }
+
+setup_py() {
+  if ! command -v uv >/dev/null; then
+    echo ">> Installing uv ..."
+    command -v curl >/dev/null || sudo apt-get install -y curl
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+  fi
+  echo ">> Installing Python $(cat python/.python-version) + packages ..."
+  (cd python && uv sync --frozen)
+  py python -c "import sys, dask; print(f'>> OK  Python {sys.version.split()[0]}  dask {dask.__version__}')"
+}
+
+setup_rs() {
+  if ! command -v cargo >/dev/null; then
+    echo ">> Installing Rust ..."
+    if command -v apt-get >/dev/null && ! command -v cc >/dev/null; then sudo apt-get install -y build-essential; fi
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+  fi
+  echo ">> Building ck (release) ..."
+  cargo build --release --manifest-path rust/Cargo.toml
+  echo ">> OK  $CK"
+}
+
+no_sleep() {
+  [ "$(uname)" = Linux ] || return 0
+  read -r -p ">> Disable sleep/suspend on this PC (recommended for the cluster)? [y/N] " a
+  if [[ "$a" =~ ^[Yy]$ ]]; then
+    sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+    echo "   Undo: sudo systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target"
+  fi
+}
+
+# Lower network latency: interrupt coalescing off, socket busy-polling, CPU at full clock.
+# Originals are saved and put back by `tune off`; nothing survives a reboot.
+tune() {
+  [ "$(uname)" = Linux ] || { echo "kit tune is for Linux (on Windows: kit tune in kit.bat)"; exit 1; }
+  local nic save="$HOME/.cache/kit-tune"
+  nic=$(ip route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1)}')
+  if [ "${1:-on}" = on ]; then
+    mkdir -p "$(dirname "$save")"
+    { ethtool -c "$nic" 2>/dev/null | awk '/^Adaptive RX/ {print "adaptive-rx", $3} /^rx-usecs:/ {print "rx-usecs", $2}'
+      echo "busy_read $(sysctl -n net.core.busy_read)"; echo "busy_poll $(sysctl -n net.core.busy_poll)"
+      echo "governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"; } > "$save"
+    sudo ethtool -C "$nic" adaptive-rx off rx-usecs 0 || echo "   $nic does not support coalescing changes, skipped"
+    sudo sysctl -qw net.core.busy_read=50 net.core.busy_poll=50
+    for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -e "$g" ] && echo performance | sudo tee "$g" >/dev/null; done
+    echo ">> Tuned $nic. Undo: ./kit tune off (or reboot)"
+  else
+    [ -f "$save" ] || { echo "nothing to undo"; exit 0; }
+    val() { awk -v k="$1" '$1 == k {print $2}' "$save"; }
+    [ -n "$(val rx-usecs)" ] && sudo ethtool -C "$nic" adaptive-rx "$(val adaptive-rx)" rx-usecs "$(val rx-usecs)"
+    sudo sysctl -qw net.core.busy_read="$(val busy_read)" net.core.busy_poll="$(val busy_poll)"
+    if [ -n "$(val governor)" ]; then
+      for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -e "$g" ] && echo "$(val governor)" | sudo tee "$g" >/dev/null; done
+    fi
+    rm -f "$save"; echo ">> Restored $nic settings"
+  fi
+}
+
+engine="${1:-help}"; cmd="${2:-}"
+shift $(( $# < 2 ? $# : 2 ))
+
+case "$engine" in
+  setup)
+    case "${cmd:-all}" in
+      py) setup_py ;;
+      rs) setup_py; setup_rs ;;  # rs uses the Python env for firewall handling
+      all) setup_py; setup_rs ;;
+      *) usage; exit 1 ;;
+    esac
+    no_sleep
+    echo ">> Done. Head PC: ./kit py head  (or rs)   Other PCs: ./kit py worker  (or rs)" ;;
+  py)
+    need_uv
+    case "$cmd" in
+      head|worker|status|bench|fw-clean) py python/cluster.py "$cmd" "$@" ;;
+      run) py "$@" ;;
+      *) usage; exit 1 ;;
+    esac ;;
+  rs)
+    case "$cmd" in
+      build) cargo build --release --manifest-path rust/Cargo.toml ;;
+      head) need_uv; need_ck; py python/cluster.py fwrun --role ck-head --tcp 7700,7702 -- "$CK" head "$@" ;;
+      worker) need_uv; need_ck; py python/cluster.py fwrun --role ck-worker --udp 7701 -- "$CK" worker "$@" ;;
+      run|ping) need_ck; exec "$CK" "$cmd" "$@" ;;
+      *) usage; exit 1 ;;
+    esac ;;
+  fw-clean) need_uv; py python/cluster.py fw-clean ;;
+  tune) tune "${cmd:-on}" ;;
+  *) usage ;;
+esac

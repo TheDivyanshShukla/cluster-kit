@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cluster Kit</title>
+<style>
+  :root { --bg: #f7f7f5; --fg: #1c1c1a; --mut: #6b6b66; --line: #e2e2dc; --acc: #2f6fde; --ok: #1f9d55; --card: #ffffff; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #151514; --fg: #ecece8; --mut: #9a9a93; --line: #2c2c29; --acc: #6b9cf5; --ok: #3fc07a; --card: #1c1c1a; } }
+  body { margin: 0; padding: 24px 16px; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 960px; margin: auto; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 13px; font-weight: 500; color: var(--mut); margin: 20px 0 6px; }
+  .muted { color: var(--mut); }
+  .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 8px 0; }
+  .bar > div { height: 100%; background: var(--acc); width: 0; transition: width .3s; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 16px 0; }
+  .tile, .panel { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--card); }
+  .tile b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--mut); font-weight: 500; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+  .busy { box-shadow: 0 0 0 2px var(--ok); }
+  .switch { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; color: var(--mut); }
+  .switch input { appearance: none; width: 34px; height: 20px; border-radius: 10px; background: var(--line); position: relative; cursor: pointer; margin: 0; transition: background .2s; }
+  .switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .2s; }
+  .switch input:checked { background: var(--acc); }
+  .switch input:checked::after { transform: translateX(14px); }
+  .switch input:focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+  svg { display: block; width: 100%; }
+  svg text { fill: var(--mut); font: 11px system-ui, sans-serif; }
+  .grid { stroke: var(--line); }
+  .meter { display: inline-block; width: 60px; height: 6px; background: var(--line); border-radius: 3px; vertical-align: middle; margin-left: 6px; overflow: hidden; }
+  .meter > i { display: block; height: 100%; background: var(--acc); }
+  body:not(.detail) .d { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Cluster Kit</h1>
+    <label class="switch">Details <input type="checkbox" id="detail" aria-label="Show details: task stream, rate chart, CPU and memory"></label>
+  </header>
+  <div id="job" class="muted">connecting…</div>
+  <div class="bar"><div id="prog"></div></div>
+  <div class="tiles">
+    <div class="tile"><span class="muted">PCs</span><b id="pcs">0</b></div>
+    <div class="tile"><span class="muted">Threads</span><b id="thr">0</b></div>
+    <div class="tile"><span class="muted">Cluster rate</span><b id="rate">0</b></div>
+  </div>
+
+  <section class="d">
+    <h2>Cluster rate, last 60 s (numbers/s)</h2>
+    <div class="panel"><svg id="chart" viewBox="0 0 900 140" preserveAspectRatio="none" role="img" aria-label="Cluster rate over the last 60 seconds"></svg></div>
+    <h2>Task stream, last 30 s (one bar per finished chunk)</h2>
+    <div class="panel"><svg id="stream" role="img" aria-label="Finished chunks per worker over the last 30 seconds"></svg></div>
+    <h2>Workers</h2>
+  </section>
+
+  <div class="wrap">
+    <table>
+      <thead><tr><th>Worker</th><th>Threads</th><th>Chunks</th><th>Numbers</th><th>Last rate</th><th class="d">CPU</th><th class="d">Memory</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+</main>
+<script>
+const COLORS = ['#2f6fde', '#e8743b', '#19a979', '#945ecf', '#ed4a7b', '#13a4b4', '#d4a017', '#6c8893'];
+const fmt = n => n >= 1e9 ? (n / 1e9).toFixed(2) + 'G' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(Math.round(n));
+const gb = b => (b / 2 ** 30).toFixed(1);
+const $ = id => document.getElementById(id);
+let dupes = new Set(); // addresses with more than one worker get a #id suffix
+const name = w => (w.addr === '127.0.0.1' ? 'head (local)' : w.addr) + (dupes.has(w.addr) ? ' #' + w.id : '');
+const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+
+const toggle = $('detail');
+toggle.checked = store.get('ck-detail') === '1';
+document.body.classList.toggle('detail', toggle.checked);
+toggle.onchange = () => { store.set('ck-detail', toggle.checked ? '1' : '0'); document.body.classList.toggle('detail', toggle.checked); };
+
+let hist = []; // [now, total numbers done]
+const color = {}; // worker id -> colour, stable for the session
+const colorOf = id => color[id] ??= COLORS[Object.keys(color).length % COLORS.length];
+
+function drawChart(now) {
+  const pts = hist.filter(h => h[0] > now - 62);
+  const rates = [];
+  for (let i = 1; i < pts.length; i++) {
+    const j = pts.findIndex(p => p[0] >= pts[i][0] - 2); // 2 s smoothing window
+    const dt = pts[i][0] - pts[j][0];
+    rates.push([pts[i][0], dt > 0 ? (pts[i][1] - pts[j][1]) / dt : 0]);
+  }
+  const max = Math.max(1, ...rates.map(r => r[1]));
+  const x = t => 900 * (1 - (now - t) / 60), y = v => 130 - 115 * v / max;
+  const line = rates.map(r => `${x(r[0]).toFixed(1)},${y(r[1]).toFixed(1)}`).join(' ');
+  $('chart').innerHTML =
+    `<line class="grid" x1="0" x2="900" y1="130" y2="130"/><line class="grid" x1="0" x2="900" y1="15" y2="15"/>` +
+    `<text x="4" y="12">${fmt(max)}/s</text>` +
+    (line ? `<polyline points="${line}" fill="none" stroke="var(--acc)" stroke-width="2" vector-effect="non-scaling-stroke"/>` : '');
+}
+
+function drawStream(now, workers, events) {
+  const W = 900, row = 22, left = 110, win = 30;
+  const svg = $('stream');
+  svg.setAttribute('viewBox', `0 0 ${W} ${Math.max(1, workers.length) * row + 18}`);
+  const x = t => left + (W - left) * (1 - (now - t) / win);
+  let out = '';
+  workers.forEach((w, i) => {
+    out += `<text x="0" y="${i * row + 15}">${name(w)}</text><line class="grid" x1="${left}" x2="${W}" y1="${i * row + row}" y2="${i * row + row}"/>`;
+  });
+  const idx = Object.fromEntries(workers.map((w, i) => [w.id, i]));
+  for (const [id, a, b] of events) {
+    if (b < now - win || idx[id] === undefined) continue;
+    const x0 = Math.max(left, x(a)), x1 = Math.max(x0 + 1, x(b) - 1);
+    out += `<rect x="${x0.toFixed(1)}" y="${idx[id] * row + 4}" width="${(x1 - x0).toFixed(1)}" height="${row - 8}" rx="2" fill="${colorOf(id)}"/>`;
+  }
+  out += `<text x="${left}" y="${workers.length * row + 14}">-30 s</text><text x="${W - 24}" y="${workers.length * row + 14}">now</text>`;
+  svg.innerHTML = out;
+}
+
+async function tick() {
+  try {
+    const detail = toggle.checked;
+    const s = await (await fetch(detail ? '/stats?detail=1' : '/stats')).json();
+    const w = s.workers.sort((a, b) => a.addr.localeCompare(b.addr, undefined, { numeric: true }));
+    dupes = new Set(w.filter((x, i) => w.findIndex(y => y.addr === x.addr) !== i).map(x => x.addr));
+    $('pcs').textContent = w.length;
+    $('thr').textContent = w.reduce((t, x) => t + x.threads, 0);
+    $('rate').textContent = fmt(w.reduce((t, x) => t + (x.busy ? x.rate : 0), 0)) + '/s';
+    const j = s.job;
+    $('job').textContent = j
+      ? `Job ${j.id} (${j.kind}): ${fmt(j.done)} / ${fmt(j.total)} · ${j.secs.toFixed(1)}s · ${fmt(j.done / Math.max(j.secs, 1e-3))}/s`
+      : (s.last ? 'Idle. Last: ' + s.last : 'Idle. Submit a job with: ck run --n 1e9 --sha 00000');
+    $('prog').style.width = j ? (100 * j.done / j.total) + '%' : '0';
+    $('rows').innerHTML = w.map(x => `<tr>
+      <td><span class="dot ${x.busy ? 'busy' : ''}" style="background:${colorOf(x.id)}"></span>${name(x)}</td>
+      <td>${x.threads}</td><td>${x.chunks}</td><td>${fmt(x.numbers)}</td><td>${fmt(x.rate)}/s</td>
+      <td class="d">${x.cpu.toFixed(0)}%<span class="meter"><i style="width:${Math.min(100, x.cpu)}%"></i></span></td>
+      <td class="d">${x.mem_total ? gb(x.mem_used) + ' / ' + gb(x.mem_total) + ' GB' : '-'}</td></tr>`).join('');
+    hist.push([s.now, w.reduce((t, x) => t + x.numbers, 0)]);
+    hist = hist.filter(h => h[0] > s.now - 65);
+    if (detail) { drawChart(s.now); drawStream(s.now, w, s.events || []); }
+  } catch { $('job').textContent = 'Head not reachable'; }
+  setTimeout(tick, 500);
+}
+tick();
+</script>
+</body>
+</html>

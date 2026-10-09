@@ -1,16 +1,19 @@
-"""Example custom job: SHA-256 every number in 1..N across the cluster.
+"""Dask engine example: SHA-256 every number in 1..N across the cluster.
 
-Run on the head PC while head + workers are up:
-    uv run job.py                     # 1..1,000,000, Dask spreads chunks over all PCs
-    uv run job.py --n 5e7 --chunk 1e6
-    uv run job.py --pin               # PC 1 gets range 1, PC 2 range 2, ... (manual split)
+Run on the head PC while `kit py head` + workers are up:
+    ./kit py run examples/dask_sha256.py                  # 1..1,000,000, Dask spreads chunks over all PCs
+    ./kit py run examples/dask_sha256.py --n 5e7 --chunk 1e6
+    ./kit py run examples/dask_sha256.py --pin            # PC 1 gets range 1, PC 2 range 2, ... (manual split)
 """
 import argparse
+import sys
 import time
+from pathlib import Path
 
 from distributed import Client
 
-from cluster import SCHED_PORT, host_table
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+from cluster import SCHED_PORT, host_table  # noqa: E402
 
 
 def hash_range(start: int, end: int, prefix: str) -> list[tuple[int, str]]:

@@ -6,6 +6,8 @@ pc-cluster: turn ordinary Windows/Ubuntu PCs on one LAN into a Dask cluster.
   uv run cluster.py status      # who is connected
   uv run cluster.py bench       # 1 -> N PC scaling benchmark (run on the head)
   uv run cluster.py fw-clean    # remove any leftover firewall rules
+  uv run cluster.py fwrun --role ck-head --tcp 7700,7702 -- ck head
+                                # open ports, run any program, close ports when it exits
 
 Firewall ports are opened only while head/worker runs and are closed again on
 Ctrl+C, window close, logoff/shutdown, kill (SIGTERM/SIGHUP) or normal exit.
@@ -35,6 +37,7 @@ DISC_PORT = 8785          # UDP discovery beacon
 WORKER_PORTS = "9000:9100"
 NANNY_PORTS = "9101:9200"
 RULE_TAG = "daskcluster"  # every firewall rule we create carries this tag
+ROLES = ("head", "worker", "ck-head", "ck-worker")  # rule groups fw-clean removes
 MAGIC = "pc-cluster/1"
 IS_WIN = os.name == "nt"
 
@@ -138,10 +141,17 @@ def run_cleanup(reason: str = "exit", firewall_first: bool = False) -> None:
 def install_exit_handlers() -> None:
     atexit.register(run_cleanup, "exit")
 
-    def to_interrupt(signum, _frame):
-        raise KeyboardInterrupt(f"signal {signum}")
+    stopping = False
 
-    signal.signal(signal.SIGINT, signal.default_int_handler)  # Ctrl+C, even if inherited as ignored
+    def to_interrupt(signum, _frame):
+        # Interrupt only once: a second Ctrl+C / SIGTERM (uv forwards them too) must not
+        # abort run_cleanup halfway and orphan the scheduler and workers.
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            raise KeyboardInterrupt(f"signal {signum}")
+
+    signal.signal(signal.SIGINT, to_interrupt)  # Ctrl+C, even if inherited as ignored
     signal.signal(signal.SIGTERM, to_interrupt)
     if hasattr(signal, "SIGHUP"):            # terminal closed (Linux)
         signal.signal(signal.SIGHUP, to_interrupt)
@@ -205,8 +215,10 @@ class _RootShell:
 
 
 class Firewall:
-    def __init__(self, enabled: bool, rules: list[tuple[str, str]], subnet: str, role: str) -> None:
+    def __init__(self, enabled: bool, rules: list[tuple[str, str]], subnet: str, role: str,
+                 exes: tuple[str, ...] = ()) -> None:
         self.rules = rules          # [(proto, "8786:8787"), ...]
+        self.exes = exes            # extra programs whose Windows BLOCK rules get removed
         self.tag = f"{RULE_TAG}-{role}"   # e.g. daskcluster-head; fw-clean matches every role
         self.subnet = subnet
         self.backend = None
@@ -242,7 +254,7 @@ class Firewall:
     def remove_tagged(self, tag: str | None = None) -> None:
         tag = tag or self.tag
         if self.backend == "windows":
-            groups = [f"{RULE_TAG}-head", f"{RULE_TAG}-worker"] if tag == RULE_TAG else [tag]
+            groups = [f"{RULE_TAG}-{r}" for r in ROLES] if tag == RULE_TAG else [tag]
             for g in groups:  # exact -Group lookup is fast (matters: window-close gives us ~5 s)
                 self._ps(f"Get-NetFirewallRule -Group '{g}' -ErrorAction SilentlyContinue "
                          f"| Remove-NetFirewallRule")
@@ -259,7 +271,7 @@ class Firewall:
         self.remove_tagged()  # stale rules from a crash / power cut
         if self.backend == "windows":
             # Dismissing Windows' "allow Python?" popup creates BLOCK rules that beat any allow rule.
-            exes = {sys.executable, getattr(sys, "_base_executable", sys.executable)}
+            exes = {sys.executable, getattr(sys, "_base_executable", sys.executable), *self.exes}
             for exe in exes:
                 self._ps(f"Get-NetFirewallApplicationFilter -Program '{exe}' -ErrorAction SilentlyContinue "
                          f"| Get-NetFirewallRule | Where-Object Action -eq 'Block' | Remove-NetFirewallRule")
@@ -286,9 +298,10 @@ class Firewall:
             self.sh.close()
 
 
-def setup_firewall(args, rules: list[tuple[str, str]], local_ip: str) -> None:
+def setup_firewall(args, rules: list[tuple[str, str]], local_ip: str, role: str | None = None,
+                   exes: tuple[str, ...] = ()) -> None:
     global _firewall
-    _firewall = Firewall(not args.no_firewall, rules, subnet_of(local_ip), args.cmd)
+    _firewall = Firewall(not args.no_firewall, rules, subnet_of(local_ip), role or args.cmd, exes)
     _firewall.open()
 
 
@@ -528,6 +541,18 @@ def plot(summary: list[dict], max_nodes: int) -> None:
     fig.savefig("scaling.png", dpi=150)
 
 
+def cmd_fwrun(args) -> None:
+    """Open ports, run another engine's program (e.g. the Rust `ck`), close ports when it exits."""
+    cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not cmd:
+        sys.exit("fwrun: give the program to run after --")
+    rules = [(proto, p.strip().replace("-", ":")) for proto, ports in (("tcp", args.tcp), ("udp", args.udp))
+             for p in ports.split(",") if p.strip()]
+    exe = shutil.which(cmd[0]) or os.path.abspath(cmd[0])
+    setup_firewall(args, rules, primary_ip(), args.role, (exe,))
+    sys.exit(spawn(cmd).wait())
+
+
 def cmd_fw_clean(args) -> None:
     global _firewall
     _firewall = Firewall(True, [], "0.0.0.0/0", "clean")
@@ -541,21 +566,25 @@ def cmd_fw_clean(args) -> None:
 
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    common = argparse.ArgumentParser(add_help=False)  # accepted after any subcommand
+    common.add_argument("--name", default="lab", help="cluster name (lets several clusters share a LAN)")
+    common.add_argument("--no-firewall", action="store_true", help="don't touch firewall rules")
     ap = argparse.ArgumentParser(description="4-PC Dask cluster toolkit")
-    ap.add_argument("--name", default="lab", help="cluster name (lets several clusters share a LAN)")
-    ap.add_argument("--no-firewall", action="store_true", help="don't touch firewall rules")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    h = sub.add_parser("head", help="run scheduler + beacon (+ local worker)")
+    def add(name: str, **kw) -> argparse.ArgumentParser:
+        return sub.add_parser(name, parents=[common], **kw)
+
+    h = add("head", help="run scheduler + beacon (+ local worker)")
     h.add_argument("--no-local-worker", action="store_true", help="head only schedules, no compute")
     h.add_argument("--procs", type=int, help="worker processes on this PC (default: physical cores)")
 
-    w = sub.add_parser("worker", help="auto-discover the head and join")
+    w = add("worker", help="auto-discover the head and join")
     w.add_argument("--head", help="skip discovery and use this head IP")
     w.add_argument("--procs", type=int, help="worker processes on this PC (default: physical cores)")
 
     for name in ("status", "bench"):
-        p = sub.add_parser(name)
+        p = add(name)
         p.add_argument("--scheduler", default=f"tcp://127.0.0.1:{SCHED_PORT}")
     b = sub.choices["bench"]
     b.add_argument("--total", nargs="+", type=float, default=[2e7, 1e8],
@@ -564,18 +593,25 @@ def main() -> None:
     b.add_argument("--repeats", type=int, default=3)
     b.add_argument("--max-nodes", type=int, help="limit the scaling test to N PCs")
 
-    sub.add_parser("fw-clean", help="remove leftover firewall rules")
+    add("fw-clean", help="remove leftover firewall rules")
+
+    f = add("fwrun", help="open ports, run a program, close ports when it exits")
+    f.add_argument("--role", required=True, help="rule tag, e.g. ck-head")
+    f.add_argument("--tcp", default="", help="comma-separated ports or ranges, e.g. 7700,9000-9100")
+    f.add_argument("--udp", default="")
+    f.add_argument("command", nargs=argparse.REMAINDER, help="-- program args...")
 
     args = ap.parse_args()
-    if args.cmd in ("head", "worker"):
+    long_running = args.cmd in ("head", "worker", "fwrun")
+    if long_running:
         install_exit_handlers()
     try:
-        {"head": cmd_head, "worker": cmd_worker, "status": cmd_status,
-         "bench": cmd_bench, "fw-clean": cmd_fw_clean}[args.cmd](args)
+        {"head": cmd_head, "worker": cmd_worker, "status": cmd_status, "bench": cmd_bench,
+         "fw-clean": cmd_fw_clean, "fwrun": cmd_fwrun}[args.cmd](args)
     except KeyboardInterrupt:
         pass
     finally:
-        if args.cmd in ("head", "worker"):
+        if long_running:
             run_cleanup("stopped")
 
 
