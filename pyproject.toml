@@ -1,0 +1,15 @@
+[project]
+name = "pc-cluster"
+version = "1.0.0"
+description = "4-PC Dask cluster with auto-discovery, auto firewall and a scaling benchmark"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "dask[distributed]==2026.8.0",
+    "bokeh==3.10.0",
+    "matplotlib>=3.9",
+]
+
+[tool.uv]
+# Every PC gets the exact same uv-managed Python, never a random system one.
+python-preference = "only-managed"
+package = false
