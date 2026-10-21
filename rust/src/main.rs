@@ -2,7 +2,7 @@
 //!
 //!   ck head   [--name lab] [--threads N] [--no-local-worker] [--spin] [--gpu]
 //!   ck worker [--name lab] [--threads N] [--head IP] [--spin] [--gpu]
-//!   ck run    [--head IP] --n 1e9 [--from 1] [--chunk 1e7] (--sha PREFIX | --cmd "prog")
+//!   ck run    [--head IP] --n 1e9 [--from 1] [--chunk 1e7] [--only IP,IP] (--sha PREFIX | --cmd "prog")
 //!   ck ping   [--head IP] [--count 10000] [--size 8] [--spin]   (round-trip latency / throughput)
 //!
 //! Workers pull chunks over one persistent TCP connection and keep PIPELINE chunks in
@@ -40,7 +40,7 @@ const REQ: u8 = 3; // worker -> head: give me a chunk
 const TASK: u8 = 4; // head -> worker: job, start, end, kind u8, arg
 const RESULT: u8 = 5; // worker -> head: job, start, end, cpu x10, mem used, mem total, compute us, body (also requests the next chunk)
 const RESULT_HDR: usize = 56;
-const SUBMIT: u8 = 6; // client -> head: start, end, chunk, kind u8, arg
+const SUBMIT: u8 = 6; // client -> head: start, end, chunk, kind u8, only len u8, only (worker IPs, comma-separated), arg
 const PART: u8 = 7; // head -> client: start, end, body
 const DONE: u8 = 8; // head -> client
 const PING: u8 = 9;
@@ -239,6 +239,7 @@ struct Job {
     total: u64,
     left: u64,
     requeue: Vec<(u64, u64)>, // chunks of workers that disconnected mid-chunk
+    only: Vec<String>,        // worker addresses allowed to take chunks; empty = all
     out: mpsc::Sender<(u8, Vec<u8>)>,
     started: Instant,
 }
@@ -249,6 +250,7 @@ struct Worker {
     threads: u32,
     chunks: u64,
     numbers: u64,
+    secs: f64, // total compute time, so a client can diff it around a job
     rate: f64,
     inflight: Vec<(u64, u64, u64)>, // (job, start, end) sent and not yet returned
     out: Option<Arc<Mutex<Sock>>>,  // writer shared by the feeder (TASK) and cancel (CANCEL)
@@ -273,7 +275,11 @@ fn now() -> f64 {
 
 type Shared = Arc<(Mutex<State>, Condvar)>;
 
-fn take(st: &mut State) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
+fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
+    let j = st.job.as_ref()?;
+    if !j.only.is_empty() && !st.workers.get(&wid).is_some_and(|w| j.only.contains(&w.addr)) {
+        return None;
+    }
     let j = st.job.as_mut()?;
     let (a, b) = match j.requeue.pop() {
         Some(r) => r,
@@ -297,6 +303,7 @@ fn finish(sh: &Shared, wid: u64, p: &[u8]) -> io::Result<()> {
     if let Some(w) = st.workers.get_mut(&wid) {
         w.chunks += 1;
         w.numbers += b - a;
+        w.secs += secs;
         w.rate = (b - a) as f64 / secs.max(1e-9);
         w.inflight.retain(|&t| t != (job, a, b));
         (w.cpu, w.mem_used, w.mem_total) = (cpu as f64 / 10.0, mem_used, mem_total);
@@ -370,7 +377,7 @@ fn feed(w: Arc<Mutex<Sock>>, sh: &Shared, wid: u64, credits: mpsc::Receiver<()>)
                 if !st.workers.contains_key(&wid) {
                     return; // disconnected; the reader already requeued our chunks
                 }
-                if let Some(t) = take(&mut st) {
+                if let Some(t) = take(&mut st, wid) {
                     st.workers.get_mut(&wid).unwrap().inflight.push((t.0, t.1, t.2));
                     break t;
                 }
@@ -418,7 +425,11 @@ fn serve_client(s: TcpStream, sh: Shared) -> io::Result<()> {
 
 fn run_job(mut r: BufReader<Sock>, mut s: Sock, sh: &Shared, p: &[u8]) -> io::Result<()> {
     let (from, end, chunk) = (u64_at(p, 0)?, u64_at(p, 8)?, u64_at(p, 16)?);
-    let (kind, arg) = (*p.get(24).unwrap_or(&KIND_SHA), p.get(25..).unwrap_or(&[]).to_vec());
+    let kind = *p.get(24).unwrap_or(&KIND_SHA);
+    let olen = *p.get(25).unwrap_or(&0) as usize;
+    let only: Vec<String> = String::from_utf8_lossy(p.get(26..26 + olen).unwrap_or(&[]))
+        .split(',').filter(|a| !a.is_empty()).map(String::from).collect();
+    let arg = p.get(26 + olen..).unwrap_or(&[]).to_vec();
     let total = end.saturating_sub(from);
     if total == 0 {
         return send(&mut s, DONE, &[]);
@@ -429,13 +440,18 @@ fn run_job(mut r: BufReader<Sock>, mut s: Sock, sh: &Shared, p: &[u8]) -> io::Re
         if st.job.is_some() {
             return send(&mut s, ERR, b"a job is already running");
         }
-        let pcs = st.workers.len().max(1) as u64;
+        // ponytail: if every --only worker disconnects mid-job, the job waits; Ctrl+C cancels it
+        let pcs = if only.is_empty() { st.workers.len() } else { st.workers.values().filter(|w| only.contains(&w.addr)).count() };
+        if pcs == 0 {
+            return send(&mut s, ERR, b"no connected worker matches --only");
+        }
+        let pcs = pcs as u64;
         // ~16 chunks per PC for load balancing, capped so cancel / the next job waits under a second
         let chunk = if chunk > 0 { chunk } else { (total / (pcs * 16)).clamp(10_000, 20_000_000) };
         st.next_id += 1;
         let id = st.next_id;
         println!("job {id}: {total} numbers, chunk {chunk}, {pcs} workers");
-        st.job = Some(Job { id, kind, arg, next: from, end, chunk, total, left: total, requeue: vec![], out: tx, started: Instant::now() });
+        st.job = Some(Job { id, kind, arg, next: from, end, chunk, total, left: total, requeue: vec![], only, out: tx, started: Instant::now() });
         sh.1.notify_all();
         id
     };
@@ -641,8 +657,14 @@ fn run(o: &Opts) {
     };
     let end = o.from.checked_add(o.n).unwrap_or_else(|| die("--from + --n overflows"));
     let (mut r, mut s) = connect_client(o);
+    let only = o.only.as_deref().unwrap_or("");
+    if only.len() > 255 {
+        die("--only list is longer than 255 characters");
+    }
     let mut p = pack(&[o.from, end, o.chunk]);
     p.push(kind);
+    p.push(only.len() as u8);
+    p.extend_from_slice(only.as_bytes());
     p.extend_from_slice(&arg);
     let t = Instant::now();
     send(&mut s, SUBMIT, &p).unwrap();
@@ -723,8 +745,8 @@ fn stats(sh: &Shared, detail: bool) -> String {
         .iter()
         .map(|(id, w)| {
             format!(
-                r#"{{"id":{id},"addr":"{}","threads":{},"chunks":{},"numbers":{},"rate":{:.0},"busy":{},"cpu":{:.1},"mem_used":{},"mem_total":{}}}"#,
-                w.addr, w.threads, w.chunks, w.numbers, w.rate, !w.inflight.is_empty(), w.cpu, w.mem_used, w.mem_total
+                r#"{{"id":{id},"addr":"{}","threads":{},"chunks":{},"numbers":{},"secs":{:.6},"rate":{:.0},"busy":{},"cpu":{:.1},"mem_used":{},"mem_total":{}}}"#,
+                w.addr, w.threads, w.chunks, w.numbers, w.secs, w.rate, !w.inflight.is_empty(), w.cpu, w.mem_used, w.mem_total
             )
         })
         .collect();
@@ -749,6 +771,7 @@ struct Opts {
     chunk: u64,
     sha: Option<String>,
     cmd: Option<String>,
+    only: Option<String>,
     count: usize,
     size: usize,
     spin: bool,
@@ -778,6 +801,7 @@ fn main() {
         chunk: 0,
         sha: None,
         cmd: None,
+        only: None,
         count: 10_000,
         size: 8,
         spin: false,
@@ -796,6 +820,7 @@ fn main() {
             "--chunk" => o.chunk = num(args.next()),
             "--sha" => o.sha = args.next(),
             "--cmd" => o.cmd = args.next(),
+            "--only" => o.only = args.next(),
             "--size" => o.size = num(args.next()).min(MAX_FRAME as u64) as usize,
             "--count" => o.count = num(args.next()).max(1) as usize,
             _ => die(&format!("unknown option {a}")),

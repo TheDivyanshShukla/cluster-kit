@@ -45,7 +45,7 @@ Copy or clone this folder to every PC, then:
 | Other PCs | `kit py worker` | `kit rs worker` (add `--gpu` to hash on the GPU) |
 | Check | `kit py status` | dashboard (has a Details toggle) |
 | Work | `kit py run examples/dask_sha256.py` | `kit rs run --n 1e9 --sha 00000` |
-| Benchmark | `kit py bench` | `kit rs ping --head HEAD_IP` |
+| Benchmark | `kit py bench` | `kit rs ping --head HEAD_IP`, `kit py run examples/sha_bench.py` (see [docs/BENCHMARK.md](docs/BENCHMARK.md)) |
 
 On Linux and macOS, write `./kit` instead of `kit`. Stop anything with Ctrl+C or by closing the window, and the ports close automatically.
 
@@ -61,7 +61,7 @@ py run     <script.py> [its args]     runs a script in the cluster's Python env
 
 rs head    --threads N  --no-local-worker  --name lab  --gpu  --spin
 rs worker  --head 192.168.1.10  --threads N  --name lab  --gpu  --spin
-rs run     --n 1e9  --from 1  --chunk 2e7  (--sha PREFIX | --cmd "prog")
+rs run     --n 1e9  --from 1  --chunk 2e7  --only IP,IP  (--sha PREFIX | --cmd "prog")
 rs ping    --head IP  --count 10000  --size 8  --spin
 
 tune       on | off       low-latency network settings (Linux, Windows); reverts on "off" or reboot
