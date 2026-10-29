@@ -47,7 +47,8 @@ Before going on stage:
 - Accuracy so far is a small check: 24 sampled MEVA frames, one annotator, 19 usable: 13 of 17 people found, no false detections. Misses were partly visible people and tiny figures far down a hallway. Models are marked "unvalidated".
 - Capture clocks of the MEVA clips are unknown to Watch, so lanes align by media time (the cameras were recording the same hour), and "align UTC" is not available.
 - Confidence is the detector's score, not a probability of being correct.
-- Fight and Weapon rules are off: there is no model behind them.\n- The cameras are recorded footage replayed as live cameras; say so if asked. Because the footage was analysed in advance, replays do not raise new alerts.
+- Fight and Weapon rules are off: there is no model behind them.
+- The cameras are recorded footage replayed as live cameras; say so if asked. Because the footage was analysed in advance, replays do not raise new alerts.
 
 ## If something goes wrong
 
