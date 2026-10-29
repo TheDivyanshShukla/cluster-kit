@@ -81,6 +81,7 @@ function errorRange(msg, text) {
   return null;
 }
 const SNIPS = {
+  sqlv1: [["Snippets…", ""], ["Persons above confidence", "SELECT * FROM detections\nWHERE class = 'person' AND confidence >= 0.5\nLIMIT 100"], ["People or cars, confident", "SELECT * FROM detections\nWHERE class IN ('person', 'car')\n  AND confidence >= 0.6\nLIMIT 100"], ["Distinct person tracks", "SELECT COUNT(DISTINCT track_id) FROM detections\nWHERE class = 'person'"], ["Frames with 5+ people", "SELECT * FROM frames\nWHERE people_count >= 5\nORDER BY media_time_us\nLIMIT 100"], ["Phones near people", "SELECT * FROM relations\nWHERE predicate = 'near' AND object_class = 'cell phone'\nLIMIT 100"]],
   sql: [["Snippets…", ""], ["Phones", "SELECT * FROM {t}\nWHERE class = 'cell phone'\nLIMIT 50"], ["People or cars, confident", "SELECT * FROM {t}\nWHERE class IN ('person', 'car')\n  AND confidence >= 0.6\nLIMIT 100"], ["Count by camera (aggregation)", "SELECT COUNT(*) FROM {t}\nWHERE class = 'person'\nGROUP BY camera_id"], ["Phones near a person", "SELECT * FROM {t}\nWHERE class = 'cell phone' AND near_person = true\nLIMIT 50"]],
   lua: [["Snippets…", ""], ["Loop: people sharing a frame with a phone", "-- evidence rows: person detections in frames that also have a phone\nlocal phones = collect(db.detections{class = 'cell phone', min_confidence = 0.5})\nfor p in db.detections{class = 'person'} do\n  for _, ph in ipairs(phones) do\n    if ph.observation_id == p.observation_id then emit(p) emit(ph) end\n  end\nend"], ["Per-frame ratio (needs a Holding model)", "-- frames where >= 20% of people hold a phone\nfor f in db.frames{} do\n  local p, h = f.counts.person, f.relations['holding:cell phone']\n  if p and h and p > 0 and h / p >= 0.2 then emit(f) end\nend"], ["Distinct tracks, aggregate only", "-- person tracks longer than 10 s; returns values, no evidence windows\nlocal n = 0\nfor t in db.tracks{class = 'person'} do\n  if t.end_us - t.start_us > 10000000 then n = n + 1 emit(t) end\nend\nreturn {long_tracks = n}"], ["Count and distinct", "-- how many person detections, how many distinct tracks\nlocal rows = collect(db.detections{class = 'person', min_confidence = 0.5})\nfor _, r in ipairs(rows) do emit(r) end\nreturn {observations = count(rows), tracks = distinct(rows, 'track_id')}"]]
 };
@@ -136,14 +137,14 @@ function setMode(m) {
   $("mode-words").classList.toggle("hide", m !== "words");
   $("mode-template").classList.toggle("hide", m !== "template");
   $("classic-note").classList.toggle("hide", !CLASSIC.includes(m));
-  const sn = SNIPS[m === "lua" ? "lua" : "sql"];
+  const sn = SNIPS[m === "lua" ? "lua" : api ? "sqlv1" : "sql"];
   $("run-classic").classList.toggle("hide", m !== "lua");
   $("snip").innerHTML = sn.map((s, i) => `<option value="${i}">${esc(s[0])}</option>`).join(""); $("snip").disabled = !(sqlish || m === "lua");
   paintTime(); paintHelp(); regen(); paintSqlState();
   V.clear($("find-err")); edSql.setError(null); edLua.setError(null);
 }
 $("snip").onchange = () => {
-  const m = mode === "lua" ? "lua" : "sql", s = SNIPS[m][Number($("snip").value)]; if (!s || !s[1]) return;
+  const m = mode === "lua" ? "lua" : "sql", s = SNIPS[m === "lua" ? "lua" : api ? "sqlv1" : "sql"][Number($("snip").value)]; if (!s || !s[1]) return;
   const body = s[1].replace(/\{t\}/g, tbl());
   (m === "lua" ? edLua : edSql).set(body); if (mode === "builder") { sqlDirty = true; paintSqlState(); }
   $("snip").value = "0";
@@ -166,7 +167,7 @@ function paintSources() {
 async function loadRefs() {
   try {
     const r = await V.pick(() => V.call("GET", "/api/v1/sources"), () => V.call("GET", "/api/sources"));
-    api = r.v;
+    api = r.v; Watch.Editor.data.legacy = !api;
     sources = api ? V.list(r.data, "sources") : (V.list(r.data, "expanded").length ? V.list(r.data, "expanded") : V.list(r.data, "sources"));
   } catch (e) { V.show($("find-err"), e, loadRefs); }
   try {
@@ -217,20 +218,32 @@ function showLegacySql(j) {
   $("hits").innerHTML = rows.length ? `<div class="scroll-x"><table><thead><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${cols.map((c, i) => `<td>${mk(Array.isArray(row) ? row[i] : row[c])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>` : '<div class="empty-state"><h2>No matching sightings</h2><p>No match is not evidence that nothing was there.</p></div>';
 }
 function holdingUnsupported() { return !models.some((m) => (m.supported_relations || []).includes("holding")); }
+// Info only: say so when the analysed intervals cover < 95% of the matched media's duration (durations come from GET /api/v1/media/{id}).
+async function coverageNote(c, matches) {
+  const ids = [...new Set(matches.map((m) => m.media_id))].slice(0, 8), an = V.analyzed(c);
+  if (!ids.length || !(c.decoded > 0)) return;
+  try {
+    const ms = await Promise.all(ids.map((id) => V.call("GET", "/api/v1/media/" + encodeURIComponent(id)).catch(() => null)));
+    const dur = ms.reduce((a, m) => a + ((m && Number(m.duration_us)) || 0), 0), el = $("cov-note");
+    if (!el || !dur || an >= dur * 0.95) return;
+    el.textContent = `${V.n(c.skipped || 0)} decoded frames were not sent to the detector (no motion, blurry or blank); a search covers the moments that were analysed.`; el.hidden = false;
+  } catch (_) {}
+}
 function paintRun(run, matches, next, extra) {
   extra = extra || {};
   lastRun = run;
   const c = run.coverage || {}, unit = extra.unit || UNIT[run.kind] || run.kind, warns = (run.warnings || []).slice();
   if (/holding/i.test(run.normalized || edSql.get()) && holdingUnsupported() && !warns.some((w) => /holding/i.test(w))) warns.push("holding is unsupported by the installed models; “near” is only a proximity heuristic.");
   if (c.failed > 0) warns.push(`${V.n(c.failed)} frames failed analysis and are not covered.`);
-  if (c.skipped > 0) warns.push(`${V.n(c.skipped)} frames were skipped by sampling gates and cannot match.`);
   if (run.result_count === 0) warns.push("Zero results is not evidence of absence: only analyzed intervals were searched; classes no installed model detects are unknown, not zero.");
-  $("run-summary").innerHTML = `<div class="runbox"><div class="runhead"><b class="big mono">${V.n(run.result_count)}</b> <span>${esc(unit)}</span> <span class="spacer"></span><a class="btn primary sm" id="open-review" href="/review?run=${encodeURIComponent(run.id)}">Open in review</a><button type="button" class="sm" id="copy-run">Copy link</button></div>
+  const mc = extra.match_count, byMatch = typeof mc === "number" && run.kind !== "aggregate";
+  $("run-summary").innerHTML = `<div class="runbox"><div class="runhead"><b class="big mono">${V.n(byMatch ? mc : run.result_count)}</b> <span>${byMatch ? (mc === 1 ? "match" : "matches") : esc(unit)}</span>${byMatch ? ` <span class="quiet">· ${V.n(run.result_count)} ${esc(unit)}</span>` : ""} <span class="spacer"></span><a class="btn primary sm" id="open-review" href="/review?run=${encodeURIComponent(run.id)}">Open in review</a><button type="button" class="sm" id="copy-run">Copy link</button></div>
     <div class="kv"><span>decoded <b>${V.n(c.decoded)}</b></span><span>inferred <b>${V.n(c.inferred)}</b></span><span>skipped <b>${V.n(c.skipped)}</b></span><span>failed <b>${V.n(c.failed)}</b></span><span>analyzed <b>${(V.analyzed(c) / 1e6).toFixed(1)}s</b></span><span><b>${((run.elapsed_us || 0) / 1000).toFixed(1)}</b> ms</span><span>run <b>${esc(run.id)}</b></span></div>
     ${extra.values != null && !(typeof extra.values === "object" && !Object.keys(extra.values).length) ? `<div class="terms"><span class="quiet">values</span> <pre class="vals mono">${esc(JSON.stringify(extra.values, null, 2))}</pre></div>` : ""}
     ${terms.length ? `<div class="terms quiet">matching: ${terms.map((t) => `<mark>${esc(t)}</mark>`).join(" ")}</div>` : ""}
-    ${warns.length ? `<ul class="warnings">${warns.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}<div class="msg" id="run-msg"></div></div>`;
-  $("hit-count").textContent = matches.length ? `${matches.length} of ${V.n(run.result_count)} shown` : ""; badge(V.n(run.result_count));
+    ${warns.length ? `<ul class="warnings">${warns.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}<p class="quiet" id="cov-note" hidden></p><div class="msg" id="run-msg"></div></div>`;
+  $("hit-count").textContent = matches.length ? `${matches.length} of ${V.n(byMatch ? mc : run.result_count)} shown` : ""; badge(V.n(byMatch ? mc : run.result_count));
+  coverageNote(c, matches);
   $("hits").innerHTML = '<div class="scroll-x"><table id="mt"><thead><tr><th></th><th>source</th><th>time</th><th>tracks</th><th>conf</th><th></th></tr></thead><tbody></tbody></table></div>'; addMatches(matches);
   $("more").classList.toggle("hide", !next); $("more").dataset.cursor = next || "";
   $("copy-run").onclick = async () => { try { await navigator.clipboard.writeText(location.origin + "/review?run=" + run.id); V.ok($("run-msg"), "Link copied."); } catch (_) { V.show($("run-msg"), { message: "Could not copy; use Open in review." }); } };
@@ -257,7 +270,7 @@ async function runV1(extra) {
   const body = Object.assign({}, extra, { scope: { source_ids: ids, media_ids: [], from_utc_us: t.from, to_utc_us: t.to } });
   const j = await V.call("POST", "/api/v1/queries", body);
   if (!j || !j.run) throw { message: "The server returned no query run." };
-  paintRun(j.run, V.list(j, "matches"), j.next, { values: j.values, unit: j.unit });
+  paintRun(j.run, V.list(j, "matches"), j.next, { values: j.values, unit: j.unit, match_count: j.match_count });
 }
 async function runFind() {
   if (running) return;
@@ -270,7 +283,7 @@ async function runFind() {
   try {
     if ((sqlish || isLua) && api) {
       try { await runV1(isLua ? { lua: edLua.get() } : { sql: edSql.get().trim() }); return; }
-      catch (e) { if (!V.absent(e)) throw e; api = 0; await loadRefs(); if (mode === "builder") regen(true); }
+      catch (e) { if (!V.absent(e)) throw e; api = 0; Watch.Editor.data.legacy = true; await loadRefs(); if (mode === "builder") regen(true); }
     }
     if (sqlish) showLegacySql(await V.call("POST", "/api/query", { sql: edSql.get() }));
     else { const j = await V.call("POST", "/api/find", askBody()); if (j.error) throw { message: j.error }; showHits(j.hits); }

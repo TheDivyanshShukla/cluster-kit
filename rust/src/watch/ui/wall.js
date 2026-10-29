@@ -57,10 +57,11 @@ const V = (() => {
 const $ = Watch.$, esc = Watch.esc;
 let alerts = [], alertApi = null, alertKey = "", extra = [], extraAll = [], extraKey = "", cams = [];
 let layout = "auto", solo = "", page = 0, seen = null, flash = {};
+// "boxes": the real recording in a muted looping <video>, boxes drawn on a canvas synced to video.currentTime.
 // "sync": draw each analyzed frame together with its own detections (boxes always match the picture).
-// "video": the head's preview stream; it is decoded separately, so no boxes are drawn on it.
-let view = "sync";
-try { view = localStorage.getItem("watch.wallView") || "sync"; } catch (_) {}
+// "live": the head's MJPEG preview of a really running source; decoded separately, so no boxes.
+let view = "boxes";
+try { const v = localStorage.getItem("watch.wallView2"); if (v === "boxes" || v === "sync" || v === "live") view = v; } catch (_) {}
 try { layout = localStorage.getItem("watch.wallLayout") || "auto"; } catch (_) {}
 
 function slotCount(n) {
@@ -71,11 +72,13 @@ function slotCount(n) {
   const c = Math.max(1, Math.ceil(Math.sqrt(Math.max(n, 1)))), r = Math.max(1, Math.ceil(n / c));
   return { cols: c, rows: r, slots: c * r };
 }
+const isRep = (id) => !!repOf[id];
 function tileHtml(c) {
   return `<div class="ct" role="listitem" tabindex="0" data-cam="${esc(c.id)}" aria-label="${esc(c.name)}: click to solo, double-click for fullscreen">
-    ${view === "video" ? `<img alt="" src="/api/live/${encodeURIComponent(c.id)}">` : `<canvas aria-hidden="true"></canvas>`}
-    <div class="ct-sig">Waiting for first frame…</div>
-    <div class="ct-top"><span class="dot"></span><b class="ct-name"></b><span class="ct-fps mono"></span></div>
+    ${view === "live" && !isRep(c.id) ? `<img alt="" src="/api/live/${encodeURIComponent(c.id)}">` : `<canvas class="base" aria-hidden="true"></canvas>`}
+    ${view === "boxes" || (view === "live" && isRep(c.id)) ? `<video class="vid" muted loop playsinline autoplay preload="auto" aria-hidden="true"></video><canvas class="ov" aria-hidden="true"></canvas>` : ""}
+    <div class="ct-sig">Waiting for first frame…</div><div class="ct-note" hidden></div>
+    <div class="ct-top"><span class="dot"></span><b class="ct-name"></b><span class="ct-tag" hidden title="This camera replays a recording on a loop, like a live feed. The position follows the wall clock, so every viewer sees the same moment. Boxes are the stored detections for that moment.">LIVE · replayed from recording</span><span class="ct-fps mono"></span></div>
     <div class="ct-bot"><span class="ct-people mono"></span><span class="ct-stat mono"></span><a class="ct-rev" href="/clip?id=${encodeURIComponent(c.id)}">Review</a></div></div>`;
 }
 const noSignal = (label) => `<div class="ct empty" role="listitem"><div class="ct-sig" style="display:flex">No signal${label ? " · " + esc(label) : ""}</div></div>`;
@@ -104,15 +107,19 @@ function render(force) {
   if (solo && !list.length) { solo = ""; list = all; }
   const g = slotCount(list.length), per = g.slots, pages = Math.max(1, Math.ceil(list.length / per));
   page = Math.min(page, pages - 1);
-  const view = list.slice(page * per, page * per + per);
-  const key = [layout, solo, page, view.map((e) => (e.c ? e.c.id : "x:" + e.x.id)).join(","), g.cols, g.rows].join("|");
+  const shown = list.slice(page * per, page * per + per);
+  const key = [layout, solo, page, shown.map((e) => (e.c ? e.c.id : "x:" + e.x.id)).join(","), g.cols, g.rows].join("|");
   const tiles = $("tiles");
   $("pager").hidden = pages < 2; $("pg-label").textContent = (page + 1) + "/" + pages;
   if (force || tiles.dataset.key !== key) {
-    tiles.dataset.key = key;
+    tiles.dataset.key = key; teardown();
     tiles.style.setProperty("--cols", g.cols); tiles.style.setProperty("--rows", g.rows);
-    tiles.innerHTML = view.map((e) => e.c ? tileHtml(e.c) : noSignal((e.x.name || e.x.id) + (e.x.enabled === false ? " (disabled)" : " (no worker reports it)"))).join("") + Array(Math.max(0, per - view.length)).fill(noSignal("empty slot")).join("");
-    tiles.querySelectorAll(".ct[data-cam]").forEach(wire);
+    tiles.innerHTML = shown.map((e) => e.c ? tileHtml(e.c) : noSignal((e.x.name || e.x.id) + (e.x.enabled === false ? " (disabled)" : " (no worker reports it)"))).join("") + Array(Math.max(0, per - shown.length)).fill(noSignal("empty slot")).join("");
+    tiles.querySelectorAll(".ct[data-cam]").forEach((el) => {
+      wire(el); ro.observe(el);
+      const f = frames[el.dataset.cam]; if (f) draw(el, f); // a rebuilt tile shows its last analysed picture at once
+      if (view === "boxes" || isRep(el.dataset.cam)) { io.observe(el); setupVideo(el); }
+    });
   }
   tiles.classList.toggle("solo", !!solo);
 }
@@ -131,12 +138,14 @@ function paint(s) {
   for (const c of cams) {
     const node = $("tiles").querySelector(`.ct[data-cam="${CSS.escape(c.id)}"]`); if (!node) continue;
     node.querySelector(".ct-name").textContent = c.name;
-    node.querySelector(".ct-fps").textContent = c.completed ? "done" : (c.feed || "");
+    node.dataset.done = c.completed ? "1" : "";
+    node.querySelector(".ct-tag").hidden = !(isRep(c.id) && !c.completed && node.dataset.vp === "1");
+    if (node.dataset.vp !== "1") node.querySelector(".ct-fps").textContent = c.completed ? "done" : (c.feed || "");
     node.querySelector(".ct-stat").textContent = [c.status, c.skip].filter(Boolean).join(" · ");
-    if (view !== "video") node.querySelector(".ct-people").textContent = "";
-    else node.querySelector(".ct-people").textContent = node.dataset.sig === "1" ? (c.people || "") : "";
+    if (node.dataset.vp === "1") {} // people count comes from the interpolated boxes
+    else node.querySelector(".ct-people").textContent = view === "live" && node.dataset.sig === "1" ? (c.people || "") : "";
     if (node.dataset.sig !== "0") node.querySelector(".dot").className = "dot " + (c.completed ? "" : "live");
-    if (node.dataset.sig !== "1") node.querySelector(".ct-sig").textContent = c.completed ? "No live preview — indexing complete." : "Waiting for first frame…";
+    if (node.dataset.sig !== "1") node.querySelector(".ct-sig").textContent = node.dataset.vs === "loading" ? "Loading video…" : c.completed ? "No live preview — indexing complete." : "Waiting for first frame…";
     node.classList.toggle("flash", !!flash[c.id] && Date.now() < flash[c.id]);
   }
   if (alertApi === 0) paintAlerts();
@@ -199,18 +208,170 @@ document.addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
   if ("1234".includes(k) && k) setLayout(k); else if (k === "a") setLayout("auto"); else if (k === "f") fullscreen(); else if (k === "escape" && solo) setSolo("");
 });
+const frames = {}; // camera id -> { an, obs, img, dets, t }
+let trails = true;
+try { trails = localStorage.getItem("watch.trails") !== "0"; } catch (_) {}
+
+// ---- video + synchronised boxes ("boxes" view) ----
+const MAX_VIDEOS = 16, CHUNK = 30, LOOK = 2.5e6, HOLD = 600e3, FADE_IN = 150e3, MAX_GAP = 2.5e6;
+const mediaCache = new Map(), bad = {}, lastT = {}; // media id -> MediaAsset; camera id -> time a failed video was seen; camera id -> last media seconds
+let mediaOf = {}, mediaBusy = false;
+// Sources the head replays from a recording on a loop ("file" kind): id -> start fraction. Position = (start*dur + wall clock) mod dur, the same for every tile and viewer.
+var repOf = {};
+// Recordings of the same scene differ by a fraction of a second in length, which over ~500k loops would put the cameras hours apart; so cameras of similar length share the shortest length as their loop period.
+const period = (id, dur) => Object.keys(repOf).reduce((p, k) => { const o = mediaOf[k]; return o && o.dur < p && Math.abs(o.dur - dur) < dur * 0.01 ? o.dur : p; }, dur);
+const repPos = (id, dur) => { const r = repOf[id]; if (!r) return null; const P = period(id, dur); return (((r.start * P + Date.now() / 1000) % P) + P) % P; };
+async function loadRep() {
+  try {
+    const j = await V.call("GET", "/api/sources"), next = {};
+    for (const x of (j && j.expanded) || []) if (x.kind === "file") next[x.id] = { start: Number(x.start) || 0 };
+    if (JSON.stringify(next) !== JSON.stringify(repOf)) { repOf = next; if (view === "live") render(true); }
+  } catch (_) {}
+}
+// camera id (= source id) -> playable media {id, dur, running}. Newest job first; legacy-import jobs are ignored.
+async function loadMedia() {
+  if (mediaBusy) return; mediaBusy = true;
+  try {
+    const jobs = V.list(await V.call("GET", "/api/v1/jobs"), "jobs").filter((j) => String(j.id).startsWith("job_")).sort((a, b) => (b.created_utc_us || 0) - (a.created_utc_us || 0)); // legacy-import jobs point at media rows that may be gone (404)
+    const ids = [...new Set(jobs.flatMap((j) => j.media_ids || []))];
+    await Promise.all(ids.map(async (id) => { const m = mediaCache.get(id); if (m && m.availability === "available") return; try { mediaCache.set(id, await V.call("GET", "/api/v1/media/" + encodeURIComponent(id))); } catch (_) {} }));
+    const best = {};
+    for (const j of jobs) for (const id of j.media_ids || []) {
+      const m = mediaCache.get(id);
+      if (m && m.availability === "available" && m.duration_us > 0 && !m.still && !best[m.source_id]) best[m.source_id] = { id, dur: m.duration_us / 1e6, running: j.state === "running" };
+    }
+    mediaOf = best;
+    document.querySelectorAll("#tiles .ct[data-cam]").forEach((el) => setupVideo(el));
+  } catch (e) { console.warn("wall: media lookup failed", e); } finally { mediaBusy = false; }
+}
+const smooth = (k) => k * k * (3 - 2 * k);
+// Boxes for media time t (us): interpolate between the two bracketing observations by track id; hold/fade a lone earlier
+// track; fade in a lone later one; nothing when no observation is within LOOK of t. Detections without a track id cross-fade.
+function boxesAt(obs, t) {
+  let lo = 0, hi = obs.length; while (lo < hi) { const m = (lo + hi) >> 1; if (obs[m].t <= t) lo = m + 1; else hi = m; }
+  const a = obs[lo - 1] && t - obs[lo - 1].t <= LOOK ? obs[lo - 1] : null, b = obs[lo] && obs[lo].t - t <= LOOK ? obs[lo] : null;
+  if (!a && !b) return [];
+  const pair = a && b && b.t - a.t <= MAX_GAP, e = pair ? smooth((t - a.t) / (b.t - a.t)) : 0, red = Watch.reduced();
+  const bt = new Map(), used = new Set(), out = [];
+  if (pair) for (const d of b.dets) if (d.track_id != null) bt.set(d.track_id, d);
+  if (a) for (const d of a.dets) {
+    const o = d.track_id != null ? bt.get(d.track_id) : null;
+    if (o) { used.add(o); out.push({ ...d, confidence: o.confidence, bbox: red ? (e < 0.5 ? d.bbox : o.bbox) : d.bbox.map((v, i) => v + (o.bbox[i] - v) * e), alpha: 1 }); }
+    else { const age = t - a.t; if (age < HOLD) out.push({ ...d, alpha: age < HOLD - 200e3 ? 1 : (HOLD - age) / 200e3 }); }
+  }
+  if (b) for (const d of b.dets) if (!used.has(d)) { const k = 1 - (b.t - t) / FADE_IN; if (k > 0) out.push({ ...d, alpha: Math.min(1, k) }); }
+  return out;
+}
+async function loadChunk(vt, c) {
+  const old = vt.chunks.get(c), now = performance.now();
+  if (old && (old.busy || (now - old.at < (old.err ? 10000 : vt.m.running ? 8000 : 1e12)))) return;
+  const ch = { busy: true, at: now, items: old ? old.items : [], err: false }; vt.chunks.set(c, ch);
+  try {
+    const r = await fetch(`/api/v1/media/${encodeURIComponent(vt.m.id)}/observations?start_us=${c * CHUNK * 1e6}&end_us=${(c + 1) * CHUNK * 1e6}`, { credentials: "same-origin" });
+    if (!r.ok) throw 0;
+    ch.items = V.list(await r.json(), "observations").map((o) => ({ t: o.observation.media_time_us, dets: o.detections || [] }));
+  } catch (_) { ch.err = true; }
+  ch.busy = false; ch.at = performance.now();
+  // ponytail: all chunks are merged and re-sorted on arrival (fine for a few hundred observations per 30 s); upgrade to a per-chunk lookup if it shows up in profiles
+  vt.obs = [...vt.chunks.values()].flatMap((x) => x.items).sort((p, q) => p.t - q.t).filter((o, i, arr) => !i || o.t !== arr[i - 1].t);
+}
+function ensureObs(vt, t) {
+  const c = Math.floor(t / CHUNK);
+  loadChunk(vt, c); if (t - c * CHUNK > 15 && (c + 1) * CHUNK < vt.m.dur) loadChunk(vt, c + 1);
+}
+const stopVideo = (v) => { try { v.pause(); v.removeAttribute("src"); v.load(); } catch (_) {} };
+function teardown() {
+  io.disconnect(); ro.disconnect();
+  document.querySelectorAll("#tiles .ct").forEach((el) => { const vt = el._vt; if (!vt) return; vt.dead = true; try { if (vt.h && vt.v.cancelVideoFrameCallback) vt.v.cancelVideoFrameCallback(vt.h); } catch (_) {} stopVideo(vt.v); el._vt = null; });
+}
+function clearOv(el) {
+  const vt = el._vt; if (!vt) return;
+  vt.an.clear(); vt.mt = -1; vt.last = 0;
+  if (!vt.blank) { vt.ov.getContext("2d").clearRect(0, 0, vt.ov.width, vt.ov.height); vt.blank = true; }
+  const p = el.querySelector(".ct-people"); if (p) p.textContent = "";
+}
+function fallback(el, why) {
+  const vt = el._vt; if (vt) { vt.dead = true; stopVideo(vt.v); clearOv(el); }
+  el.dataset.vp = ""; el.dataset.vs = "";
+  const n = el.querySelector(".ct-note"); n.textContent = why; n.hidden = false;
+  const f = frames[el.dataset.cam]; if (f) draw(el, f);
+}
+function playState(el) {
+  const vt = el._vt; if (!vt || vt.dead) return;
+  const want = el._vis !== false && !document.hidden;
+  if (want && vt.v.paused) vt.v.play().catch(() => {}); else if (!want && !vt.v.paused) vt.v.pause();
+}
+function setupVideo(el) {
+  if (el._vt || !(view === "boxes" || (view === "live" && isRep(el.dataset.cam)))) return;
+  const id = el.dataset.cam, m = mediaOf[id], v = el.querySelector("video");
+  if (!m || !v) return; // nothing playable: stay on the analysed view
+  if (bad[id] && Date.now() - bad[id] < 60000) { const n = el.querySelector(".ct-note"); n.textContent = "Video unavailable. Showing analysed frames."; n.hidden = false; return; }
+  if (document.querySelectorAll("#tiles video[src]").length >= MAX_VIDEOS) return; // over the cap: analysed still
+  const vt = el._vt = { m, v, ov: el.querySelector(".ov"), an: Watch.Annotate.create({ direct: true }), chunks: new Map(), obs: [], mt: -1, f0: 0, pf0: 0, fc: 0, blank: true, dead: false, sync: 0 };
+  el.dataset.vs = "loading";
+  v.addEventListener("loadedmetadata", () => {
+    const rp = repPos(id, m.dur), t0 = rp != null ? rp : lastT[id] != null ? lastT[id] : frames[id] ? frames[id].t / 1e6 : 0;
+    if (t0 > 0 && t0 < (v.duration || m.dur) - 1) v.currentTime = t0;
+  });
+  v.addEventListener("playing", () => { el.dataset.vp = "1"; el.dataset.vs = ""; el.dataset.sig = "1"; el.querySelector(".ct-sig").style.display = "none"; arm(el); });
+  for (const ev of ["seeking", "waiting", "stalled", "pause", "emptied"]) v.addEventListener(ev, () => clearOv(el));
+  v.addEventListener("error", () => { bad[id] = Date.now(); fallback(el, "Video unavailable. Showing analysed frames."); });
+  v.src = "/api/v1/media/" + encodeURIComponent(m.id) + "/stream";
+  playState(el);
+}
+function arm(el) {
+  const vt = el._vt; if (!vt || vt.dead || vt.armed) return; vt.armed = true;
+  const v = vt.v, cb = (now, md) => { vt.armed = false; if (vt.dead) return; frame(el, vt, now, md ? md.mediaTime : v.currentTime, md); arm(el); };
+  vt.h = v.requestVideoFrameCallback ? v.requestVideoFrameCallback(cb) : requestAnimationFrame((t) => cb(t, null));
+}
+function frame(el, vt, now, mt, md) {
+  if (vt.v.paused || vt.v.seeking) return;
+  vt.last = now;
+  if (repOf[el.dataset.cam] && now >= vt.sync) { // replayed "live" source: stay on the shared wall-clock position
+    const dur = period(el.dataset.cam, vt.m.dur), d = ((mt - repPos(el.dataset.cam, vt.m.dur) + dur * 1.5) % dur) - dur / 2;
+    vt.sync = now + 1000;
+    if (Math.abs(d) > (vt.synced ? 1.5 : 0.5)) { vt.v.currentTime = repPos(el.dataset.cam, vt.m.dur) + 0.15; clearOv(el); vt.synced = true; vt.sync = now + 2500; return; }
+    vt.synced = true;
+  }
+  if (vt.mt >= 0 && (mt < vt.mt - 0.05 || mt - vt.mt > 1)) vt.an.clear(); // seek or loop wrap: restart the overlay
+  vt.mt = mt; lastT[el.dataset.cam] = mt;
+  const pf = md && md.presentedFrames != null ? md.presentedFrames : (vt.pf0 + 1);
+  if (!vt.f0) { vt.f0 = now; vt.pf0 = pf; }
+  else if (now - vt.f0 >= 1000) {
+    vt.fps = (pf - vt.pf0) * 1000 / (now - vt.f0); vt.f0 = now; vt.pf0 = pf;
+    el.querySelector(".ct-fps").textContent = (el.dataset.done ? "done · " : "") + Math.round(vt.fps) + " fps";
+  }
+  if (el._vis === false) return;
+  ensureObs(vt, mt);
+  const dets = boxesAt(vt.obs, mt * 1e6);
+  vt.an.update(dets, now);
+  if (!dets.length && vt.blank) return;
+  const sz = el._sz, v = vt.v; if (!sz || !v.videoWidth) return;
+  const g = vt.ov.getContext("2d"), dpr = vt.ov.width / sz.w;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, sz.w, sz.h);
+  vt.an.paint(g, fitRect(sz.w, sz.h, v.videoWidth, v.videoHeight), now, { trail: trails, badge: false });
+  vt.blank = !dets.length;
+  const n = dets.filter((d) => d.class === "person" && d.alpha > 0.5).length;
+  if (n !== vt.people) { vt.people = n; el.querySelector(".ct-people").textContent = n ? n + (n === 1 ? " person" : " people") : ""; }
+}
+const io = new IntersectionObserver((es) => es.forEach((e) => { e.target._vis = e.isIntersecting; playState(e.target); }));
+const ro = new ResizeObserver((es) => es.forEach((e) => {
+  const el = e.target, w = e.contentRect.width, h = e.contentRect.height; el._sz = { w, h };
+  const vt = el._vt, d = window.devicePixelRatio || 1;
+  if (vt) { vt.ov.width = Math.round(w * d); vt.ov.height = Math.round(h * d); vt.blank = true; } else draw(el, frames[el.dataset.cam]);
+}));
+document.addEventListener("visibilitychange", () => document.querySelectorAll("#tiles .ct").forEach(playState));
+// a stalled video (no new frame for 0.8 s while "playing") must not keep stale boxes on screen
+setInterval(() => document.querySelectorAll("#tiles .ct").forEach((el) => { const vt = el._vt; if (vt && !vt.dead && vt.last && performance.now() - vt.last > 800) clearOv(el); }), 400);
 setLayout(layout);
 V.auth(); loadAlerts(); setInterval(loadAlerts, 3000);
 // ---- analyzed frames with their own boxes ----
-const frames = {}; // camera id -> { obs, img, dets, t }
 function fitRect(cw, ch, iw, ih) {
   const k = Math.min(cw / iw, ch / ih), w = iw * k, h = ih * k;
   return { x: (cw - w) / 2, y: (ch - h) / 2, w, h };
 }
-let trails = true;
-try { trails = localStorage.getItem("watch.trails") !== "0"; } catch (_) {}
 function draw(el, f, now) {
-  const cv = el.querySelector("canvas"); if (!cv || !f || !f.img) return;
+  const cv = el.querySelector("canvas.base"); if (!cv || !f || !f.img) return;
   now = now ?? performance.now();
   const dpr = window.devicePixelRatio || 1, cw = cv.clientWidth, ch = cv.clientHeight;
   if (!cw || !ch) return;
@@ -218,7 +379,7 @@ function draw(el, f, now) {
   const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, cw, ch);
   const r = fitRect(cw, ch, f.img.naturalWidth, f.img.naturalHeight);
   g.drawImage(f.img, r.x, r.y, r.w, r.h);
-  el.dataset.drawn = f.obs;
+  el.dataset.drawn = f.obs; el.dataset.sig = "1"; el.querySelector(".ct-sig").style.display = "none";
   // boxes are positioned in the image content rect (object-fit: contain), so they stay on the picture at any tile size
   f.an.paint(g, r, now, { trail: trails, bx: 8, by: 28 });
   const css = getComputedStyle(document.documentElement), ts = Math.max(0, Math.round(f.t / 1000)) / 1000;
@@ -237,10 +398,10 @@ function loop(now) {
 function kick() { if (!raf) raf = requestAnimationFrame(loop); }
 let polling = false;
 async function pollFrames() {
-  if (polling || view !== "sync" || document.hidden) return;
+  if (polling || view === "live" || document.hidden) return;
   polling = true;
   try {
-    const tiles = [...document.querySelectorAll("#tiles .ct[data-cam]")];
+    const tiles = [...document.querySelectorAll("#tiles .ct[data-cam]")].filter((el) => el.dataset.vp !== "1");
     await Promise.all(tiles.map(async (el) => {
       const id = el.dataset.cam, n = el.querySelector(".ct-sig");
       let v;
@@ -263,14 +424,15 @@ async function pollFrames() {
   } finally { polling = false; }
 }
 function setView(v) {
-  view = v; try { localStorage.setItem("watch.wallView", v); } catch (_) {}
-  $("view-sync").setAttribute("aria-pressed", String(v === "sync")); $("view-video").setAttribute("aria-pressed", String(v === "video"));
+  view = v; try { localStorage.setItem("watch.wallView2", v); } catch (_) {}
+  for (const k of ["boxes", "sync", "live"]) $("view-" + k).setAttribute("aria-pressed", String(v === k));
   render(true);
 }
+$("view-boxes").onclick = () => setView("boxes");
 $("view-sync").onclick = () => setView("sync");
-$("view-video").onclick = () => setView("video");
+$("view-live").onclick = () => setView("live");
 setView(view);
-document.addEventListener("keydown", (e) => { if ((e.key === "v" || e.key === "V") && !e.target.closest("input,textarea,select")) setView(view === "sync" ? "video" : "sync"); });
+document.addEventListener("keydown", (e) => { if ((e.key === "v" || e.key === "V") && !e.target.closest("input,textarea,select")) setView(view === "boxes" ? "sync" : view === "sync" ? "live" : "boxes"); });
 window.addEventListener("resize", () => document.querySelectorAll("#tiles .ct[data-cam]").forEach((el) => draw(el, frames[el.dataset.cam])));
 function setTrails(on) {
   trails = on; try { localStorage.setItem("watch.trails", on ? "1" : "0"); } catch (_) {}
@@ -283,3 +445,4 @@ setInterval(pollFrames, 250);
 
 Watch.start(paint, 400);
 loadExtra(); setInterval(loadExtra, 10000);
+loadMedia(); setInterval(loadMedia, 15000); loadRep(); setInterval(loadRep, 15000);

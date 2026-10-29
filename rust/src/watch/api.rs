@@ -423,6 +423,8 @@ fn stream(api: &Api, id: &str, range: Option<&str>) -> Result<Reply, ApiError> {
     let mut r = Reply::bytes(buf, ctype);
     r.status = status;
     r.headers.push(("Accept-Ranges".into(), "bytes".into()));
+    // Recordings do not change; let the browser reuse them (solo, layout changes) instead of downloading again.
+    r.headers.push(("Cache-Control".into(), "private, max-age=3600".into()));
     if status == 206 {
         r.headers.push(("Content-Range".into(), format!("bytes {start}-{end}/{len}")));
     }
@@ -928,7 +930,8 @@ pub fn sync_sources(api: &Api, cams: &[Camera]) {
         let finished = !matches!(kind, SourceKind::Live | SourceKind::Webcam)
             && c.kind != "file"
             && api.store.job(&job_id).ok().flatten().is_some_and(|j| j.state == JobState::Completed);
-        if media.availability != Availability::Missing && !finished {
+        // `analyze: false` sources are replayed from stored detections; no worker task is created for them.
+        if media.availability != Availability::Missing && !finished && c.analyze {
             let _ = api.sched.lock().unwrap().submit(job, vec![spec]);
         }
         cat.insert(c.id.clone(), (key, task_id));
@@ -1318,20 +1321,23 @@ mod tests {
 
 /// The media of a source whose import completed. A source can own older media rows (a file replaced since), so
 /// pick the one with a completed job rather than the first.
-fn finished_media(api: &Api, id: &str) -> Option<(MediaAsset, IndexJob)> {
+fn finished_media(api: &Api, id: &str, any_state: bool) -> Option<(MediaAsset, IndexJob)> {
     api.store.media_for_source(id).ok()?.into_iter().find_map(|m| {
-        let j = api.store.job(&stable_id("job", &[id, &m.id])).ok().flatten().filter(|j| j.state == JobState::Completed)?;
+        let j = api.store.job(&stable_id("job", &[id, &m.id])).ok().flatten().filter(|j| any_state || j.state == JobState::Completed)?;
         Some((m, j))
     })
 }
 
 /// A configured camera that no worker reports any more because its import finished: the view the wall and the
 /// Rules page need, built from the stored job. `None` when the source has no finished job.
-pub fn finished_camera(api: &Api, id: &str, name: &str) -> Option<serde_json::Value> {
-    let (media, job) = finished_media(api, id)?;
+pub fn finished_camera(api: &Api, id: &str, name: &str, replay: bool) -> Option<serde_json::Value> {
+    // `replay`: a source that is not analysed (analyze:false) shows its stored data whatever its old job state.
+    let (media, job) = finished_media(api, id, replay)?;
     let ops = job.sampling.get("ops").cloned().unwrap_or(serde_json::json!({}));
     Some(serde_json::json!({
-        "id": id, "name": name, "status": "done", "completed": true, "seq": 0, "indexed_frames": job.coverage.inferred,
+        "id": id, "name": name,
+        // A replayed recording is a running (looping) camera, not a finished import.
+        "status": if replay { "on time" } else { "done" }, "completed": !replay, "replay": replay, "seq": 0, "indexed_frames": job.coverage.inferred,
         "people": "", "lacking": "0", "feed": "", "skip": "", "host": "", "at": 0, "dur": media.duration_us.unwrap_or(0) as f64 / 1e6, "boxes": [],
         "ops": ops,
         "detector_passes": ops.get("detector_passes"), "static": ops.get("static"), "regions": ops.get("regions"),
@@ -1341,7 +1347,7 @@ pub fn finished_camera(api: &Api, id: &str, name: &str) -> Option<serde_json::Va
 
 /// The last analysed frame of a finished import with its detections, for a wall tile that has no live feed.
 fn last_analyzed(api: &Api, source: &str) -> Option<serde_json::Value> {
-    let (media, _) = finished_media(api, source)?;
+    let (media, _) = finished_media(api, source, true)?;
     let dur = media.duration_us?;
     let mut from = (dur - 30_000_000).max(0);
     loop {

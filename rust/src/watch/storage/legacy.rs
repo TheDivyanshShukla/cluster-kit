@@ -234,14 +234,23 @@ mod tests {
     use super::*;
     use crate::watch::storage::tests::tmp;
 
-    fn repo_seen() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../vision/data/seen.jsonl")
+    /// A small journal in the legacy shape. Generated, so the test never depends on a user's real data folder.
+    fn sample_journal() -> String {
+        let mut out = String::new();
+        for i in 1..=40u64 {
+            let cam = if i % 3 == 0 { "street" } else { "hall" };
+            out.push_str(&format!(
+                "{{\"at\":{:.3},\"camera\":\"{cam}\",\"camera_id\":\"{cam}\",\"class\":\"{}\",\"color\":\"gray\",\"id\":{i},\"ts\":{:.6}}}\n",
+                (i / 2) as f64 * 0.5, if i % 2 == 0 { "person" } else { "car" }, 1792963258.0 + i as f64 * 0.5
+            ));
+        }
+        out
     }
 
     #[test]
     fn legacy_import_counts_and_resumes() {
         let dir = tmp("legacy");
-        let text = std::fs::read_to_string(repo_seen()).unwrap();
+        let text = sample_journal();
         let valid = text.lines().filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()).count() as u64;
         std::fs::write(dir.join("seen.jsonl"), &text).unwrap();
         let store = crate::watch::storage::memory();

@@ -63,6 +63,10 @@ pub struct Camera {
     pub kind: String,
     #[serde(default)]
     pub zones: Vec<Zone>,
+    /// `false`: do not run the detector on this source. For recordings that are already fully indexed and are
+    /// only replayed on the wall, which draws the stored detections. Default `true`.
+    #[serde(default = "default_true")]
+    pub analyze: bool,
 }
 
 /// How a PC spends its cores. A mode is a starting point. Each switch can be changed on its own.
@@ -275,7 +279,8 @@ pub fn clamp_process(mut p: Process) -> Process {
     p.blur = p.blur.clamp(1.0, 400.0);
     p.same = p.same.clamp(0.2, 40.0);
     p.every = p.every.clamp(1, 4);
-    p.rate = if p.rate >= 45 { 60 } else { 30 };
+    // Preview frame rate for the wall's live-preview mode. Low values spare the Mac when many cameras run.
+    p.rate = if p.rate >= 45 { 60 } else if p.rate >= 22 { 30 } else if p.rate >= 12 { 15 } else { 10 };
     p.width = match p.width {
         w if w <= 368 => 320,
         w if w <= 464 => 416,
@@ -386,7 +391,7 @@ fn expand(raw: &[Value], copies: usize) -> Vec<Camera> {
                 out.push(Camera {
                     id: format!("{}-{:016x}", c.get("id").and_then(|v| v.as_str()).unwrap_or("images"), hash.finish()),
                     name: file.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                    url: file.to_string_lossy().into_owned(), start: 0.0, kind: "image".into(), zones: Vec::new(),
+                    url: file.to_string_lossy().into_owned(), start: 0.0, kind: "image".into(), zones: Vec::new(), analyze: true,
                 });
             }
             continue;
@@ -398,6 +403,7 @@ fn expand(raw: &[Value], copies: usize) -> Vec<Camera> {
             start: c.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0),
             kind: c.get("kind").and_then(|v| v.as_str()).filter(|k| matches!(*k, "archive" | "image" | "file" | "live" | "webcam")).map(str::to_string).unwrap_or_else(|| kind_of(url)),
             zones: c.get("zones").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
+            analyze: c.get("analyze").and_then(|v| v.as_bool()).unwrap_or(true),
         });
         let cam = out.last_mut().unwrap();
         if cam.id.is_empty() {
@@ -434,6 +440,7 @@ fn expand(raw: &[Value], copies: usize) -> Vec<Camera> {
             start: ((i as f64) * 0.13) % 0.85,
             kind: "file".into(),
             zones: Vec::new(),
+            analyze: true,
         });
     }
     out

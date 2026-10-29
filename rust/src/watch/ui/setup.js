@@ -76,7 +76,7 @@ const FIELDS = [
   { k: "keyframe_secs", g: "Detect", kind: "range", label: "Full keyframe every", unit: "seconds", min: 0.5, max: 60, step: 0.5, dep: "motion", help: "A full-frame pass at least this often, so objects that stopped moving are not lost." },
   { k: "every", g: "Throughput", kind: "seg", base: 1, label: "Look every", opts: [[1, "Every sharp frame"], [2, "2nd"], [3, "3rd"], [4, "4th"]], help: "Analyze one sharp frame out of N." },
   { k: "width", g: "Throughput", kind: "seg", base: 1, label: "Detector picture size", opts: [[320, "320"], [416, "416"], [512, "512"], [640, "640"], [960, "960"], [1280, "1280"]], help: "Width the picture is decoded at. In motion mode crops are cut from it at full detail, so a wider picture finds small objects (aerial, far cameras) at the cost of decoding. The detector itself sees its own input size." },
-  { k: "rate", g: "Throughput", kind: "seg", base: 1, label: "Wall rate", opts: [[30, "30 fps"], [60, "60 fps"]], help: "Refresh rate of the live wall preview." }
+  { k: "rate", g: "Throughput", kind: "seg", base: 1, label: "Wall rate", opts: [[10, "10 fps"], [15, "15 fps"], [30, "30 fps"], [60, "60 fps"]], help: "Frame rate of the head's live-preview stream (Live preview view only). The Video + boxes view plays the recording directly and does not use it, so a low value saves CPU." }
 ];
 const FBY = Object.fromEntries(FIELDS.map((f) => [f.k, f]));
 const DEFAULTS = { mode: "balanced", blur_on: true, blur: 40, blank_on: true, same_on: true, same: 3.5, every: 2, width: 512, rate: 60 };
@@ -418,7 +418,7 @@ if ("IntersectionObserver" in window) {
   document.querySelectorAll(".su-sec").forEach((s) => io.observe(s));
 }
 
-ed = Watch.Editor.makeEditor($("ed-rule"), () => $("rule-submit").click());
+ed = Watch.Editor.makeEditor($("ed-rule"), () => $("rule-submit").click(), { kind: "rule" });
 ed.set(lineFor());
 V.auth(); loadModels(); loadSources();
 Watch.start((s) => { $("proc-live").textContent = s.process_line || ""; ingest(s); }, 1500);

@@ -123,13 +123,17 @@ pub fn run(opts: Opts) -> Result<(), String> {
         if let Err(e) = r { log(&format!("module {id}: {}", e.message)); }
     }
     crate::watch::api::sync_sources(&api, &config::load_watch().cameras);
-    thread::spawn({
-        let api = api.clone();
-        move || match crate::watch::storage::legacy::import(&*api.store, &data_path("")) {
-            Ok(r) => log(&format!("legacy index: {} imported, {} already present, {} malformed", r.imported, r.duplicates, r.malformed)),
-            Err(e) => log(&format!("legacy import failed: {}", e.message)),
-        }
-    });
+    // Old-format journals (seen.jsonl, events.jsonl) are imported only on request: CW_IMPORT_LEGACY=1.
+    // They hold sample records from before the database existed and show up as bogus "legacy:" cameras.
+    if std::env::var("CW_IMPORT_LEGACY").is_ok_and(|v| v == "1") {
+        thread::spawn({
+            let api = api.clone();
+            move || match crate::watch::storage::legacy::import(&*api.store, &data_path("")) {
+                Ok(r) => log(&format!("legacy index: {} imported, {} already present, {} malformed", r.imported, r.duplicates, r.malformed)),
+                Err(e) => log(&format!("legacy import failed: {}", e.message)),
+            }
+        });
+    }
     thread::spawn({
         let api = api.clone();
         move || loop { thread::sleep(Duration::from_secs(30)); api.save_alert_state(); }
@@ -284,6 +288,8 @@ fn watch_pictures(hub: Arc<Hub>) {
             .cameras
             .iter()
             .filter(|c| !matches!(c.kind.as_str(), "archive" | "image"))
+            // A replayed recording (analyze:false) is played by the browser directly; no preview stream needed.
+            .filter(|c| c.analyze)
             .map(|c| (c.id.clone(), (format!("{}|{:.3}|{rate}", c.url, c.start), c.clone())))
             .collect();
         let stale: Vec<String> = running
@@ -1164,7 +1170,7 @@ fn snapshot(hub: &Hub) -> serde_json::Value {
         let have: std::collections::HashSet<String> = cam_views.iter().filter_map(|v| v["id"].as_str().map(String::from)).collect();
         for c in &watch.cameras {
             if !have.contains(&c.id) {
-                if let Some(v) = crate::watch::api::finished_camera(&hub.api, &c.id, &c.name) { cam_views.push(v); }
+                if let Some(v) = crate::watch::api::finished_camera(&hub.api, &c.id, &c.name, !c.analyze) { cam_views.push(v); }
             }
         }
     }

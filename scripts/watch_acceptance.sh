@@ -131,7 +131,8 @@ else
   fail indexing_completes "state(completed frames error)='$STATE' within ${INDEX_TIMEOUT}s"
 fi
 N1="$(legacy_count "$BASE")"; N1="${N1:-}"
-if [ -n "$N1" ] && [ "$N1" -gt 0 ] 2>/dev/null; then pass legacy_query "SELECT COUNT(*) FROM sightings = $N1"; else fail legacy_query "count='$N1'"; N1=0; fi
+# The legacy sightings index is the old journal; indexing no longer writes it (CW_IMPORT_LEGACY=1 imports old journals).
+if [ -n "$N1" ] && [ "$N1" -gt 0 ] 2>/dev/null; then pass legacy_query "SELECT COUNT(*) FROM sightings = $N1"; else skip legacy_query "legacy journal is no longer written by indexing"; N1=0; fi
 
 v1="$(curl -s -m 30 -o "$TMP/v1.json" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
   -d '{"class":"person","min_confidence":0.4,"scope":{}}' "$BASE/api/v1/queries")"

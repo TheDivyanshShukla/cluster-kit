@@ -151,7 +151,7 @@ function paintJobs() {
       <div class="kv"><span>decoded <b>${V.n(c.decoded)}</b></span><span>inferred <b>${V.n(c.inferred)}</b></span><span>skipped <b>${V.n(c.skipped)}</b></span><span>failed <b ${c.failed ? 'style="color:#E5846B"' : ""}>${V.n(c.failed)}</b></span><span>analyzed <b>${(V.analyzed(c) / 1e6).toFixed(1)} s</b> in ${(c.analyzed || []).length} interval${(c.analyzed || []).length === 1 ? "" : "s"}</span></div>
       ${pct != null ? `<div class="progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct}%"></i></div>` : ""}
       <p class="quiet">${pct != null ? pct + "% of media time" : "Total length not known yet"} · ${(j.media_ids || []).length} media item${(j.media_ids || []).length === 1 ? "" : "s"} · job ${esc(j.id)}</p>
-      ${j.state === "completed" && c.decoded ? `<p class="quiet">${V.n(c.inferred)} of ${V.n(c.decoded)} decoded frames were inferred; skipped frames cannot match a search.</p>` : ""}
+      ${j.state === "completed" && c.decoded ? `<p class="quiet">${V.n(c.inferred)} of ${V.n(c.decoded)} decoded frames went to the detector; the rest were still, blurry or blank. A search covers the moments that were analysed.</p>` : ""}
       ${missing.length ? `<p class="msg bad">${missing.length} media item${missing.length === 1 ? " is" : "s are"} ${esc([...new Set(missing.map((m) => m.availability))].join("/"))}: playback is unavailable, existing detections stay searchable.</p>` : ""}
       ${j.error ? `<p class="msg bad">${esc(j.error.message)}${j.error.retryable ? " (retryable)" : ""}</p>` : ""}</div>`;
   }).join("");

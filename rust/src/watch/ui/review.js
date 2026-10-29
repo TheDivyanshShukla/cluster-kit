@@ -5,7 +5,7 @@
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const qs = new URLSearchParams(location.search);
-  const FIX = qs.get("fixture") === "1";
+  const FIX = false; // the generated TEST DATA mode is disabled: the review page shows real data only
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   const sec = (us) => (us / 1e6).toFixed(3) + " s";
   const utcStr = (us) => new Date(us / 1000).toISOString().replace("T", " ").slice(0, 23) + " UTC";
