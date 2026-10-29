@@ -265,12 +265,6 @@ pub fn run(opts: Opts) -> Result<(), String> {
             let range = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Range")).map(|(_, v)| v.clone());
             let body = inject_actor(&method, path, body, &principal);
             if let Some(r) = crate::watch::api::handle(&hub.api, method.as_str(), &url, &body, range.as_deref()) {
-                if path == "/api/v1/index" && r.status == 200 && !r.body.windows(16).any(|w| w == b"\"duplicate\":true") {
-                    // Compatibility: legacy /api/query, /api/find and /api/hit read the JSONL journal.
-                    if let Some(legacy) = legacy_batch(&body) {
-                        if let Err(e) = ingest_index(&hub, &legacy) { log(&format!("legacy journal write failed: {e}")); }
-                    }
-                }
                 let _ = req.respond(v1_reply(r));
                 return;
             }
@@ -1447,23 +1441,4 @@ fn inject_actor(method: &Method, path: &str, body: Vec<u8>, p: &crate::watch::au
         Ok(mut v) if v.is_object() => { v["actor"] = serde_json::json!(p.name); serde_json::to_vec(&v).unwrap_or(body) }
         _ => body,
     }
-}
-
-/// v1 IndexBatch -> legacy `/api/index` body, so the seconds-based compatibility endpoints keep working.
-fn legacy_batch(body: &[u8]) -> Option<Vec<u8>> {
-    let b: crate::watch::domain::IndexBatch = serde_json::from_slice(body).ok()?;
-    let o = &b.observation;
-    let near: std::collections::HashSet<&str> = b.relations.iter().map(|r| r.object_detection_id.as_str()).collect();
-    let dets: Vec<_> = b.detections.iter().map(|d| serde_json::json!({
-        "class": d.class, "confidence": d.confidence, "model": d.model_version, "color": d.color,
-        "track_id": d.track_id.as_deref().and_then(|t| t.rsplit(|c| c == '/' || c == 't').next()).and_then(|n| n.parse::<u64>().ok()),
-        "near_person": near.contains(d.detection_id.as_str()),
-    })).collect();
-    let v = serde_json::json!({
-        "camera_id": o.source_id, "camera": o.source_id,
-        "seq": o.frame_index.unwrap_or((o.media_time_us / 1000) as u64),
-        "at": o.media_time_us as f64 / 1e6, "ts": o.indexed_at_utc_us as f64 / 1e6,
-        "detections": dets, "thumbnail_hex": b.thumbnail_hex,
-    });
-    serde_json::to_vec(&v).ok()
 }

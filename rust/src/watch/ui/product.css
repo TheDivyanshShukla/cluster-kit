@@ -2,6 +2,8 @@
 .auth-bar { margin: 0; padding: .2rem .75rem; border-bottom: 1px solid var(--line); background: var(--surface); color: var(--quiet); font-size: .92rem; }
 .auth-bar a { color: var(--pop); text-underline-offset: 3px; }
 .auth-bar.need { color: var(--warn); }
+/* Only a real problem (sign-in required) is worth a row; "signed in as…" / "open mode" notices are not. */
+.auth-bar:not(.need) { display: none; }
 .card { border: 0; border-top: 1px solid var(--line); padding: .55rem 0; margin: 0; background: transparent; }
 .card h3 { margin: 0 0 .2rem; }
 .card p { margin: .2rem 0; }
@@ -56,6 +58,13 @@
 .ct > img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
 .ct > svg, .ct > canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .ct[data-sig="1"] > .ct-sig { display: none; }
+.ct > video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; opacity: 0; }
+.ct[data-vp="1"] > video { opacity: 1; }
+.ct[data-vp="1"] > canvas.base { visibility: hidden; }
+.ct[data-vs="loading"]::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(100deg, transparent 30%, rgba(255,255,255,.07) 50%, transparent 70%) 0 0 / 200% 100%; animation: shimmer 1.4s linear infinite; }
+@keyframes shimmer { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .ct[data-vs="loading"]::after { animation: none; } }
+.ct-note { position: absolute; left: .4rem; bottom: 1.8rem; font-size: .8rem; padding: 0 .4rem; background: rgba(0,0,0,.7); border: 1px solid var(--line2); color: var(--quiet); pointer-events: none; }
 .ct svg rect { fill: none; stroke: var(--ok); stroke-width: .4; } .ct svg text { fill: var(--ok); font-family: var(--font-mono); }
 .ct-sig { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; color: #5b646b; font-family: var(--font-mono); font-size: .92rem; padding: .5rem; background: #050607; }
 .ct img:not(.hide) ~ .ct-sig { background: transparent; }
