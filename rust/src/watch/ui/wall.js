@@ -220,10 +220,12 @@ let mediaOf = {}, mediaBusy = false;
 var repOf = {};
 // Recordings of the same scene differ by a fraction of a second in length, which over ~500k loops would put the cameras hours apart; so cameras of similar length share the shortest length as their loop period.
 const period = (id, dur) => Object.keys(repOf).reduce((p, k) => { const o = mediaOf[k]; return o && o.dur < p && Math.abs(o.dur - dur) < dur * 0.01 ? o.dur : p; }, dur);
-const repPos = (id, dur) => { const r = repOf[id]; if (!r) return null; const P = period(id, dur); return (((r.start * P + Date.now() / 1000) % P) + P) % P; };
+var repEpoch = 0; // server start time (unix s): a replayed source is at its `start` position at that moment
+const repPos = (id, dur) => { const r = repOf[id]; if (!r) return null; const P = period(id, dur); return (((r.start * P + (Date.now() / 1000 - repEpoch)) % P) + P) % P; };
 async function loadRep() {
   try {
     const j = await V.call("GET", "/api/sources"), next = {};
+    if (j && Number(j.epoch) > 0) repEpoch = Number(j.epoch);
     for (const x of (j && j.expanded) || []) if (x.kind === "file") next[x.id] = { start: Number(x.start) || 0 };
     if (JSON.stringify(next) !== JSON.stringify(repOf)) { repOf = next; if (view === "live") render(true); }
   } catch (_) {}

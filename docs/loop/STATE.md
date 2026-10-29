@@ -8,11 +8,11 @@ Defaults chosen (no answer from the user yet): the demo cluster is a mix of mach
 | # | Item | Branch | Status | Evidence |
 | --- | --- | --- | --- | --- |
 | 1 | Editor autocomplete (SQL + Lua) and Search wording fixes | feature/watch-vision-platform | Done: verified in a real browser (SQL keywords/tables/columns/values, Lua db./row fields/counts.), 1,278 of 1,291 suggestions accepted by the server (the rest intentionally flagged), rehearsal 15/15 | docs/evidence/e2/ |
-| 2 | Cluster join (running, agent K): `cw join`, `/join` page, pairing, prebuilt/source bundle, models + config + footage served by the head, `cw deploy user@host` | feature/watch-vision-platform | Not started | docs/evidence/k/ |
-| 3 | Cluster work split: archive segments across workers, no duplicates, failover per segment | same | Not started | docs/evidence/k/ |
-| 4 | Cluster benchmark: run, per-worker live progress, 1/2/3/4 PC results, speed-up and efficiency, honest same-machine warning | same | Not started | docs/evidence/k/ |
-| 5 | Realtime view: per-camera lag and keeping-up, camera to worker map, capacity versus demand, phone camera helper (test URL, add as live source) | same | Not started | docs/evidence/k/ |
-| 6 | `docs/CLUSTER_DEMO.md` runbook for the multi-PC demo | same | Not started | |
+| 2 | Cluster join: `cw join`, `/join` page, pairing, prebuilt/source bundle, models + config + footage served by the head, `cw deploy user@host` | feature/watch-vision-platform | Done on one machine (agent K): real join via install.sh (bundle + sha256), join with and without sign-in, remote footage, deploy dry-run. Not run: Linux/Windows installer, source build, real ssh, multi-PC | docs/evidence/k/join_enforced.md, docs/evidence/k/join-*.jpg |
+| 3 | Cluster work split: archive segments across workers, no duplicates, failover per segment | same | Done (agent K): 2 workers, w2 without footage, identical observation/detection ids vs single run, w2 killed mid-run | docs/evidence/k/segments.md |
+| 4 | Cluster benchmark: run, per-worker live progress, 1/2/3/4 PC results, speed-up and efficiency, honest same-machine warning | same | Done (agent K): API, panel, `scripts/cluster_bench.sh`; numbers are single-machine only | docs/evidence/k/bench_local.md, docs/evidence/k/cluster-*.jpg |
+| 5 | Realtime view: per-camera lag and keeping-up, camera to worker map, capacity versus demand, phone camera helper | same | Done (agent K): panel, SSE, live rebalance, probe + add (MJPEG simulated phone) | docs/evidence/k/cluster-*.jpg |
+| 6 | `docs/CLUSTER_DEMO.md` runbook for the multi-PC demo | same | Done (agent K) | docs/CLUSTER_DEMO.md |
 | 7 | Distributed search: per-node shards, fan-out and merge, partial results, realtime events, media proxy | worktree branch (3 commits, base eff6465) | Built behind CW_SHARDS=1 (default off); 199 unit tests pass (re-run by coordinator); chaos run 98/98 on one machine. To do: merge onto the cluster work (api.rs, head.rs, worker.rs, auth, domain.rs, mod.rs integration points), re-run tests and the chaos script on the merged tree, wire nodes strip into Search/Review | docs/evidence/d/, docs/DISTRIBUTED.md (in the worktree) |
 | 8 | Final pass: full test suite, acceptance, demo rehearsal, docs refresh, commit | each branch | Not started | |
 

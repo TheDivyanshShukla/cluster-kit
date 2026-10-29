@@ -7,11 +7,12 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/ui/app.css">
+<link rel="stylesheet" href="/ui/cluster.css">
 </head>
 <body>
 <header>
   <a class="brand" href="/" aria-label="Watch home"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 8V3h5M17 3h5v5M22 16v5h-5M7 21H2v-5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Watch</a>
-  <nav aria-label="Main navigation"><a href="/">Live</a><a href="/find">Search</a><a href="/sources">Sources</a><a href="/setup">Rules & models</a><a href="/analytics" aria-current="page">Cluster</a><a href="/logs">Activity</a></nav>
+  <nav aria-label="Main navigation"><a href="/">Live</a><a href="/find">Search</a><a href="/sources">Sources</a><a href="/setup">Rules & models</a><a href="/analytics" aria-current="page">Cluster</a><a href="/join">Join a PC</a><a href="/logs">Activity</a></nav>
   <div class="meters">
     <div class="ops"><b id="f-ops">0</b><span>ops / s</span></div>
     <div class="lack"><b id="f-lack">0</b><span>lacking / s</span></div>
@@ -21,8 +22,72 @@
 </header>
 <div class="connection hide" id="connection" role="status"></div>
 <main>
-  <h1>Cluster performance</h1>
+  <h1>Cluster</h1>
   <p class="quiet" id="sentence"></p>
+  <section class="cl-panel" id="p-nodes" aria-labelledby="h-nodes">
+    <div class="section-heading"><h2 id="h-nodes">PCs</h2><a href="/join">Join a PC</a></div>
+    <div class="scroll"><table class="cl" id="nodes"><thead><tr><th>Name</th><th>System</th><th class="n">Cores</th><th>State</th><th>Working on</th><th class="n">Frames/s</th><th class="n">ms/frame</th><th class="n">CPU</th><th>Joined</th></tr></thead><tbody></tbody></table></div>
+    <div class="cl-warn" id="same-host" hidden></div>
+  </section>
+
+  <section class="cl-panel" id="p-rt" aria-labelledby="h-rt">
+    <div class="section-heading"><h2 id="h-rt">Realtime</h2><span class="quiet mono" id="rt-age"></span></div>
+    <p class="sub quiet">Live cameras against what the PCs can analyse. Capacity is one divided by the measured cost of a frame on each PC, so it moves with how busy the picture is.</p>
+    <div id="rt-total"></div>
+    <div id="rt-map"></div>
+    <div class="scroll"><table class="cl" id="rt-cams"><thead><tr><th>Camera</th><th>PC</th><th class="n">Analysed fps</th><th class="n">Needed fps</th><th class="n">Lag</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+    <div id="rt-moves" class="cl-note" hidden></div>
+    <p class="footnote">A camera that stays behind for 20 seconds while another PC is idle is moved there, one camera at a time. Its tracker starts over on the new PC, so track ids do not continue across the move.</p>
+  </section>
+
+  <section class="cl-panel" id="p-bench" aria-labelledby="h-bench">
+    <div class="section-heading"><h2 id="h-bench">Benchmark</h2><span class="quiet mono" id="bench-workers"></span></div>
+    <p class="sub quiet">Runs the real pipeline, with the current settings, over recordings you pick, using the PCs connected right now. Run it with one PC, join another, run it again, and compare. Benchmark data is kept apart and can be deleted.</p>
+    <div class="cl-grid">
+      <div>
+        <label for="b-name">Name</label><input id="b-name" placeholder="e.g. 1 PC">
+        <div class="row two">
+          <div><label for="b-rep">Repeat</label><input id="b-rep" type="number" min="1" max="20" value="1"></div>
+          <div><label for="b-seg">Segment (seconds, 0 = whole file)</label><input id="b-seg" type="number" min="0" max="3600" placeholder="setting"></div>
+        </div>
+        <label>Recordings</label>
+        <div class="pick" id="b-media"><span class="quiet">Loading...</span></div>
+        <div class="row"><button class="primary" id="b-run" type="button">Run benchmark</button><span class="msg" id="b-msg" role="status"></span></div>
+      </div>
+      <div id="b-live"></div>
+    </div>
+    <div class="cl-warn" id="b-warn" hidden></div>
+    <h3 style="margin-top:1rem">Results</h3>
+    <div class="scroll"><table class="cl" id="b-table"><thead><tr><th>Run</th><th class="n">PCs</th><th class="n">Time</th><th class="n">Speed</th><th class="n">Frames inferred</th><th class="n">Speed-up</th><th class="n">Efficiency</th><th></th></tr></thead><tbody></tbody></table></div>
+    <div id="b-chart"></div>
+    <p class="footnote" id="b-foot">Speed-up is the 1-PC time divided by the run's time, for the same recordings and settings. Efficiency is speed-up divided by the number of PCs. A run without a 1-PC run to compare shows neither.</p>
+  </section>
+
+  <section class="cl-panel" id="p-phone" aria-labelledby="h-phone">
+    <div class="section-heading"><h2 id="h-phone">Add a phone camera</h2></div>
+    <p class="sub quiet">No camera connected? A phone on the same Wi-Fi can be a live camera. Any app that publishes an RTSP or HTTP MJPEG stream will do.</p>
+    <div class="cl-grid">
+      <div>
+        <ol class="cl-steps">
+          <li><b>Android:</b> start an app that serves video over the network (for example an IP-webcam style app). Typical addresses are <code>http://&lt;phone-ip&gt;:8080/video</code> or <code>rtsp://&lt;phone-ip&gt;:8554/...</code>; the app shows the exact one.</li>
+          <li><b>iPhone:</b> use an app that publishes an RTSP or HTTP stream and copy the address it shows. Without an app, Continuity Camera shows up below when this Mac can see it.</li>
+          <li>Keep the phone on the same Wi-Fi as this PC and awake. Paste the address, press Test, then Add.</li>
+        </ol>
+        <label for="ph-url">Stream address</label>
+        <input id="ph-url" placeholder="http://192.168.1.50:8080/video" autocomplete="off" inputmode="url">
+        <label for="ph-name">Camera name</label>
+        <input id="ph-name" placeholder="Phone 1" value="Phone 1">
+        <div class="row"><button id="ph-test" type="button">Test</button><button class="primary" id="ph-add" type="button" disabled>Add as live camera</button></div>
+        <div class="msg" id="ph-msg" role="status"></div>
+      </div>
+      <div>
+        <h3>Cameras attached to the PCs</h3>
+        <div id="devices" class="quiet">Looking...</div>
+      </div>
+    </div>
+  </section>
+
+  <h1 style="margin-top:1.5rem">Performance</h1>
   <div class="charts">
     <section>
       <h2>Operations and frames lacking</h2>
@@ -42,5 +107,6 @@
 </main>
 <script src="/ui/app.js"></script>
 <script src="/ui/analytics.js"></script>
+<script src="/ui/cluster.js"></script>
 </body>
 </html>

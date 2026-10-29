@@ -11,6 +11,21 @@ pub struct Probe {
     pub duration: f64,
 }
 
+/// Footage the head serves to a worker that has no copy of the recording. The worker token rides in a request header.
+pub const REMOTE_MEDIA: &str = "/api/v1/worker/media/";
+
+/// ffmpeg/ffprobe input options for `url`: the worker token for the head's media route, nothing otherwise.
+pub fn input_headers(url: &str) -> Vec<String> {
+    headers_with(url, std::env::var("CW_WORKER_TOKEN").ok().as_deref())
+}
+
+fn headers_with(url: &str, token: Option<&str>) -> Vec<String> {
+    match token {
+        Some(t) if !t.is_empty() && url.starts_with("http") && url.contains(REMOTE_MEDIA) => vec!["-headers".into(), format!("Authorization: Bearer {t}\r\n")],
+        _ => Vec::new(),
+    }
+}
+
 pub fn ffmpeg_args(url: &str, kind: &str, ss: f64, width: u32) -> Vec<String> {
     let width = (width.clamp(320, 1280) / 2) * 2; // motion mode decodes wide and cuts crops from it
     let mut a = vec![
@@ -39,6 +54,7 @@ pub fn ffmpeg_args(url: &str, kind: &str, ss: f64, width: u32) -> Vec<String> {
         }
         "archive" | "image" => {
             if ss > 0.0 { a.extend(["-ss".into(), format!("{ss:.3}")]); }
+            a.extend(input_headers(url));
             a.extend(["-i".into(), url.into()]);
         }
         _ => {
@@ -46,6 +62,7 @@ pub fn ffmpeg_args(url: &str, kind: &str, ss: f64, width: u32) -> Vec<String> {
             if ss > 0.05 {
                 a.extend(["-ss".into(), format!("{ss:.3}")]);
             }
+            a.extend(input_headers(url));
             a.extend(["-i".into(), url.into()]);
         }
     }
@@ -67,17 +84,9 @@ pub fn ffmpeg_args(url: &str, kind: &str, ss: f64, width: u32) -> Vec<String> {
 
 pub fn probe(path: &str) -> Probe {
     let out = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "format=duration:stream=avg_frame_rate",
-            "-of",
-            "json",
-            path,
-        ])
+        .args(["-v", "error"])
+        .args(input_headers(path))
+        .args(["-select_streams", "v:0", "-show_entries", "format=duration:stream=avg_frame_rate", "-of", "json", path])
         .output();
     let Ok(out) = out else { return Probe { fps: 25.0, duration: 0.0 } };
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({}));
@@ -487,6 +496,18 @@ mod tests {
         assert!(preview.iter().any(|a| a == "-re"));
         assert!(preview.iter().any(|a| a == "mjpeg"));
         assert!(preview.iter().any(|a| a == "framerate=fps=60,scale=1280:-2:flags=fast_bilinear"));
+    }
+
+    #[test]
+    fn the_worker_token_goes_only_to_the_heads_media_route() {
+        let head = "http://10.0.0.2:7710/api/v1/worker/media/m1/stream";
+        assert_eq!(headers_with(head, Some("cwt_x")), ["-headers", "Authorization: Bearer cwt_x\r\n"]);
+        assert!(headers_with(head, None).is_empty(), "open mode: no token, no header");
+        assert!(headers_with("http://camera.local/video", Some("cwt_x")).is_empty(), "never sent to a camera or any other URL");
+        assert!(headers_with("rtsp://10.0.0.9/live", Some("cwt_x")).is_empty());
+        let args = ffmpeg_args(head, "archive", 8.0, 640);
+        let i = args.iter().position(|a| a == "-i").unwrap();
+        assert!(args[..i].iter().any(|a| a == "-ss"), "seek is an input option, before -i");
     }
 
     #[test]

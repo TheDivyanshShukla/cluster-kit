@@ -2,7 +2,7 @@
 //! latest sharp frame. Rules run only on frames the detector actually saw.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -75,6 +75,8 @@ struct CamLive {
     same: u32,
     paced: u32,
     passes: u32,
+    /// Sampled frames taken off the queue this second, whatever the plan (detector, tracked or static).
+    processed: u32,
     detect_us: u64,
     debt: f64,
     pace: f64,
@@ -108,7 +110,7 @@ struct CamLive {
 impl CamLive {
     fn new(name: String, url: String) -> Self {
         CamLive {
-            name, url, gated: 0, blur: 0, blank: 0, missed: 0, same: 0, paced: 0, passes: 0, detect_us: 0, debt: 0.0, pace: 25.0, persons: 0,
+            name, url, gated: 0, blur: 0, blank: 0, missed: 0, same: 0, paced: 0, passes: 0, processed: 0, detect_us: 0, debt: 0.0, pace: 25.0, persons: 0,
             at: 0.0, dur: 0.0, error: String::new(), detector_error: String::new(), queue: VecDeque::new(), seq: 0,
             boxes: serde_json::json!([]), completed: false, indexed_frames: 0, processing: false, cov: CoverageTracker::default(),
             dropped: 0, error_code: String::new(), halt: false, checkpoint_us: 0,
@@ -129,6 +131,11 @@ struct Shared {
     /// Until this unix-ms time, skip `/api/v1/index` (the head answered 404) and use the legacy route.
     legacy_until_ms: AtomicI64,
     measured_fps: Mutex<f64>,
+    /// Head address, for footage this PC does not hold.
+    base: String,
+    /// Time spent on, and number of, frames taken off the queues since the last stats post.
+    proc_us: AtomicU64,
+    proc_n: AtomicU64,
 }
 
 pub fn run(opts: Opts) -> Result<(), String> {
@@ -158,6 +165,9 @@ pub fn run(opts: Opts) -> Result<(), String> {
         leases: Mutex::new(HashMap::new()),
         legacy_until_ms: AtomicI64::new(0),
         measured_fps: Mutex::new(0.0),
+        base: base.clone(),
+        proc_us: AtomicU64::new(0),
+        proc_n: AtomicU64::new(0),
     });
     let threads = crate::watch::detector_threads();
     let infer_shared = shared.clone();
@@ -180,6 +190,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
             .query("host", &crate::watch::hostname())
             .query("cores", &threads.to_string())
             .query("local", if opts.local { "1" } else { "0" })
+            .query("label", &std::env::var("CW_NODE_NAME").unwrap_or_default())
             .call();
         let Ok(resp) = work else {
             thread::sleep(Duration::from_secs(1));
@@ -233,7 +244,9 @@ pub fn run(opts: Opts) -> Result<(), String> {
 
 fn source_width(url: &str) -> Option<u32> {
     let out = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width", "-of", "csv=p=0", url])
+        .args(["-v", "error"])
+        .args(decode::input_headers(url))
+        .args(["-select_streams", "v:0", "-show_entries", "stream=width", "-of", "csv=p=0", url])
         .output()
         .ok()?;
     String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse().ok().filter(|w| *w > 0)
@@ -285,8 +298,16 @@ fn drain_and_complete(shared: &Shared, id: &str, stop: &AtomicBool) {
 }
 
 fn camera_loop(cam: Camera, id: String, shared: Arc<Shared>, stop: Arc<AtomicBool>) {
-    let url = config::resolve_url(&cam.url);
     let archive = matches!(cam.kind.as_str(), "archive" | "image");
+    let lease = shared.leases.lock().unwrap().get(&id).cloned();
+    let mut url = config::resolve_url(&cam.url);
+    // No copy of the recording here (or CW_MEDIA=remote): read it from the head, which serves ranges.
+    if let Some(l) = lease.as_ref().filter(|l| (archive || cam.kind == "file") && !l.media_id.is_empty() && !url.contains("://")) {
+        if std::env::var("CW_MEDIA").is_ok_and(|v| v == "remote") || !std::path::Path::new(&url).is_file() {
+            url = format!("{}{}{}/stream", shared.base, decode::REMOTE_MEDIA, l.media_id);
+            log(&format!("{}: reading the recording from the head", cam.name));
+        }
+    }
     if let Err(e) = decode::preflight(&url, &cam.kind) {
         set_error(&shared, &id, e.code(), e.message(), true);
         return;
@@ -300,7 +321,6 @@ fn camera_loop(cam: Camera, id: String, shared: Arc<Shared>, stop: Arc<AtomicBoo
     }
     let probed = if matches!(cam.kind.as_str(), "file" | "archive") { decode::probe(&url) } else { decode::Probe { fps: 25.0, duration: 0.0 } };
     // A lease with a segment decodes from (start - overlap) and stops at its end; the overlap is tracked, not indexed.
-    let lease = shared.leases.lock().unwrap().get(&id).cloned();
     let seg_end_us = lease.as_ref().and_then(|l| l.segment[1]);
     let ss = match lease.as_ref().and_then(|l| l.segment[0]) {
         Some(start) => (start - lease.as_ref().map_or(0, |l| l.overlap_us)).max(0) as f64 / 1e6,
@@ -309,6 +329,8 @@ fn camera_loop(cam: Camera, id: String, shared: Arc<Shared>, stop: Arc<AtomicBoo
     };
     // Decoding wider than the source only upscales: cap at the source width when it is known (files).
     let src_w = if matches!(cam.kind.as_str(), "file" | "archive") { source_width(&url) } else { None };
+    // A segment starts on a whole frame, so frame times are the same whole-frame times a single run produces.
+    let first_frame = lease.as_ref().and_then(|l| l.segment[0]).map(|_| (ss * probed.fps - 1e-3).ceil().max(0.0) as u64);
     let eff_width = |p: &Process| src_w.map_or(p.decode_width(), |s| p.decode_width().min(s.max(16)));
     let started = Instant::now();
     let mut frames = 0u64;
@@ -362,7 +384,7 @@ fn camera_loop(cam: Camera, id: String, shared: Arc<Shared>, stop: Arc<AtomicBoo
             if eff_width(&proc) != width {
                 break;
             }
-            let at = media_at(ss, frames, probed.fps, probed.duration);
+            let at = match first_frame { Some(i0) => (i0 + frames.saturating_sub(1)) as f64 / probed.fps.max(0.1), None => media_at(ss, frames, probed.fps, probed.duration) };
             let at_us = (at * 1e6).round() as i64;
             if seg_end_us.is_some_and(|e| at_us >= e) {
                 // Segment finished: stop decoding and let the queue drain.
@@ -504,6 +526,7 @@ fn infer_loop(shared: Arc<Shared>, threads: usize, base: String) {
             if let Some(c) = shared.cams.lock().unwrap().get_mut(&id) {
                 c.processing = false;
                 let span = (1_000_000.0 / c.pace.max(1.0)) as i64 * proc_now.every.max(1) as i64;
+                c.processed += 1;
                 if plan == Plan::Tracked { c.ops.tracked_frames += 1 } else { c.ops.static_frames += 1 }
                 c.ops.pixels_full += slot.w as u64 * slot.h as u64;
                 if slot.own && c.last_acked {
@@ -515,6 +538,8 @@ fn infer_loop(shared: Arc<Shared>, threads: usize, base: String) {
                 c.persons = view.iter().filter(|b| b["class"] == "person").count() as u32;
                 c.boxes = serde_json::Value::Array(view);
             }
+            shared.proc_n.fetch_add(1, Ordering::Relaxed);
+            shared.proc_us.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
             continue;
         }
         let rules = shared.rules.lock().unwrap().clone();
@@ -646,6 +671,7 @@ fn infer_loop(shared: Arc<Shared>, threads: usize, base: String) {
             continue;
         }
         let lease = shared.leases.lock().unwrap().get(&id).cloned();
+        let source_id = lease.as_ref().and_then(|l| l.settings.get("source_id")).and_then(|v| v.as_str()).unwrap_or(&id).to_string();
         let posted = if !slot.own {
             // Segment overlap: tracker warmed above, but the previous segment owns this frame.
             Posted::Skipped
@@ -673,10 +699,12 @@ fn infer_loop(shared: Arc<Shared>, threads: usize, base: String) {
             ran.dedup();
             let job_id = lease.as_ref().map(|l| l.job_id.clone()).unwrap_or_else(|| "legacy".into());
             let resolved = config::resolve_url(&cam_url);
-            let batch = ingest::batch_from_frame(&FrameIn {
-                source_id: &id,
+            let mut batch = ingest::batch_from_frame(&FrameIn {
+                source_id: &source_id,
                 media_id: lease.as_ref().map(|l| l.media_id.as_str()),
-                fingerprint: None,
+                // Segmented and benchmark tasks carry the recording's content fingerprint, so frame ids do not depend on where
+                // this PC keeps (or streams) the file. Other tasks keep the path-based ids their data already has.
+                fingerprint: lease.as_ref().and_then(|l| l.settings.get("fingerprint")).and_then(|v| v.as_str()),
                 resolved_url: &resolved,
                 job_id: &job_id,
                 media_time_us: at_us,
@@ -688,6 +716,15 @@ fn infer_loop(shared: Arc<Shared>, threads: usize, base: String) {
                 indexed_at_utc_us: (now_secs() * 1e6) as i64,
                 lease: lease.as_ref().map(|l| LeaseRef { task_id: l.task_id.clone(), generation: l.generation }),
             });
+            // Tracker numbers start at 1 in every segment (and after every failover): scope them so two segments never share a track.
+            if let Some(seg) = lease.as_ref().and_then(|l| l.settings.get("seg").and_then(|v| v.as_u64()).map(|s| (s, l.generation))) {
+                let tag = if seg.1 > 1 { format!("~s{}g{}", seg.0, seg.1) } else { format!("~s{}", seg.0) };
+                for d in &mut batch.detections { if let Some(t) = d.track_id.as_mut() { t.push_str(&tag); } }
+                for r in &mut batch.relations {
+                    if let Some(t) = r.subject_track_id.as_mut() { t.push_str(&tag); }
+                    if let Some(t) = r.object_track_id.as_mut() { t.push_str(&tag); }
+                }
+            }
             // Next pass can carry these forward by detection id.
             if let Some(pipe) = pipes.get_mut(&id) {
                 for (d, b) in batch.detections.iter().zip(&drawn) {
@@ -722,6 +759,8 @@ fn infer_loop(shared: Arc<Shared>, threads: usize, base: String) {
         }
         let persons = counts.get("person").copied().unwrap_or(0);
         let us = t0.elapsed().as_micros() as u64;
+        shared.proc_n.fetch_add(1, Ordering::Relaxed);
+        shared.proc_us.fetch_add(us, Ordering::Relaxed);
         let looks: Vec<String> = people.iter().take(2).map(|b| format!("{} person", gate::color_name(&slot.rgb, slot.w, slot.h, *b))).collect();
         if let Some(c) = shared.cams.lock().unwrap().get_mut(&id) {
             c.processing = false;
@@ -746,13 +785,14 @@ fn infer_loop(shared: Arc<Shared>, threads: usize, base: String) {
                 _ => {}
             }
             c.passes += 1;
+            c.processed += 1;
             c.detect_us += us;
             c.persons = persons;
             c.boxes = serde_json::Value::Array(drawn);
         }
         let mut events = Vec::new();
         for rule in &rules {
-            if !rule.enabled {
+            if !rule.enabled || source_id.starts_with("bench-") {
                 continue;
             }
             if !rule.camera.is_empty() && rule.camera != name && rule.camera != id {
@@ -828,6 +868,11 @@ fn sync_engines(shared: &Shared, loaded: &mut Vec<Loaded>, threads: usize) {
         if m.enabled && m.kind != "fight" && !m.model.is_empty() {
             let p = root.join(&m.model);
             if p.is_file() {
+                match Engine::load(&p, threads) {
+                    Ok(e) => engine = Some(e),
+                    Err(e) => log(&format!("could not load {}: {e}", m.model)),
+                }
+            } else if std::env::var("CW_FETCH_MODELS").is_ok_and(|v| v == "1") && crate::watch::join::fetch_from_head(&shared.base, &m.model, &root).is_ok() {
                 match Engine::load(&p, threads) {
                     Ok(e) => engine = Some(e),
                     Err(e) => log(&format!("could not load {}: {e}", m.model)),
@@ -983,7 +1028,10 @@ fn heartbeat_loop(shared: Arc<Shared>, base: String, id: String, cores: usize) {
                     for cam in lost {
                         leases.remove(&cam);
                         drop(leases);
-                        set_error(&shared, &cam, "lease_lost", "The head no longer lists this lease (expired or reassigned); stopping this task.".into(), true);
+                        // A finished part is no longer listed by the head: that is completion, not a lost lease.
+                        if !shared.cams.lock().unwrap().get(&cam).is_some_and(|c| c.completed) {
+                            set_error(&shared, &cam, "lease_lost", "The head no longer lists this lease (expired or reassigned); stopping this task.".into(), true);
+                        }
                         leases = shared.leases.lock().unwrap();
                     }
                 }
@@ -1015,8 +1063,15 @@ fn conf_of(base: f32, mode: &str) -> f32 {
 fn stats_loop(shared: Arc<Shared>, base: String, id: String, ip: String, local: bool) {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_millis(500)).build();
     let mut sys = sysinfo::System::new();
+    let mut frame_ms = 0.0f64;
     loop {
         thread::sleep(Duration::from_secs(1));
+        // Average cost of one sampled frame (detector, tracked or static), the basis of the head's capacity estimate.
+        let (n, us) = (shared.proc_n.swap(0, Ordering::Relaxed), shared.proc_us.swap(0, Ordering::Relaxed));
+        if n > 0 {
+            let now_ms = us as f64 / n as f64 / 1000.0;
+            frame_ms = if frame_ms == 0.0 { now_ms } else { frame_ms * 0.7 + now_ms * 0.3 };
+        }
         sys.refresh_cpu_usage();
         sys.refresh_memory();
         let mut cams_json = serde_json::Map::new();
@@ -1035,6 +1090,7 @@ fn stats_loop(shared: Arc<Shared>, base: String, id: String, ip: String, local: 
                         "same": cam.same,
                         "paced": cam.paced,
                         "passes": cam.passes,
+                        "processed": cam.processed,
                         "detect_us": cam.detect_us,
                         "debt": cam.debt,
                         "pace": cam.pace,
@@ -1087,6 +1143,7 @@ fn stats_loop(shared: Arc<Shared>, base: String, id: String, ip: String, local: 
                 cam.same = 0;
                 cam.paced = 0;
                 cam.passes = 0;
+                cam.processed = 0;
                 cam.detect_us = 0;
             }
         }
@@ -1102,6 +1159,10 @@ fn stats_loop(shared: Arc<Shared>, base: String, id: String, ip: String, local: 
             "ip": ip,
             "cores": crate::watch::detector_threads(),
             "local": local,
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "label": std::env::var("CW_NODE_NAME").unwrap_or_default(),
+            "frame_ms": frame_ms,
             "cpu": sys.global_cpu_usage(),
             "ram_used": sys.used_memory(),
             "ram_total": sys.total_memory(),

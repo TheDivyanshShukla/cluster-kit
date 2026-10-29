@@ -101,6 +101,8 @@ struct Task {
     attempt: u32,
     st: St,
     queued_at: Us,
+    /// The worker a rebalance just took this task from: it does not get it straight back while another worker can run it.
+    avoid: Option<String>,
 }
 
 struct W {
@@ -139,6 +141,9 @@ pub struct WorkerView {
 pub struct Scheduler {
     lease_us: Us,
     max_attempts: u32,
+    /// Most finite (archive/image) tasks one worker holds at once. Keeps segments spread over the workers
+    /// instead of one worker queueing up the whole file.
+    archive_cap: usize,
     now: Us,
     workers: BTreeMap<String, W>,
     tasks: BTreeMap<String, Task>,
@@ -152,11 +157,16 @@ fn stale(msg: impl Into<String>) -> ApiError {
 impl Scheduler {
     /// `lease_us`: how long a lease and a worker's liveness last without a heartbeat. Retry budget is 3 attempts.
     pub fn new(lease_us: Us) -> Self {
-        Scheduler { lease_us: lease_us.max(1), max_attempts: 3, now: 0, workers: BTreeMap::new(), tasks: BTreeMap::new(), jobs: BTreeMap::new() }
+        Scheduler { lease_us: lease_us.max(1), max_attempts: 3, archive_cap: usize::MAX, now: 0, workers: BTreeMap::new(), tasks: BTreeMap::new(), jobs: BTreeMap::new() }
     }
 
     pub fn with_max_attempts(mut self, n: u32) -> Self {
         self.max_attempts = n.max(1);
+        self
+    }
+
+    pub fn with_archive_cap(mut self, n: usize) -> Self {
+        self.archive_cap = n.max(1);
         self
     }
 
@@ -175,6 +185,10 @@ impl Scheduler {
 
     fn held(&self, worker: &str) -> usize {
         self.tasks.values().filter(|t| matches!(&t.st, St::Leased { worker: w, .. } if w == worker)).count()
+    }
+
+    fn held_finite(&self, worker: &str) -> usize {
+        self.tasks.values().filter(|t| !t.spec.live() && matches!(&t.st, St::Leased { worker: w, .. } if w == worker)).count()
     }
 
     /// Refresh liveness and extend every lease this worker still holds. Returns the leases the head still
@@ -210,7 +224,7 @@ impl Scheduler {
         job.state = JobState::Queued;
         let now = self.now;
         for s in specs {
-            self.tasks.insert(s.task_id.clone(), Task { spec: s, job_id: job.id.clone(), generation: 1, attempt: 1, st: St::Queued, queued_at: now });
+            self.tasks.insert(s.task_id.clone(), Task { spec: s, job_id: job.id.clone(), generation: 1, attempt: 1, st: St::Queued, queued_at: now, avoid: None });
         }
         self.jobs.insert(job.id.clone(), job);
         Ok(())
@@ -219,6 +233,9 @@ impl Scheduler {
     fn eligible(&self, w: &W, t: &Task) -> bool {
         let s = &t.spec;
         if !self.alive(w) || self.held(&w.caps.id) >= w.caps.cores.max(1) as usize {
+            return false;
+        }
+        if !s.live() && self.held_finite(&w.caps.id) >= self.archive_cap {
             return false;
         }
         if !s.eligible_workers.is_empty() && !s.eligible_workers.contains(&w.caps.id) {
@@ -252,12 +269,16 @@ impl Scheduler {
             if !self.eligible(me, t) {
                 return false;
             }
+            if t.avoid.as_deref() == Some(worker) && now - t.queued_at < self.lease_us * 2 && self.workers.values().any(|o| o.caps.id != worker && self.eligible(o, t)) {
+                return false;
+            }
             let better = self.workers.values().any(|o| o.caps.id != worker && self.eligible(o, t) && self.load(o) + 1e-9 < my_load);
             !better || now - t.queued_at > self.lease_us / 2
         });
         let id = pick?.0.clone();
         let ttl = self.lease_us;
         let t = self.tasks.get_mut(&id)?;
+        t.avoid = None;
         t.st = St::Leased { worker: worker.to_string(), expires: now + ttl };
         let mut settings = t.spec.settings.clone();
         if let Some(o) = settings.as_object_mut() {
@@ -317,6 +338,10 @@ impl Scheduler {
 
     pub fn fail_with(&mut self, task_id: &str, generation: u64, permanent: bool, err: ApiError) -> Result<(), ApiError> {
         self.check(&LeaseRef { task_id: task_id.into(), generation })?;
+        // A report that arrives after the task finished (a worker that lost its lease record at the end) must not undo it.
+        if self.tasks.get(task_id).is_some_and(|t| t.st == St::Done) {
+            return Ok(());
+        }
         if permanent {
             self.tasks.get_mut(task_id).unwrap().st = St::Failed(err);
         } else {
@@ -369,6 +394,10 @@ impl Scheduler {
     /// spending an attempt; its old holder loses the lease at its next heartbeat and the head resumes
     /// the new lease from the committed checkpoint. Returns the task IDs moved.
     pub fn rebalance(&mut self) -> Vec<String> {
+        // Work still waiting in the queue goes to the idle worker first; nobody has to lose a running task for it.
+        if self.tasks.values().any(|t| t.st == St::Queued) {
+            return Vec::new();
+        }
         let mut moved = Vec::new();
         loop {
             let idle: Vec<String> = self.workers.values().filter(|w| self.alive(w) && self.held(&w.caps.id) == 0).map(|w| w.caps.id.clone()).collect();
@@ -379,7 +408,8 @@ impl Scheduler {
             let mut by: BTreeMap<String, Vec<(Us, String)>> = BTreeMap::new();
             for (id, t) in &self.tasks {
                 if let St::Leased { worker, expires } = &t.st {
-                    if !t.spec.live() && t.spec.device.is_none() && t.spec.eligible_workers.is_empty() {
+                    // Segments are small and pulled one by one (see `archive_cap`); moving one that is half done only repeats its work.
+                    if !t.spec.live() && t.spec.device.is_none() && t.spec.eligible_workers.is_empty() && t.spec.settings.get("seg").is_none() {
                         by.entry(worker.clone()).or_default().push((*expires, id.clone()));
                     }
                 }
@@ -399,6 +429,9 @@ impl Scheduler {
             }
             let now = self.now;
             let t = self.tasks.get_mut(&id).unwrap();
+            if let St::Leased { worker, .. } = &t.st {
+                t.avoid = Some(worker.clone());
+            }
             t.generation += 1;
             t.st = St::Queued;
             t.queued_at = now - self.lease_us; // first in line for the idle worker
@@ -408,6 +441,38 @@ impl Scheduler {
             }
         }
         moved
+    }
+
+    /// Conservative live-camera rebalance. `behind` = live tasks that have not kept up for a while. One camera moves per
+    /// call, and only to a worker that holds at least two fewer live cameras than the camera's current worker.
+    /// The task is requeued at generation+1 (no attempt spent); the old holder loses it at its next poll and the
+    /// new worker starts a fresh tracker: track ids do not continue across the move.
+    pub fn rebalance_live(&mut self, behind: &[String]) -> Option<String> {
+        let live_on = |w: &str| self.tasks.values().filter(|o| o.spec.live() && matches!(&o.st, St::Leased { worker, .. } if worker == w)).count();
+        let id = behind.iter().find(|id| {
+            let Some(t) = self.tasks.get(*id) else { return false };
+            let St::Leased { worker, .. } = &t.st else { return false };
+            if !t.spec.live() || t.spec.device.is_some() || !t.spec.eligible_workers.is_empty() {
+                return false;
+            }
+            let mine = live_on(worker);
+            self.workers.values().any(|w| w.caps.id != *worker && self.eligible(w, t) && live_on(&w.caps.id) + 2 <= mine)
+        })?.clone();
+        let now = self.now;
+        let t = self.tasks.get_mut(&id)?;
+        if let St::Leased { worker, .. } = &t.st {
+            t.avoid = Some(worker.clone());
+        }
+        t.generation += 1;
+        t.st = St::Queued;
+        t.queued_at = now - self.lease_us;
+        Some(id)
+    }
+
+    /// Forget a job and its tasks (a deleted benchmark). Workers holding them lose the lease at their next poll.
+    pub fn remove_job(&mut self, job_id: &str) {
+        self.tasks.retain(|_, t| t.job_id != job_id);
+        self.jobs.remove(job_id);
     }
 
     pub fn tasks(&self) -> Vec<TaskView> {
@@ -478,6 +543,59 @@ mod tests {
         s.register(caps("w1", 4));
         s.register(caps("w2", 4));
         s
+    }
+
+    #[test]
+    fn nothing_running_is_taken_away_while_the_queue_has_work() {
+        let mut s = Scheduler::new(15 * S);
+        s.register(caps("a", 8));
+        s.submit(job("j"), (0..4).map(|i| spec(&format!("t{i}"), SourceKind::Archive)).collect()).unwrap();
+        assert!(s.lease("a").is_some() && s.lease("a").is_some());
+        s.register(caps("b", 8));
+        assert!(s.rebalance().is_empty(), "b can lease queued tasks; a keeps both of its own");
+        assert!(s.lease("b").is_some() && s.lease("b").is_some());
+        assert!(s.rebalance().is_empty());
+    }
+
+    #[test]
+    fn a_failure_report_after_completion_does_not_reopen_the_task() {
+        let mut s = Scheduler::new(15 * S);
+        s.register(caps("a", 8));
+        s.submit(job("j"), vec![spec("t", SourceKind::Archive)]).unwrap();
+        let l = s.lease("a").unwrap();
+        s.complete("t", l.generation).unwrap();
+        s.fail("t", l.generation, false).unwrap();
+        assert_eq!(s.job_state("j"), Some(JobState::Completed));
+        assert!(s.lease("a").is_none(), "nothing was requeued");
+    }
+
+    #[test]
+    fn archive_cap_spreads_segments_over_workers() {
+        let mut s = Scheduler::new(15 * S).with_archive_cap(1);
+        s.register(caps("a", 8));
+        s.register(caps("b", 8));
+        let specs = crate::watch::scheduler::plan_segments("j", "src", "m", 40 * S, 10 * S, 2 * S);
+        s.submit(job("j"), specs).unwrap();
+        assert!(s.lease("a").is_some());
+        assert!(s.lease("a").is_none(), "cap of one finite task per worker");
+        assert!(s.lease("b").is_some());
+    }
+
+    #[test]
+    fn behind_live_camera_moves_once_to_an_idle_worker() {
+        let mut s = Scheduler::new(10 * S);
+        s.register(caps("a", 8));
+        let (j1, j2) = (job("j1"), job("j2"));
+        s.submit(j1, vec![spec("t1", SourceKind::Live)]).unwrap();
+        s.submit(j2, vec![spec("t2", SourceKind::Live)]).unwrap();
+        assert!(s.lease("a").is_some() && s.lease("a").is_some());
+        assert_eq!(s.rebalance_live(&["t1".into()]), None, "no idle worker yet");
+        s.register(caps("b", 8));
+        assert_eq!(s.rebalance_live(&["t1".into()]).as_deref(), Some("t1"));
+        assert!(s.lease("a").is_none_or(|l| l.task_id != "t1"), "the PC it was just taken from does not get it straight back");
+        let l = s.lease("b").unwrap();
+        assert_eq!((l.task_id.as_str(), l.generation), ("t1", 2));
+        assert_eq!(s.rebalance_live(&["t2".into()]), None, "one camera each is balanced; a keeps its last camera");
     }
 
     #[test]

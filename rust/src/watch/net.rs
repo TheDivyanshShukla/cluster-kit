@@ -48,3 +48,21 @@ pub fn discover(name: &str) -> String {
         }
     }
 }
+
+/// First head heard on the beacon port, whatever its name: (ip, http port, name). `None` after `wait`.
+pub fn discover_any(wait: Duration) -> Option<(String, u16, String)> {
+    let sock = UdpSocket::bind(("0.0.0.0", DISC)).ok()?;
+    let _ = sock.set_read_timeout(Some(Duration::from_secs(1)));
+    let end = std::time::Instant::now() + wait;
+    let mut buf = [0u8; 2048];
+    while std::time::Instant::now() < end {
+        if let Ok((n, from)) = sock.recv_from(&mut buf) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf[..n]) {
+                if v["magic"] == MAGIC {
+                    return Some((from.ip().to_string(), v["port"].as_u64().unwrap_or(crate::watch::PORT as u64) as u16, v["name"].as_str().unwrap_or("").to_string()));
+                }
+            }
+        }
+    }
+    None
+}

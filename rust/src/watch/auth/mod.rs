@@ -49,7 +49,7 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     d == 0
 }
 
-fn random(n: usize) -> Result<Vec<u8>, ApiError> {
+pub(crate) fn random(n: usize) -> Result<Vec<u8>, ApiError> {
     use std::io::Read;
     let mut buf = vec![0u8; n];
     std::fs::File::open("/dev/urandom")
@@ -253,6 +253,7 @@ static POLICY: &[(&str, &str, Access)] = &[
     ("GET", "/login", Public),
     ("GET", "/favicon.ico", Public),
     ("GET", "/ui", Public),
+    ("GET", "/join", Public),
     // auth
     ("POST", "/api/v1/auth/login", Public),
     ("POST", "/api/v1/auth/logout", Public),
@@ -261,7 +262,21 @@ static POLICY: &[(&str, &str, Access)] = &[
     ("POST", "/api/v1/auth/users", ADM),
     ("POST", "/api/v1/auth/password", RO),
     ("POST", "/api/v1/auth/worker-tokens", ADM),
+    // joining a PC to the cluster. The install scripts carry only the head's address. Bundles and source are public in open
+    // mode and need a valid pairing code otherwise (checked by the handler); enrolling needs a code in enforced mode.
+    ("GET", "/api/v1/join/info", Public),
+    ("GET", "/api/v1/join/install.sh", Public),
+    ("GET", "/api/v1/join/install.ps1", Public),
+    ("GET", "/api/v1/join/bundle", Public),
+    ("GET", "/api/v1/join/source.tar.gz", Public),
+    ("POST", "/api/v1/join/enroll", Public),
+    ("*", "/api/v1/join/codes", ADM),
+    ("GET", "/api/v1/join/manifest", Worker),
+    ("GET", "/api/v1/join/file", Worker),
     // worker credential routes (legacy and v1)
+    ("POST", "/api/v1/heartbeat", Worker),
+    ("POST", "/api/v1/lease", Worker),
+    ("GET", "/api/v1/worker/media", Worker),
     ("POST", "/api/index", Worker),
     ("POST", "/api/v1/index", Worker),
     ("GET", "/api/work", Worker),
@@ -307,6 +322,9 @@ static POLICY: &[(&str, &str, Access)] = &[
     ("POST", "/api/v1/rules/backtest", OP),
     ("GET", "/api/v1/audit", OP),
     ("GET", "/api/v1/events", RO),
+    ("GET", "/api/v1/cluster", RO),
+    ("GET", "/api/v1/benchmarks", RO),
+    ("W", "/api/v1/benchmarks", OP),
 ];
 
 fn method_matches(class: &str, method: &str) -> bool {
@@ -1126,6 +1144,32 @@ mod tests {
         assert_eq!(code("GET", "/ui/app.js", &[]), None);
         assert_eq!(code("GET", "/api/health", &[]), None);
         assert_eq!(code("GET", "/review", &[]), None);
+    }
+
+    #[test]
+    fn join_routes_follow_the_cluster_policy() {
+        let (a, _r) = with_admin("join");
+        a.create_user("op", PW, Role::Operator).unwrap();
+        let tok = a.create_worker_token("pc3").unwrap();
+        let (adm, op) = (login_as(&a, "admin"), login_as(&a, "op"));
+        let w = h(&[("Authorization", &format!("Bearer {tok}"))]);
+        let code = |m: &str, p: &str, c: &[(String, String)]| a.check(m, p, c).err().map(|e| e.code);
+        for p in ["/join", "/api/v1/join/info", "/api/v1/join/install.sh", "/api/v1/join/install.ps1", "/api/v1/join/bundle/macos-aarch64.tar.gz", "/api/v1/join/source.tar.gz"] {
+            assert_eq!(code("GET", p, &[]), None, "{p} is public");
+        }
+        assert_eq!(code("POST", "/api/v1/join/enroll", &[]), None, "enroll is public; the handler wants the code");
+        assert_eq!(code("POST", "/api/v1/join/codes", &[]), Some("unauthorized".into()));
+        assert_eq!(code("POST", "/api/v1/join/codes", &op), Some("forbidden".into()), "only an administrator creates codes");
+        assert_eq!(code("POST", "/api/v1/join/codes", &adm), None);
+        assert_eq!(code("POST", "/api/v1/join/codes", &w), Some("forbidden".into()), "a worker cannot mint codes");
+        for (m, p) in [("GET", "/api/v1/join/manifest"), ("GET", "/api/v1/join/file"), ("GET", "/api/v1/worker/media/m1/stream"), ("POST", "/api/v1/heartbeat")] {
+            assert_eq!(code(m, p, &w), None, "{p}");
+            assert_eq!(code(m, p, &[]), Some("unauthorized".into()), "{p} needs the worker token");
+            assert_eq!(code(m, p, &adm), Some("forbidden".into()), "{p} is not for sessions");
+        }
+        assert_eq!(code("POST", "/api/v1/benchmarks", &op), None);
+        assert_eq!(code("DELETE", "/api/v1/benchmarks/b1", &op), None);
+        assert_eq!(code("GET", "/api/v1/cluster/realtime", &op), None);
     }
 
     #[test]

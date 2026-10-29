@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch · Join a PC</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/ui/app.css">
+<link rel="stylesheet" href="/ui/cluster.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="/" aria-label="Watch home"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 8V3h5M17 3h5v5M22 16v5h-5M7 21H2v-5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Watch</a>
+  <nav aria-label="Main navigation"><a href="/">Live</a><a href="/find">Search</a><a href="/sources">Sources</a><a href="/setup">Rules &amp; models</a><a href="/analytics">Cluster</a><a href="/join" aria-current="page">Join a PC</a><a href="/logs">Activity</a></nav>
+</header>
+<main>
+  <div class="page-heading">
+    <div>
+      <h1>Join a PC to this cluster</h1>
+      <p class="sentence">A PC joins only when someone runs one command on it. Nothing is installed or started on any other machine by this page.</p>
+    </div>
+  </div>
+  <div class="cl-warn" id="localhost" hidden></div>
+  <div class="cl-grid">
+    <section class="cl-panel" aria-labelledby="h-pair">
+      <h2 id="h-pair">1. Pairing code</h2>
+      <p class="sub" id="pair-sub">A code lets one PC join. It works for 10 minutes and for one PC.</p>
+      <div class="paircode" id="code" aria-live="polite">----</div>
+      <p class="quiet mono" id="code-meta"></p>
+      <div class="row">
+        <button class="primary" id="mk" type="button">Make a pairing code</button>
+        <label class="row" style="margin:0"><span>PCs it may admit</span><input id="uses" type="number" min="1" max="50" value="1" style="width:5rem"></label>
+      </div>
+      <div class="msg" id="pair-msg" role="status"></div>
+    </section>
+    <section class="cl-panel" aria-labelledby="h-run">
+      <h2 id="h-run">2. Run one command on the PC</h2>
+      <p class="sub">Open a terminal on the other PC. It needs <code>curl</code> and <code>tar</code> (built into macOS, Linux and Windows 10+), and <code>ffmpeg</code> for decoding video.</p>
+      <div class="os-label">macOS and Linux</div>
+      <div class="cmd"><code id="cmd-sh">...</code><button type="button" data-copy="cmd-sh">Copy</button></div>
+      <div class="os-label">Windows (PowerShell)</div>
+      <div class="cmd"><code id="cmd-ps">...</code><button type="button" data-copy="cmd-ps">Copy</button></div>
+      <div class="os-label">Already have the program</div>
+      <div class="cmd"><code id="cmd-cw">...</code><button type="button" data-copy="cmd-cw">Copy</button></div>
+      <details class="help"><summary>What the command does</summary>
+        <ol class="cl-steps">
+          <li>Downloads the worker program from this head into <code>~/.watch-worker</code> and checks its sha256. If this head runs another OS it builds from the head's source instead (needs Rust).</li>
+          <li>Enrolls with the pairing code and receives a worker token, stored here as a hash only.</li>
+          <li>Downloads the detector models named in the head's settings (checked by sha256). Recordings are not copied: the worker reads them from the head as it goes.</li>
+          <li>Runs as a worker. Press Ctrl-C on that PC to leave. Nothing else on the PC is changed.</li>
+        </ol>
+        <p class="quiet">From this PC you can also push to a machine you can reach by ssh: <code>cw deploy user@host --head <span id="deploy-head">HEAD-IP</span></code></p>
+      </details>
+    </section>
+  </div>
+  <section class="cl-panel" aria-labelledby="h-nodes">
+    <h2 id="h-nodes">PCs in this cluster</h2>
+    <div class="msg" id="nodes-msg" role="status"></div>
+    <div class="scroll"><table class="cl" id="nodes"><thead><tr><th>Name</th><th>System</th><th class="n">Cores</th><th>State</th><th>Joined</th><th class="n">Frames/s</th><th class="n">CPU</th></tr></thead><tbody></tbody></table></div>
+    <p class="footnote">A PC is marked lost when the head has not heard from it for 15 seconds (the lease time); its work goes to another PC.</p>
+  </section>
+  <section class="cl-panel" aria-labelledby="h-net">
+    <h2 id="h-net">Network checklist</h2>
+    <ul class="cl-steps">
+      <li><b>TCP 7710</b> on this head must be reachable from the other PCs (http, workers and this page).</li>
+      <li><b>UDP 7711</b> lets <code>cw join</code> find the head by itself when no address is given. Giving the address works without it.</li>
+      <li>The head listens on every interface only when started with <code>CW_BIND=0.0.0.0</code>. In open mode it stays on this PC otherwise.</li>
+      <li id="mode-line"></li>
+    </ul>
+  </section>
+</main>
+<script src="/ui/join.js"></script>
+</body>
+</html>

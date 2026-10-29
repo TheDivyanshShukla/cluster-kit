@@ -113,6 +113,9 @@ pub struct Process {
     /// More separate motion crops than this on one frame: run one full-picture pass instead.
     #[serde(default = "default_max_regions")]
     pub max_regions: u32,
+    /// Archives longer than this many seconds are split into segments that different workers take at the same time. 0 = never split.
+    #[serde(default = "default_segment_secs")]
+    pub segment_secs: u32,
 }
 
 impl Process {
@@ -142,6 +145,9 @@ fn default_keyframe_secs() -> f32 {
 }
 fn default_max_regions() -> u32 {
     4
+}
+fn default_segment_secs() -> u32 {
+    120
 }
 
 fn default_mode() -> String {
@@ -232,6 +238,7 @@ pub fn preset(mode: &str) -> Process {
             detect_interval: 3,
             keyframe_secs: 3.0,
             max_regions: 3,
+            segment_secs: default_segment_secs(),
         },
         "accuracy" => Process {
             mode: "accuracy".into(),
@@ -250,6 +257,7 @@ pub fn preset(mode: &str) -> Process {
             detect_interval: 1,
             keyframe_secs: 1.0,
             max_regions: 6,
+            segment_secs: default_segment_secs(),
         },
         _ => Process {
             mode: "balanced".into(),
@@ -268,6 +276,7 @@ pub fn preset(mode: &str) -> Process {
             detect_interval: default_detect_interval(),
             keyframe_secs: default_keyframe_secs(),
             max_regions: default_max_regions(),
+            segment_secs: default_segment_secs(),
         },
     }
 }
@@ -298,6 +307,7 @@ pub fn clamp_process(mut p: Process) -> Process {
     p.detect_interval = p.detect_interval.clamp(1, 10);
     p.keyframe_secs = if p.keyframe_secs.is_finite() { p.keyframe_secs.clamp(0.5, 30.0) } else { default_keyframe_secs() };
     p.max_regions = p.max_regions.clamp(1, 8);
+    p.segment_secs = if p.segment_secs == 0 { 0 } else { p.segment_secs.clamp(5, 3600) };
     p
 }
 

@@ -1,0 +1,47 @@
+/* Cluster and Join pages. Built on app.css tokens. */
+.cl-grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); align-items: start; }
+.cl-panel { border: 1px solid var(--line); background: var(--surface); padding: .75rem .9rem; min-width: 0; margin: 0 0 1rem; }
+.cl-panel > h2:first-child { margin-top: 0; }
+.cl-panel .sub { color: var(--quiet); margin: 0 0 .6rem; max-width: 75ch; }
+.cl-steps { margin: 0 0 .5rem; padding-left: 1.2rem; color: var(--quiet); max-width: 75ch; }
+.cl-steps li { margin: .2rem 0; }
+.cl-steps b { color: var(--text); font-weight: 500; }
+.cmd { display: flex; gap: .4rem; align-items: stretch; margin: .3rem 0 .6rem; }
+.cmd code { flex: 1; display: block; padding: .55rem .7rem; background: var(--edit); border: 1px solid var(--line2); font-size: 1rem; overflow-x: auto; white-space: pre; user-select: all; min-width: 0; }
+.cmd button { flex: none; min-width: 5.5rem; }
+.os-label { font-size: .85rem; color: var(--quiet); text-transform: uppercase; letter-spacing: .06em; margin-top: .6rem; }
+.paircode { font-family: var(--font-mono); font-size: 2.2rem; letter-spacing: .14em; color: var(--pop); line-height: 1.1; margin: .2rem 0; user-select: all; }
+.paircode.dead { color: var(--quiet); text-decoration: line-through; }
+table.cl { font-family: var(--font-ui); }
+table.cl th, table.cl td { text-align: left; font-family: var(--font-ui); }
+table.cl td.n, table.cl th.n { text-align: right; font-family: var(--font-mono); }
+table.cl tr.lost td { color: var(--quiet); }
+.state { display: inline-flex; align-items: center; gap: .35rem; }
+.meter { height: 8px; background: var(--edit); position: relative; min-width: 80px; }
+.meter i { display: block; height: 100%; background: var(--lead); transition: width .4s var(--ease-out); }
+.meter.warn i { background: var(--warn); } .meter.bad i { background: var(--bad); } .meter.ok i { background: var(--ok); }
+.meter .mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--pop); }
+.cl-bars { display: grid; grid-template-columns: minmax(70px, 150px) 1fr minmax(64px, auto); gap: .3rem .6rem; align-items: center; font-size: .95rem; }
+.cl-bars > span:nth-child(3n+1) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cl-bars > span:nth-child(3n) { font-family: var(--font-mono); text-align: right; }
+.pick { max-height: 14rem; overflow: auto; border: 1px solid var(--line); background: var(--edit); padding: .2rem .5rem; }
+.pick label { display: flex; align-items: center; gap: .3rem; margin: .15rem 0; color: var(--text); overflow-wrap: anywhere; }
+.pick small { color: var(--quiet); margin-left: auto; font-family: var(--font-mono); white-space: nowrap; }
+.row.two > * { flex: 1 1 10rem; }
+.cl-warn { margin: .4rem 0; padding: .4rem .7rem; background: var(--surface2); border-left: 2px solid var(--warn); color: var(--warn); }
+.cl-note { margin: .4rem 0; padding: .4rem .7rem; background: var(--surface2); border-left: 2px solid var(--lead); color: var(--quiet); max-width: 80ch; }
+.cl-kv { display: grid; grid-template-columns: auto 1fr; gap: .15rem .8rem; margin: .3rem 0; }
+.cl-kv dt { color: var(--quiet); } .cl-kv dd { margin: 0; font-family: var(--font-mono); overflow-wrap: anywhere; }
+.status-keeping { color: var(--ok); } .status-behind { color: var(--bad); } .status-starting { color: var(--warn); } .status-error { color: var(--bad); }
+.map-row { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; margin: .25rem 0; }
+.map-row .host { min-width: 9rem; color: var(--quiet); }
+.chip { display: inline-flex; gap: .35rem; align-items: center; padding: .1rem .5rem; border: 1px solid var(--line2); font-size: .92rem; background: var(--surface2); }
+.chip.behind { border-color: var(--bad); color: var(--bad); }
+.chip.error { border-color: var(--bad); color: var(--bad); }
+.chip.starting { border-color: var(--warn); color: var(--warn); }
+details.help { margin: .4rem 0; } details.help summary { cursor: pointer; color: var(--pop); }
+@media (max-width: 600px) {
+  .cmd { flex-direction: column; } .cmd button { min-height: 34px; }
+  .paircode { font-size: 1.6rem; }
+  .bar { grid-template-columns: 90px 1fr 54px; }
+}

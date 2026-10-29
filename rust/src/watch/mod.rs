@@ -7,6 +7,8 @@
 #[allow(dead_code)]
 mod alerts;
 #[allow(dead_code)]
+mod bench;
+#[allow(dead_code)]
 mod api;
 mod approx;
 #[allow(dead_code)]
@@ -17,10 +19,13 @@ mod decode;
 mod domain;
 mod fetch;
 mod fight;
+mod fleet;
 mod gate;
 mod head;
 #[allow(dead_code)]
 mod ingest;
+#[allow(dead_code)]
+mod join;
 #[allow(dead_code)]
 mod matches;
 #[allow(dead_code)]
@@ -55,10 +60,18 @@ pub fn main() -> Result<(), String> {
         port: PORT,
         no_local: false,
         local: false,
+        positional: Vec::new(),
+        code: None,
+        node_name: None,
+        dry_run: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--name" => o.name = args.next().ok_or("--name needs a value")?,
+            "--name" => {
+                let n = args.next().ok_or("--name needs a value")?;
+                // For `join` the name labels this PC; everywhere else it is the head's name used for discovery.
+                if cmd == "join" { o.node_name = Some(n) } else { o.name = n }
+            }
             "--head" => o.head = args.next(),
             "--port" => {
                 o.port = args
@@ -69,6 +82,9 @@ pub fn main() -> Result<(), String> {
             }
             "--no-local-worker" => o.no_local = true,
             "--local" => o.local = true,
+            "--code" => o.code = Some(args.next().ok_or("--code needs a value")?),
+            "--dry-run" => o.dry_run = true,
+            other if !other.starts_with('-') && matches!(cmd.as_str(), "join" | "deploy") => o.positional.push(other.to_string()),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -76,7 +92,9 @@ pub fn main() -> Result<(), String> {
         "head" => head::run(o),
         "worker" => worker::run(o),
         "fetch" => fetch::run(),
-        _ => Err("usage: cw head | cw worker [--head IP] | cw fetch".into()),
+        "join" => join::run_join(o),
+        "deploy" => join::run_deploy(o),
+        _ => Err("usage: cw head | cw worker [--head IP] | cw join [head-ip] [--code CODE] [--name N] | cw deploy user@host [--head IP] [--dry-run] | cw fetch".into()),
     }
 }
 
@@ -86,6 +104,13 @@ pub struct Opts {
     pub port: u16,
     pub no_local: bool,
     pub local: bool,
+    /// Bare arguments after the command (`cw join 192.168.1.20`, `cw deploy me@pc`).
+    pub positional: Vec<String>,
+    /// Pairing code for `join` / `deploy`.
+    pub code: Option<String>,
+    /// `cw join --name`: the label this PC shows in the cluster.
+    pub node_name: Option<String>,
+    pub dry_run: bool,
 }
 
 pub fn log(msg: &str) {

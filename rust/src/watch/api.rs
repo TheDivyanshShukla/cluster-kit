@@ -136,9 +136,21 @@ pub struct Api {
     pub sched: Mutex<Scheduler>,
     pub engine: Mutex<alerts::Engine>,
     /// Leases handed out, by task ID. The scheduler stays the authority; this keeps the full lease body.
-    held: Mutex<HashMap<String, TaskLease>>,
+    pub(crate) held: Mutex<HashMap<String, TaskLease>>,
     /// camera id -> (url|kind key, task id). A camera is re-registered only when its location changes.
     catalog: Mutex<HashMap<String, (String, String)>>,
+    /// The PCs in the cluster and what they report (see `fleet`).
+    pub(crate) fleet: Mutex<crate::watch::fleet::Fleet>,
+    /// Pairing codes for `cw join`.
+    pub(crate) join: Mutex<crate::watch::join::State>,
+    pub(crate) bench: Mutex<crate::watch::bench::BenchState>,
+    /// Leaf locks (never held while taking another): benchmark cameras and their private stores, by id.
+    pub(crate) bench_cams: Mutex<HashMap<String, Camera>>,
+    pub(crate) bench_stores: Mutex<HashMap<String, Arc<dyn Store>>>,
+    /// Newest media time committed per task, so a re-leased segment resumes instead of starting over.
+    task_ckpt: Mutex<HashMap<String, Us>>,
+    /// Per job, per segment task: that task's totals. The job's coverage is their sum.
+    seg_cov: Mutex<HashMap<String, HashMap<String, Coverage>>>,
     /// Last analyzed frame per source with its own detections, for an in-sync live overlay.
     latest: Mutex<HashMap<String, serde_json::Value>>,
     /// Rule diagnostics already written to the audit log: (rule, version, source, code). Each is logged once.
@@ -168,7 +180,14 @@ impl Api {
             bus: Bus::new(),
             data_dir,
             exports: Mutex::new(HashMap::new()),
-            sched: Mutex::new(Scheduler::new(LEASE_US)),
+            sched: Mutex::new(Scheduler::new(LEASE_US).with_archive_cap(std::env::var("CW_TASKS").ok().and_then(|v| v.parse().ok()).unwrap_or(2))),
+            fleet: Mutex::new(Default::default()),
+            join: Mutex::new(Default::default()),
+            bench: Mutex::new(Default::default()),
+            bench_cams: Mutex::new(HashMap::new()),
+            bench_stores: Mutex::new(HashMap::new()),
+            task_ckpt: Mutex::new(HashMap::new()),
+            seg_cov: Mutex::new(HashMap::new()),
             engine: Mutex::new(engine),
             held: Mutex::new(HashMap::new()),
             catalog: Mutex::new(HashMap::new()),
@@ -186,6 +205,25 @@ impl Api {
             let _ = std::fs::write(self.data_dir.join("alerts_state.json"), b);
         }
     }
+}
+
+/// The store that holds this id's data: a benchmark's own file for `bench-<run>-...` ids, the main store otherwise.
+pub fn store_for(api: &Api, id: &str) -> Arc<dyn Store> {
+    if id.starts_with("bench-") {
+        if let Some(s) = crate::watch::bench::store_of(api, id) {
+            return s;
+        }
+    }
+    api.store.clone()
+}
+
+#[cfg(test)]
+pub fn test_api() -> Arc<Api> {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!("cw-api-test-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let _ = std::fs::create_dir_all(&dir);
+    let auth = crate::watch::auth::Auth::load(&dir);
+    Arc::new(Api::new(crate::watch::storage::memory(), dir, auth))
 }
 
 pub fn param(url: &str, key: &str) -> Option<String> {
@@ -236,14 +274,16 @@ pub fn handle(api: &Arc<Api>, method: &str, url: &str, body: &[u8], range: Optio
     let path = url.split('?').next().unwrap_or(url);
     let rest = path.strip_prefix("/api/v1/")?;
     let parts: Vec<&str> = rest.split('/').collect();
+    if rest == "benchmarks" || rest.starts_with("benchmarks/") {
+        return crate::watch::bench::handle(api, method, url, body);
+    }
     let r = match (method, parts.as_slice()) {
         ("POST", ["index"]) => index(api, body),
         ("POST", ["heartbeat"]) => heartbeat(api, body),
         ("POST", ["lease"]) => lease(api, body),
-        ("GET", ["cluster"]) => {
-            let s = api.sched.lock().unwrap();
-            Ok(Reply::json(&serde_json::json!({ "workers": s.workers(), "tasks": s.tasks() })))
-        }
+        ("GET", ["cluster"]) => Ok(Reply::json(&crate::watch::fleet::cluster(api))),
+        ("GET", ["cluster", "realtime"]) => Ok(Reply::json(&crate::watch::fleet::realtime(api))),
+        ("POST", ["sources", "probe"]) => crate::watch::fleet::probe_source(body),
         ("POST", ["queries"]) => run_query(api, body),
         ("GET", ["queries", id]) => q::get_run(&*api.store, id).map(|r| Reply::json(&serde_json::json!({ "run": r }))),
         ("GET", ["queries", id, "matches"]) => {
@@ -299,8 +339,11 @@ pub fn handle(api: &Arc<Api>, method: &str, url: &str, body: &[u8], range: Optio
 fn index(api: &Api, body: &[u8]) -> Result<Reply, ApiError> {
     let b: IndexBatch = body_json(body)?;
     validate_batch(&b)?;
+    // Benchmark data goes to the run's own store, with no thumbnails, alerts or live overlay.
+    let bench = b.observation.source_id.starts_with("bench-");
+    let store = store_for(api, &b.observation.source_id);
     let thumb = match &b.thumbnail_hex {
-        Some(hex) if !hex.is_empty() => Some(save_thumbnail(api, &b.observation.observation_id, hex)?),
+        Some(hex) if !hex.is_empty() && !bench => Some(save_thumbnail(api, &b.observation.observation_id, hex)?),
         _ => None,
     };
     let mut b = b;
@@ -313,7 +356,15 @@ fn index(api: &Api, body: &[u8]) -> Result<Reply, ApiError> {
         s.reap(now_us());
         s.check(l)?;
     }
-    let out = api.store.commit_batch(&b)?;
+    let out = store.commit_batch(&b)?;
+    if let Some(l) = &b.lease {
+        let mut c = api.task_ckpt.lock().unwrap();
+        let e = c.entry(l.task_id.clone()).or_insert(i64::MIN);
+        *e = (*e).max(b.observation.media_time_us);
+    }
+    if bench {
+        return Ok(Reply::json(&out));
+    }
     if let Some(t) = &b.observation.thumbnail {
         let o = &b.observation;
         let newer = api.latest.lock().unwrap().get(&o.source_id).and_then(|v| v["media_time_us"].as_i64()).map_or(true, |t0| o.media_time_us >= t0 || o.media_time_us + 5_000_000 < t0);
@@ -384,10 +435,10 @@ fn save_thumbnail(api: &Api, obs: &str, hex: &str) -> Result<String, ApiError> {
 }
 
 fn media(api: &Api, id: &str) -> Result<MediaAsset, ApiError> {
-    api.store.media(id)?.ok_or_else(|| missing("media"))
+    store_for(api, id).media(id)?.ok_or_else(|| missing("media"))
 }
 
-fn media_file(api: &Api, id: &str) -> Result<(MediaAsset, PathBuf), ApiError> {
+pub(crate) fn media_file(api: &Api, id: &str) -> Result<(MediaAsset, PathBuf), ApiError> {
     let m = media(api, id)?;
     let p = PathBuf::from(crate::watch::config::resolve_url(&m.uri));
     if !p.is_file() {
@@ -931,8 +982,20 @@ pub fn sync_sources(api: &Api, cams: &[Camera]) {
             && c.kind != "file"
             && api.store.job(&job_id).ok().flatten().is_some_and(|j| j.state == JobState::Completed);
         // `analyze: false` sources are replayed from stored detections; no worker task is created for them.
+        // A long recording is cut into segments so different workers can take different parts at the same time.
+        let mut specs = vec![spec];
+        let seg_us = crate::watch::config::load_watch().process.segment_secs as i64 * 1_000_000;
+        if kind == SourceKind::Archive && seg_us > 0 {
+            if let Some(d) = media.duration_us.filter(|d| *d as f64 > seg_us as f64 * 1.5) {
+                specs = crate::watch::scheduler::plan_segments(&job_id, &c.id, &media.id, d, seg_us, 2_000_000);
+                let total = specs.len();
+                for (i, sp) in specs.iter_mut().enumerate() {
+                    sp.settings = serde_json::json!({ "camera_id": format!("{}~{}", c.id, i), "seg": i, "segments": total, "fingerprint": media.fingerprint });
+                }
+            }
+        }
         if media.availability != Availability::Missing && !finished && c.analyze {
-            let _ = api.sched.lock().unwrap().submit(job, vec![spec]);
+            let _ = api.sched.lock().unwrap().submit(job, specs);
         }
         cat.insert(c.id.clone(), (key, task_id));
     }
@@ -940,6 +1003,7 @@ pub fn sync_sources(api: &Api, cams: &[Camera]) {
 
 /// Leases this worker holds, keyed by camera id, after handing it any new ones.
 pub fn leases_for(api: &Api, worker: &str, host: &str, cores: usize, may_take: bool) -> HashMap<String, TaskLease> {
+    let behind = crate::watch::fleet::behind_tasks(api);
     let mut s = api.sched.lock().unwrap();
     s.reap(now_us());
     if !s.workers().iter().any(|w| w.caps.id == worker) {
@@ -948,6 +1012,10 @@ pub fn leases_for(api: &Api, worker: &str, host: &str, cores: usize, may_take: b
     }
     for id in s.rebalance() {
         audit(api, Some("scheduler"), "task.rebalance", &[&id], "ok", "moved to an idle worker; resumes from checkpoint");
+    }
+    if let Some(id) = s.rebalance_live(&behind) {
+        crate::watch::fleet::moved(api, &id);
+        audit(api, Some("scheduler"), "camera.rebalance", &[&id], "ok", "live camera behind for 20 s moved to an idle worker; its tracker restarts there");
     }
     let _ = s.heartbeat(worker);
     let mut held = api.held.lock().unwrap();
@@ -972,6 +1040,18 @@ pub fn leases_for(api: &Api, worker: &str, host: &str, cores: usize, may_take: b
 /// Two seconds before it are decoded for tracker warm-up and not indexed (`ingest::owns`).
 /// Track IDs restart in the new lease: identity does not carry across a failover.
 fn resume_from_checkpoint(api: &Api, l: &mut TaskLease) {
+    // A segment resumes from what its own task committed (generation 2+ only; the first lease starts at the segment start).
+    if l.settings.get("seg").is_some() {
+        if l.generation > 1 {
+            if let Some(&at) = api.task_ckpt.lock().unwrap().get(&l.task_id) {
+                if at > l.segment[0].unwrap_or(0) {
+                    l.segment[0] = Some(at + 1);
+                    l.overlap_us = 2_000_000;
+                }
+            }
+        }
+        return;
+    }
     let archive = api.store.media(&l.media_id).ok().flatten().is_some_and(|m| m.duration_us.is_some() && !m.still)
         && l.settings.get("source_id").and_then(|s| s.as_str()).and_then(|id| api.store.sources().ok()?.into_iter().find(|s| s.id == id)).is_some_and(|s| s.kind == SourceKind::Archive);
     if !archive || l.segment[0].is_some() {
@@ -983,6 +1063,24 @@ fn resume_from_checkpoint(api: &Api, l: &mut TaskLease) {
             l.overlap_us = 2_000_000;
         }
     }
+}
+
+/// The camera entries a worker should run for its leases. A segment's key is `<source>~<n>`; its camera is the
+/// source's with that key as id, so the worker keeps one pipeline (tracker, queue) per segment.
+pub fn cameras_for(api: &Api, leases: &HashMap<String, TaskLease>, cams: &[Camera]) -> Vec<Camera> {
+    let bench = api.bench_cams.lock().unwrap();
+    leases
+        .iter()
+        .filter_map(|(key, l)| {
+            let src = l.settings["source_id"].as_str().unwrap_or(key);
+            let mut c = cams.iter().find(|c| c.id == src).cloned().or_else(|| bench.get(src).cloned())?;
+            if key != src {
+                c.name = format!("{} [part {}/{}]", c.name, l.settings["seg"].as_u64().unwrap_or(0) + 1, l.settings["segments"].as_u64().unwrap_or(1));
+                c.id = key.clone();
+            }
+            Some(c)
+        })
+        .collect()
 }
 
 /// Totals for a job across worker restarts. First report of a task after the head started: what the store
@@ -1012,12 +1110,53 @@ fn add_coverage(a: &Coverage, b: &Coverage) -> Coverage {
     Coverage { decoded: a.decoded + b.decoded, inferred: a.inferred + b.inferred, skipped: a.skipped + b.skipped, failed: a.failed + b.failed, analyzed: merged }
 }
 
+/// One segment of a split recording reported in. The job's coverage is the sum of its segments and the job
+/// completes only when every segment is done (or fails once the rest have settled).
+fn segment_state(api: &Api, worker: &str, l: &TaskLease, state: &str, error_code: &str, coverage: Option<&serde_json::Value>) {
+    let store = store_for(api, &l.job_id);
+    let mut s = api.sched.lock().unwrap();
+    match state {
+        "completed" => {
+            let _ = s.complete(&l.task_id, l.generation);
+        }
+        "error" if !error_code.is_empty() => {
+            let permanent = matches!(error_code, "model_unavailable" | "missing_file" | "unsupported_media" | "not_found");
+            let _ = s.fail_with(&l.task_id, l.generation, permanent, ApiError::new(error_code, format!("worker {worker} reported {error_code}")));
+        }
+        _ => {}
+    }
+    let job_state = s.job_state(&l.job_id);
+    drop(s);
+    let Ok(Some(mut j)) = store.job(&l.job_id) else { return };
+    if let Some(cov) = coverage.and_then(|c| serde_json::from_value::<Coverage>(c.clone()).ok()) {
+        let mine = merge_coverage(api, &l.task_id, &Coverage::default(), cov);
+        let mut g = api.seg_cov.lock().unwrap();
+        let tasks = g.entry(l.job_id.clone()).or_default();
+        tasks.insert(l.task_id.clone(), mine);
+        j.coverage = tasks.values().fold(Coverage::default(), |a, b| add_coverage(&a, b));
+    }
+    if let Some(st) = job_state {
+        j.state = st;
+        if st == JobState::Failed && j.error.is_none() {
+            j.error = Some(ApiError::new(if error_code.is_empty() { "task_failed" } else { error_code }, format!("a segment failed on {worker}")));
+        }
+        if matches!(st, JobState::Completed | JobState::Failed) && j.finished_utc_us.is_none() {
+            j.finished_utc_us = Some(now_us());
+        }
+    }
+    let _ = store.upsert_job(&j);
+}
+
 /// Worker-reported camera state: finished archives complete their task; permanent errors fail it.
 pub fn camera_state(api: &Api, worker: &str, camera: &str, state: &str, error_code: &str, coverage: Option<&serde_json::Value>, ops: Option<&serde_json::Value>) {
     let lease = api.held.lock().unwrap().values().find(|l| l.worker == worker && l.settings.get("camera_id").and_then(|c| c.as_str()) == Some(camera)).cloned();
     let Some(l) = lease else { return };
+    if l.settings.get("segments").and_then(|v| v.as_u64()).is_some_and(|n| n > 1) {
+        return segment_state(api, worker, &l, state, error_code, coverage);
+    }
     if let Some(cov) = coverage.and_then(|c| serde_json::from_value::<Coverage>(c.clone()).ok()) {
-        if let Ok(Some(mut j)) = api.store.job(&l.job_id) {
+        let store = store_for(api, &l.job_id);
+        if let Ok(Some(mut j)) = store.job(&l.job_id) {
             j.coverage = merge_coverage(api, &l.task_id, &j.coverage, cov);
             j.state = match state {
                 "completed" => JobState::Completed,
@@ -1035,7 +1174,7 @@ pub fn camera_state(api: &Api, worker: &str, camera: &str, state: &str, error_co
                 if !j.sampling.is_object() { j.sampling = serde_json::json!({}); }
                 j.sampling["ops"] = o.clone();
             }
-            let _ = api.store.upsert_job(&j);
+            let _ = store.upsert_job(&j);
         }
     }
     let mut s = api.sched.lock().unwrap();
@@ -1273,6 +1412,51 @@ mod tests {
 
     fn cov(d: u64, i: u64, a: [Us; 2]) -> Coverage {
         Coverage { decoded: d, inferred: i, skipped: d - i, failed: 0, analyzed: vec![a] }
+    }
+
+    #[test]
+    fn a_split_recording_completes_only_when_every_segment_is_done() {
+        let api = test_api();
+        let job = IndexJob {
+            id: "job_s".into(), manifest_version: "t".into(), media_ids: vec!["m".into()], model_versions: vec![], sampling: serde_json::json!({}),
+            state: JobState::Queued, checkpoint: Default::default(), coverage: Coverage::default(), error: None, created_utc_us: 0, finished_utc_us: None,
+        };
+        api.store.upsert_job(&job).unwrap();
+        let mut specs = crate::watch::scheduler::plan_segments("job_s", "src", "m", 30_000_000, 10_000_000, 2_000_000);
+        assert_eq!(specs.len(), 3);
+        for (i, s) in specs.iter_mut().enumerate() {
+            s.settings = serde_json::json!({ "camera_id": format!("src~{i}"), "seg": i, "segments": 3 });
+        }
+        api.sched.lock().unwrap().submit(job, specs).unwrap();
+        api.sched.lock().unwrap().register(WorkerCaps { id: "w".into(), cores: 8, decoders: vec![], ..Default::default() });
+        let first = leases_for(&api, "w", "h", 8, true);
+        assert_eq!(first.len(), 2, "a worker holds at most two finite tasks at a time");
+        let cams = cameras_for(&api, &first, &[Camera { id: "src".into(), name: "Gate".into(), url: "a.mp4".into(), start: 0.0, kind: "archive".into(), zones: vec![], analyze: true }]);
+        assert!(cams.iter().all(|c| c.id.starts_with("src~") && c.name.starts_with("Gate [part ")), "each segment is its own camera for the worker");
+        let cov = |d: u64| serde_json::json!({ "decoded": d, "inferred": d, "skipped": 0, "failed": 0, "analyzed": [[0, d as i64]] });
+        for key in first.keys() {
+            camera_state(&api, "w", key, "completed", "", Some(&cov(10)), None);
+        }
+        let j = api.store.job("job_s").unwrap().unwrap();
+        assert_eq!((j.state, j.coverage.decoded), (JobState::Running, 20), "two of three done: still running, coverage is the sum");
+        let second = leases_for(&api, "w", "h", 8, true);
+        assert_eq!(second.len(), 1, "the third segment is leased once a slot frees up");
+        camera_state(&api, "w", second.keys().next().unwrap(), "completed", "", Some(&cov(10)), None);
+        let j = api.store.job("job_s").unwrap().unwrap();
+        assert_eq!((j.state, j.coverage.decoded, j.coverage.inferred), (JobState::Completed, 30, 30));
+        assert!(j.finished_utc_us.is_some());
+    }
+
+    #[test]
+    fn a_re_leased_segment_resumes_after_what_it_committed() {
+        let api = test_api();
+        api.task_ckpt.lock().unwrap().insert("t".into(), 14_000_000);
+        let mut l = TaskLease { task_id: "t".into(), job_id: "j".into(), media_id: "m".into(), segment: [Some(10_000_000), Some(20_000_000)], worker: "w".into(), generation: 2, expires_utc_us: 0, attempt: 2, overlap_us: 2_000_000, settings: serde_json::json!({"seg": 1}) };
+        resume_from_checkpoint(&api, &mut l);
+        assert_eq!((l.segment[0], l.segment[1], l.overlap_us), (Some(14_000_001), Some(20_000_000), 2_000_000));
+        let mut first = TaskLease { generation: 1, segment: [Some(10_000_000), Some(20_000_000)], ..l.clone() };
+        resume_from_checkpoint(&api, &mut first);
+        assert_eq!(first.segment[0], Some(10_000_000), "the first lease always starts at the segment start");
     }
 
     #[test]

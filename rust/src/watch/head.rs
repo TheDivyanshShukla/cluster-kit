@@ -113,6 +113,7 @@ struct Hub {
 }
 
 pub fn run(opts: Opts) -> Result<(), String> {
+    let _ = started_secs();
     let root = crate::watch::repo_root();
     std::fs::create_dir_all(data_path("")).map_err(|e| e.to_string())?;
     let store = crate::watch::storage::open(&data_path("watch.db")).map_err(|e| format!("metadata store: {}", e.message))?;
@@ -173,6 +174,17 @@ pub fn run(opts: Opts) -> Result<(), String> {
         let name = opts.name.clone();
         let port = opts.port;
         move || crate::watch::net::beacon(name, port)
+    });
+    // The Cluster page listens for this instead of polling.
+    thread::spawn({
+        let api = api.clone();
+        move || loop {
+            thread::sleep(Duration::from_secs(2));
+            let rt = crate::watch::fleet::realtime(&api);
+            if rt["cameras"].as_array().is_some_and(|c| !c.is_empty()) || rt["workers"].as_array().is_some_and(|w| !w.is_empty()) {
+                api.bus.publish("realtime", &rt);
+            }
+        }
     });
     if !opts.no_local {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -236,6 +248,15 @@ pub fn run(opts: Opts) -> Result<(), String> {
                 return;
             }
             if method == Method::Get {
+                // Footage for a worker that has no copy: streamed from the file, any byte range.
+                if let Some(id) = path.strip_prefix("/api/v1/worker/media/").and_then(|r| r.strip_suffix("/stream")) {
+                    let range = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Range")).map(|(_, v)| v.clone());
+                    match worker_media(&hub, id, range.as_deref()) {
+                        Ok(r) => { let _ = req.respond(r); }
+                        Err(e) => { let _ = req.respond(v1_reply(crate::watch::api::Reply::err(e))); }
+                    }
+                    return;
+                }
                 if let Some(id) = path.strip_prefix("/api/live/") {
                     let _ = req.respond(live_response(hub, id.to_string()));
                     return;
@@ -268,6 +289,10 @@ pub fn run(opts: Opts) -> Result<(), String> {
             }
             let range = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Range")).map(|(_, v)| v.clone());
             let body = inject_actor(&method, path, body, &principal);
+            if let Some(r) = crate::watch::join::handle(&hub.api, method.as_str(), &url, &body, &headers) {
+                let _ = req.respond(v1_reply(r));
+                return;
+            }
             if let Some(r) = crate::watch::api::handle(&hub.api, method.as_str(), &url, &body, range.as_deref()) {
                 let _ = req.respond(v1_reply(r));
                 return;
@@ -464,7 +489,7 @@ fn handle(hub: &Hub, method: &Method, url: &str, body: &[u8], _req: &tiny_http::
     if path == "/api/sources" {
         if method == &Method::Get {
             let raw = std::fs::read_to_string(config::watch_path()).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).unwrap_or(serde_json::json!({}));
-            return json(serde_json::json!({"sources":raw.get("cameras").cloned().unwrap_or(serde_json::json!([])),"expanded":config::load_watch().cameras}));
+            return json(serde_json::json!({"sources":raw.get("cameras").cloned().unwrap_or(serde_json::json!([])),"expanded":config::load_watch().cameras,"epoch":started_secs()}));
         }
         if method == &Method::Post { return save_sources(hub, body); }
     }
@@ -610,6 +635,9 @@ fn handle(hub: &Hub, method: &Method, url: &str, body: &[u8], _req: &tiny_http::
             if let Some(n) = v.get("max_regions").and_then(|x| x.as_u64()) {
                 proc.max_regions = n as u32;
             }
+            if let Some(n) = v.get("segment_secs").and_then(|x| x.as_u64()) {
+                proc.segment_secs = n as u32;
+            }
         }
         if let Err(e) = config::save_process(&proc, watch.copies) { return json_err(&e); }
         audit(hub, "settings.save", "Processing or execution mode changed");
@@ -637,6 +665,7 @@ fn assignment(hub: &Hub, url: &str) -> serde_json::Value {
     let local = query(url, "local").as_deref() == Some("1");
     let cores = cores.max(1);
     if !id.is_empty() {
+        crate::watch::fleet::note_poll(&hub.api, &id, &host, cores, local, &query(url, "label").unwrap_or_default());
         let mut workers = hub.workers.lock().unwrap();
         let w = workers.entry(id.clone()).or_insert_with(|| Worker {
             host: host.clone(),
@@ -671,7 +700,7 @@ fn assignment(hub: &Hub, url: &str) -> serde_json::Value {
     crate::watch::api::sync_sources(&hub.api, &watch.cameras);
     // Solo keeps every camera on the head's own worker.
     let leases = if id.is_empty() { HashMap::new() } else { crate::watch::api::leases_for(&hub.api, &id, &host_of(hub, &id), cores, !solo || local) };
-    let mine: Vec<&Camera> = watch.cameras.iter().filter(|c| leases.contains_key(&c.id)).collect();
+    let mine = crate::watch::api::cameras_for(&hub.api, &leases, &watch.cameras);
     serde_json::json!({
         "leases": leases,
         "blur": watch.blur,
@@ -685,6 +714,7 @@ fn assignment(hub: &Hub, url: &str) -> serde_json::Value {
 fn ingest_stats(hub: &Hub, body: &[u8]) {
     let v: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::json!({}));
     let Some(id) = v.get("id").and_then(|x| x.as_str()) else { return };
+    crate::watch::fleet::note_stats(&hub.api, &v);
     let mut workers = hub.workers.lock().unwrap();
     let w = workers.entry(id.to_string()).or_insert_with(|| Worker {
         host: "pc".into(),
@@ -935,6 +965,30 @@ pub(crate) fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
     Some((start, end.min(start + 8 * 1024 * 1024 - 1)))
 }
 
+/// `GET /api/v1/worker/media/{id}/stream`: the recording as a stream, honouring `Range`, without buffering it.
+fn worker_media(hub: &Hub, id: &str, range: Option<&str>) -> Result<Response<Box<dyn Read + Send>>, crate::watch::domain::ApiError> {
+    use crate::watch::domain::ApiError;
+    let (_, path) = crate::watch::api::media_file(&hub.api, id)?;
+    let mut file = File::open(&path).map_err(|e| ApiError::new("unavailable", e.to_string()))?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len == 0 { return Err(ApiError::new("unavailable", "media file is empty")); }
+    let (start, end, status) = match range.and_then(|h| h.trim().strip_prefix("bytes=")).and_then(|r| r.split_once('-')) {
+        Some((a, b)) => {
+            let start: u64 = if a.is_empty() { 0 } else { a.parse().map_err(|_| ApiError::new("invalid_request", "bad Range"))? };
+            let end = if b.is_empty() { len - 1 } else { b.parse::<u64>().map_err(|_| ApiError::new("invalid_request", "bad Range"))?.min(len - 1) };
+            if start >= len || start > end { return Err(ApiError::new("invalid_request", "unsatisfiable range")); }
+            (start, end, 206)
+        }
+        None => (0, len - 1, 200),
+    };
+    file.seek(SeekFrom::Start(start)).map_err(|e| ApiError::new("unavailable", e.to_string()))?;
+    let n = end - start + 1;
+    let mut headers = vec![Header::from_bytes(b"Content-Type", b"video/mp4").unwrap(), Header::from_bytes(b"Accept-Ranges", b"bytes").unwrap(), Header::from_bytes(b"Cache-Control", b"no-store").unwrap()];
+    if status == 206 { headers.push(Header::from_bytes(b"Content-Range", format!("bytes {start}-{end}/{len}").as_bytes()).unwrap()); }
+    let body: Box<dyn Read + Send> = Box::new(file.take(n));
+    Ok(Response::new(StatusCode(status), headers, body, Some(n as usize), None))
+}
+
 fn media_response(id: &str, range: Option<&str>) -> Response<std::io::Cursor<Vec<u8>>> {
     let Some(path) = media_path(id) else { return empty(StatusCode(404)) };
     let mut file = match File::open(&path) {
@@ -1062,7 +1116,7 @@ fn snapshot(hub: &Hub) -> serde_json::Value {
         let mut ms_n = 0.0;
         let mut on_time = 0;
         let mut pc_warnings = 0;
-        for (cid, cam) in &w.cameras {
+        for (cid, cam) in w.cameras.iter().filter(|(cid, _)| !cid.starts_with("bench-")) {
             let g = cam.gated.unwrap_or(0.0);
             let b = cam.blur.unwrap_or(0.0);
             let k = cam.blank.unwrap_or(0.0);
@@ -1280,6 +1334,10 @@ fn ui_page(path: &str) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
         "/ui/sources.js" => ("sources.js", "text/javascript; charset=utf-8"),
         "/ui/logs.js" => ("logs.js", "text/javascript; charset=utf-8"),
         "/analytics" => ("analytics.html", "text/html; charset=utf-8"),
+        "/join" => ("join.html", "text/html; charset=utf-8"),
+        "/ui/join.js" => ("join.js", "text/javascript; charset=utf-8"),
+        "/ui/cluster.js" => ("cluster.js", "text/javascript; charset=utf-8"),
+        "/ui/cluster.css" => ("cluster.css", "text/css; charset=utf-8"),
         "/setup" => ("setup.html", "text/html; charset=utf-8"),
         "/clip" => ("clip.html", "text/html; charset=utf-8"),
         "/review" => ("review.html", "text/html; charset=utf-8"),
@@ -1312,6 +1370,10 @@ fn ui_page(path: &str) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
         "sources.js" => include_str!("ui/sources.js").as_bytes(),
         "logs.js" => include_str!("ui/logs.js").as_bytes(),
         "analytics.html" => include_str!("ui/analytics.html").as_bytes(),
+        "join.html" => include_str!("ui/join.html").as_bytes(),
+        "join.js" => include_str!("ui/join.js").as_bytes(),
+        "cluster.js" => include_str!("ui/cluster.js").as_bytes(),
+        "cluster.css" => include_str!("ui/cluster.css").as_bytes(),
         "setup.html" => include_str!("ui/setup.html").as_bytes(),
         "clip.html" => include_str!("ui/clip.html").as_bytes(),
         "review.html" => include_str!("ui/review.html").as_bytes(),
@@ -1447,4 +1509,11 @@ fn inject_actor(method: &Method, path: &str, body: Vec<u8>, p: &crate::watch::au
         Ok(mut v) if v.is_object() => { v["actor"] = serde_json::json!(p.name); serde_json::to_vec(&v).unwrap_or(body) }
         _ => body,
     }
+}
+
+/// Unix seconds when this head started. Replayed "live" recordings begin at their `start` position at this
+/// moment, so every demo run opens on the chosen part of the footage and all viewers agree on the position.
+pub fn started_secs() -> f64 {
+    static START: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *START.get_or_init(now_secs)
 }
