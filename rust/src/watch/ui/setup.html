@@ -7,16 +7,12 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/ui/app.css">
+<link rel="stylesheet" href="/ui/product.css">
 </head>
 <body>
 <header>
-  <a class="brand" href="/">Watch</a>
-  <nav>
-    <a href="/">Wall</a>
-    <a href="/find">Find</a>
-    <a href="/analytics">Analytics</a>
-    <a href="/setup" aria-current="page">Setup</a>
-  </nav>
+  <a class="brand" href="/" aria-label="Watch home"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 8V3h5M17 3h5v5M22 16v5h-5M7 21H2v-5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Watch</a>
+  <nav aria-label="Main navigation"><a href="/">Live</a><a href="/find">Search</a><a href="/sources">Sources</a><a href="/setup" aria-current="page">Rules & models</a><a href="/analytics">Cluster</a><a href="/logs">Activity</a></nav>
   <div class="meters">
     <div class="ops"><b id="f-ops">0</b><span>ops / s</span></div>
     <div class="lack"><b id="f-lack">0</b><span>lacking / s</span></div>
@@ -24,86 +20,97 @@
     <div><b id="f-warn">0</b><span>warnings</span></div>
   </div>
 </header>
-<main>
-  <h1>Setup</h1>
-  <p class="quiet" id="proc-live"></p>
-  <div class="setup-grid">
-    <form id="rule-form">
-      <fieldset>
-        <legend>Rules</legend>
-        <label for="r-name">Name</label>
-        <input id="r-name" required placeholder="Few phones open">
-        <label for="r-cam">Camera</label>
-        <input id="r-cam" placeholder="Empty means each camera on its own">
-        <label for="r-class">Class</label>
-        <input id="r-class" placeholder="cell phone" required>
-        <label for="r-op">When</label>
-        <select id="r-op">
-          <option value="seen">it is seen</option>
-          <option value="gt">count is more than</option>
-          <option value="lt" selected>count is less than</option>
-          <option value="ge">count is at least</option>
-          <option value="le">count is at most</option>
-          <option value="eq">count equals</option>
-        </select>
-        <label for="r-n">Number</label>
-        <input id="r-n" type="number" min="0" value="5">
-        <label for="r-hold">Frames before it asks a person</label>
-        <input id="r-hold" type="number" min="1" value="8">
-        <label for="r-line">Line</label>
-        <textarea id="r-line" rows="2">count("cell phone") &lt; 5</textarea>
-        <p class="quiet">A line can join tests: seen("pistol") or seen("knife"). A count below a number waits until the picture is sharp.</p>
-        <div class="row">
-          <button type="submit">Add rule</button>
-          <button type="button" id="r-save">Save list</button>
-        </div>
-        <p class="err" id="r-err"></p>
-      </fieldset>
-      <div id="rule-list"></div>
-    </form>
-    <form id="mod-form">
-      <fieldset>
-        <legend>Processing</legend>
-        <div class="row" id="presets">
-          <button type="button" data-preset="speed">Speed</button>
-          <button type="button" data-preset="balanced">Balanced</button>
-          <button type="button" data-preset="accuracy">Accuracy</button>
-        </div>
-        <label><input id="blur-on" type="checkbox" checked> Blur filter</label>
-        <label for="blur">Blur threshold</label>
-        <input id="blur" type="number" min="1" max="400" value="40">
-        <label><input id="blank-on" type="checkbox" checked> Skip a blank picture</label>
-        <label><input id="same-on" type="checkbox" checked> Skip a picture that has not changed</label>
-        <label for="same">Change needed</label>
-        <input id="same" type="number" min="0.2" max="40" step="0.1" value="3.5">
-        <label for="every">Look every</label>
-        <select id="every">
-          <option value="1">Every sharp frame</option>
-          <option value="2" selected>Every 2nd</option>
-          <option value="3">Every 3rd</option>
-          <option value="4">Every 4th</option>
-        </select>
-        <label for="width">Detector picture size</label>
-        <select id="width">
-          <option value="320">320</option>
-          <option value="416">416</option>
-          <option value="512" selected>512</option>
-          <option value="640">640</option>
-        </select>
-        <label for="rate">Wall rate</label>
-        <select id="rate">
-          <option value="30">30 fps</option>
-          <option value="60" selected>60 fps</option>
-        </select>
-        <div class="row"><button type="button" id="save-set">Save processing</button></div>
-      </fieldset>
-      <fieldset>
-        <legend>Models</legend>
-        <div id="mod-list"></div>
-        <div class="row"><button type="submit">Save models</button></div>
-        <p class="err" id="m-err"></p>
-      </fieldset>
-    </form>
+<div class="connection hide" id="connection" role="status"></div>
+<main class="su">
+  <div class="su-head">
+    <div><h1>Rules &amp; models</h1><p class="sentence">Tune how frames are analyzed, choose which models run, then write rules against their classes. Alerts are detection candidates for a person to review.</p></div>
+    <p class="quiet mono su-live" id="proc-live"></p>
+  </div>
+  <div class="su-grid">
+    <nav class="su-nav" id="su-nav" aria-label="Setup sections">
+      <a href="#sec-pipeline" class="on">Detection pipeline<i class="su-dot" hidden></i></a>
+      <a href="#sec-models">Models <span class="tag" id="n-models">·</span><i class="su-dot" hidden></i></a>
+      <a href="#sec-rules">Rules <span class="tag" id="n-rules">·</span><i class="su-dot" hidden></i></a>
+      <a href="#sec-alerts">Alerts</a>
+    </nav>
+    <div class="su-body">
+      <section class="su-sec" id="sec-pipeline" aria-labelledby="h-pipe">
+        <div class="su-sh"><h2 id="h-pipe">Detection pipeline</h2><p>Fewer inference passes for the same accuracy: skip dull frames, then run the detector only where something moved.</p></div>
+        <div class="presets" id="presets" role="radiogroup" aria-label="Pipeline presets"></div>
+        <div class="est" id="est" aria-live="polite"></div>
+        <div id="pipe-fields"><div class="skel skel-card"></div><div class="skel skel-card"></div></div>
+        <div class="saved-ops" id="saved-ops" hidden></div>
+      </section>
+
+      <section class="su-sec" id="sec-models" aria-labelledby="h-models">
+        <div class="su-sh"><h2 id="h-models">Models</h2><p>Each module is a YOLO ONNX model. Classes a model does not list are unknown, not zero.</p></div>
+        <div id="cap-list" aria-live="polite"><div class="skel skel-card"></div></div>
+        <div id="mod-list"><div class="skel skel-card"></div><div class="skel skel-card"></div></div>
+        <details class="add-mod"><summary>Add a detection module</summary>
+          <p class="field-help">Use a compatible YOLO ONNX model. Its class labels and output order must match the model. A standard COCO model does not cover every weapon.</p>
+          <div class="f2">
+            <div><label for="new-mod-name">Module name</label><input id="new-mod-name" placeholder="Classroom objects"></div>
+            <div><label for="new-mod-id">Module ID</label><input id="new-mod-id" placeholder="classroom-objects" pattern="[a-z0-9-]+"></div>
+            <div><label for="new-mod-path">ONNX model path</label><input id="new-mod-path" placeholder="vision/models/classroom.onnx"></div>
+            <div><label for="new-mod-labels">Labels in model output order</label><input id="new-mod-labels" placeholder="person, cell phone"></div>
+          </div>
+          <div class="row"><button type="button" id="add-module">Add disabled module</button></div>
+          <div class="msg" id="m-err" role="status"></div>
+        </details>
+      </section>
+
+      <section class="su-sec" id="sec-rules" aria-labelledby="h-rules">
+        <div class="su-sh"><h2 id="h-rules">Rules</h2><p>A rule watches class counts per processed frame. Join conditions with <code>and</code> / <code>or</code>; prefix <code>lua:</code> for a sandboxed Lua expression.</p></div>
+        <div id="rule-list"><div class="skel skel-card"></div></div>
+        <form id="rule-form" class="editor-panel" novalidate>
+          <h3 id="rule-legend">New rule</h3>
+          <div class="f2">
+            <div><label for="r-name">Name</label><input id="r-name" required placeholder="Few phones open" aria-describedby="e-name"><p class="f-err" id="e-name"></p></div>
+            <div><label for="r-cam">Camera</label><input id="r-cam" placeholder="Empty means each camera on its own"></div>
+          </div>
+          <div class="f4">
+            <div><label for="r-class">Class</label><input id="r-class" list="class-list" placeholder="cell phone" autocomplete="off"><datalist id="class-list"></datalist></div>
+            <div><label for="r-op">When</label><select id="r-op"><option value="seen">it is seen</option><option value="gt">count is more than</option><option value="lt" selected>count is less than</option><option value="ge">count is at least</option><option value="le">count is at most</option><option value="eq">count equals</option></select></div>
+            <div><label for="r-n">Number</label><input id="r-n" type="number" min="0" value="5"></div>
+            <div><label for="r-hold">Hold (frames)</label><input id="r-hold" type="number" min="1" value="8" aria-describedby="e-hold"><p class="f-err" id="e-hold"></p></div>
+          </div>
+          <label for="r-line">Rule line</label>
+          <div class="edwrap su-ed"><div class="ed" id="ed-rule" data-lang="lua"><div class="ed-gut" aria-hidden="true"><div></div></div><div class="ed-body"><pre class="ed-err" aria-hidden="true"></pre><pre class="ed-hl" aria-hidden="true"></pre><textarea id="r-line" class="ed-in" spellcheck="false" wrap="off" autocapitalize="off" autocomplete="off" aria-label="Rule line" aria-describedby="e-line"></textarea></div></div></div>
+          <p class="f-err" id="e-line"></p>
+          <p class="field-help">Hold counts consecutive processed frames, not seconds. Counts measure detections in a frame. The line follows the class/When/Number fields until you edit it by hand.</p>
+          <details class="rule-help"><summary>Rule and Lua syntax</summary>
+            <p><code>seen("person")</code> true when the class is detected.</p>
+            <p><code>count("cell phone") &gt;= 4</code> detections of a class in one frame. Operators: <code>&gt; &lt; &gt;= &lt;= ==</code>.</p>
+            <p><code>ratio("cell phone", "person") &gt;= 0.2</code> relative proportion of two classes.</p>
+            <p><code>lua: count("cell phone") &gt;= 4 and count("person") &gt; 0</code> a sandboxed Lua boolean; no files, no network. A runtime error fails closed (no alert).</p>
+            <p class="quiet">Visible phones and proximity do not prove a person is holding or using a phone.</p></details>
+          <details class="bt-scope"><summary>Backtest scope</summary>
+            <p class="field-help">Replays the rule line over already-indexed frames. It does not change saved rules.</p>
+            <div class="check-list" id="bt-sources" role="group" aria-label="Backtest sources"><div class="skel">Loading sources</div></div>
+            <div class="f2"><div><label for="bt-from">From (UTC)</label><input id="bt-from" type="datetime-local"></div><div><label for="bt-to">To (UTC)</label><input id="bt-to" type="datetime-local"></div></div>
+            <p class="field-help">Leave blank for everything analyzed.</p>
+          </details>
+          <div class="row">
+            <button type="submit" id="rule-submit" class="primary">Add rule</button>
+            <button type="button" id="rule-backtest">Backtest this rule</button>
+            <button type="button" id="rule-cancel" hidden>Cancel edit</button>
+          </div>
+          <div class="msg" id="r-err" role="status"></div>
+          <div id="bt-result" aria-live="polite"></div>
+        </form>
+      </section>
+
+      <section class="su-sec" id="sec-alerts" aria-labelledby="h-alerts">
+        <div class="su-sh"><h2 id="h-alerts">Alerts</h2><p>An alert opens when an enabled rule holds for its hold-frame count. Review decisions live on the wall and in Activity.</p></div>
+        <div id="alert-sum"><div class="skel skel-card"></div></div>
+        <div class="row"><a class="btn" href="/">Open the wall</a><a class="btn" href="/logs">Activity</a></div>
+      </section>
+    </div>
+  </div>
+  <div class="su-save" id="savebar" role="region" aria-label="Unsaved changes" aria-hidden="true">
+    <div class="su-save-l"><span class="dot warn"></span><b id="sv-n">0 unsaved changes</b><span class="quiet mono" id="sv-keys"></span></div>
+    <div class="msg" id="sv-msg" role="status"></div>
+    <div class="row"><button type="button" id="sv-discard">Discard</button><button type="button" id="sv-save" class="primary">Save changes</button></div>
   </div>
 </main>
 <script src="/ui/app.js"></script>

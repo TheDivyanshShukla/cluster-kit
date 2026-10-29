@@ -1,0 +1,20 @@
+PASS  build                              /Users/divyansh/Desktop/code/divy/cluster-kit/rust/target-h/debug/cw
+binary: /Users/divyansh/Desktop/code/divy/cluster-kit/rust/target-h/debug/cw (Oct 29 18:00:39 2026)
+PASS  head_start                         port 59536, CW_ROOT=/var/folders/vl/fv9rg79d3kq5hj0fj5264cw00000gn/T//cw-accept.Y4eW85/root
+PASS  add_source                         archive source saved via POST /api/sources
+PASS  reject_bad_source                  invalid id -> 400
+PASS  indexing_completes                 frames=58
+FAIL  legacy_query                       count='0'
+PASS  v1_query                           run.result_count=108
+PASS  media_range                        206 + Content-Range: bytes 0-1023/5482579
+PASS  idempotent_batch                   count 0 -> 1 -> 1 (second post ignored)
+PASS  malformed_batch                    400, 400
+PASS  malformed_not_stored               count unchanged (1)
+PASS  durable_restart                    legacy count 1 before/after restart
+PASS  v1_durable                         v1 query after restart HTTP 200
+PASS  reindex_no_duplicates              count stays 1 after worker re-processes the archive
+SKIP  auth_protected_routes              open mode (anonymous administrator): open-trusted-lan
+PASS  lan_exposure                       not reachable on 10.97.31.96
+FAIL  missing_model                      no failure reported within 90s (state='false 0 ', indexed rows=0); capabilities: {"accuracy":"Model confidence is not an accuracy guarantee. Validate thresholds and recall on labeled footage. Small phones and occluded objects can be missed.","archive":"Finite scan with backpressure; processing presets still control which frames are sampled. Use Accuracy with filters off to scan 
+FAIL  repo_data_untouched                vision/data files 9 -> 13
+SUMMARY pass=14 fail=3 skip=1

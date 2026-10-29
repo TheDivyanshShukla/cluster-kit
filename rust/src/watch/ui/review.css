@@ -1,0 +1,127 @@
+/* Watch review: dense VMS / editor workspace. Everything is scoped under .review.
+   Tokens come from app.css (--page --surface --line --quiet --text --lead --support --pop); local ones below. */
+.review { --wl: 250px; --wr: 300px; --hed: 40vh; --fs: 12px;
+  display: flex; flex-direction: column; height: calc(100dvh - var(--hdr, 40px)); min-height: 560px; overflow: hidden; padding: 0; font-size: var(--fs); line-height: 1.35; }
+.review .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.review .mono { font-family: "IBM Plex Mono", monospace; }
+.review .hide { display: none !important; }
+.review button, .review select, .review input[type=search], .review input[type=text], .review textarea { background: var(--surface); border: 1px solid var(--line); border-radius: 3px; color: var(--text); font-size: var(--fs); }
+.review button { padding: 2px 7px; min-height: 24px; line-height: 1.2; }
+.review button:hover { border-color: var(--lead); }
+.review button:disabled { opacity: .4; cursor: not-allowed; }
+.review select { padding: 2px 4px; min-height: 24px; width: auto; max-width: 100%; }
+.review input[type=search], .review input[type=text] { padding: 3px 6px; min-height: 24px; width: 100%; }
+.review button[aria-pressed="true"] { border-color: var(--pop); color: var(--pop); background: #181c1b; }
+.review .rv-test { display: flex; align-items: center; gap: 12px; background: var(--support); color: #0A0A0A; padding: 1px 10px; flex: none; }
+.review .rv-test b { font-size: 16px; font-weight: 600; letter-spacing: .1em; } .review .rv-test span { font-size: 11px; font-weight: 500; }
+.review .rv-bar { flex: none; display: flex; align-items: center; gap: 4px 12px; padding: 3px 8px; border-bottom: 1px solid var(--line); background: var(--page); min-height: 32px; overflow: hidden; }
+.review .rv-chips { display: flex; gap: 3px; flex-wrap: nowrap; overflow: hidden; }
+.review .rv-chip { font: 11px "IBM Plex Mono", monospace; border: 1px solid var(--line); padding: 0 6px; color: var(--pop); background: var(--surface); border-radius: 2px; white-space: nowrap; }
+.review .rv-scope { font-size: 11px; color: var(--quiet); white-space: nowrap; }
+.review .rv-grow { flex: 1; }
+.review .rv-stats { display: flex; gap: 12px; margin: 0; font-family: "IBM Plex Mono", monospace; font-size: 11px; white-space: nowrap; }
+.review .rv-stats div { display: flex; gap: 5px; } .review .rv-stats dt { color: var(--quiet); } .review .rv-stats dd { margin: 0; } .review .rv-stats dd.warn-t { color: var(--support); }
+.review .rv-panelbtns { display: flex; gap: 3px; }
+.review .rv-warn { flex: none; padding: 1px 8px; font-size: 11px; color: var(--support); background: #17120d; border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.review .rv-state { padding: 14px 16px; margin: 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+.review .rv-state.err { border-color: var(--bad); } .review .rv-state b { display: block; margin-bottom: 4px; }
+.review .rv-mtabs { display: none; }
+/* work area: resizable columns */
+.review .rv-work { flex: 1 1 0; min-height: 0; display: grid; grid-template-columns: var(--wl) 5px minmax(0, 1fr) 5px var(--wr); background: var(--edit); }
+.review .rv-work.nl { --wl: 0px; } .review .rv-work.nr { --wr: 0px; }
+.review .rv-work.nl .rv-left, .review .rv-work.nr .rv-right { visibility: hidden; overflow: hidden; }
+.review .rv-work.nl .rv-split[data-split=left], .review .rv-work.nr .rv-split[data-split=right] { pointer-events: none; opacity: 0; }
+.review .rv-split { background: var(--line); touch-action: none; position: relative; }
+.review .rv-split:hover, .review .rv-split:focus-visible, .review .rv-split.on { background: var(--pop); }
+.review .rv-split.v { cursor: col-resize; width: 5px; } .review .rv-split.h { cursor: row-resize; height: 5px; flex: none; }
+.review .rv-left, .review .rv-right { min-height: 0; min-width: 0; background: var(--page); display: flex; flex-direction: column; overflow: hidden; }
+.review .rv-ph { flex: none; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 8px; min-height: 26px; border-bottom: 1px solid var(--line); background: #0d0d0d; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--quiet); }
+.review .rv-ph b { color: var(--text); font-weight: 500; } .review .rv-ph .rv-x { margin-left: auto; padding: 0 6px; min-height: 20px; }
+.review .rv-subtabs button { text-transform: uppercase; letter-spacing: .06em; font-size: 11px; border-radius: 0; border-width: 0 0 2px; background: transparent; min-height: 26px; } .review .rv-subtabs button[aria-pressed=true] { border-color: var(--pop); }
+.review .rv-ff > summary { padding: 2px 8px; font-size: 11px; color: var(--quiet); cursor: pointer; border-bottom: 1px solid var(--line); }
+.review .rv-filters { padding: 5px 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 4px; font-size: 11px; color: var(--quiet); border-bottom: 1px solid var(--line); }
+.review .rv-filters > input[type=search], .review .rv-filters label { grid-column: 1 / -1; } .review .rv-filters label { display: flex; align-items: center; gap: 6px; } .review .rv-filters input[type=range] { flex: 1; min-width: 0; }
+.review .rv-list { position: relative; flex: 1 1 0; min-height: 60px; overflow: auto; outline-offset: -2px; }
+.review .rv-list .sizer { position: relative; width: 100%; }
+.review .rv-row { position: absolute; left: 0; right: 0; height: 44px; display: grid; grid-template-columns: 52px 1fr; gap: 8px; padding: 2px 6px; align-items: center; border-bottom: 1px solid var(--line); cursor: pointer; font-size: 11px; }
+.review .rv-row:hover { background: var(--surface); } .review .rv-row[aria-selected="true"] { background: #1a2321; box-shadow: inset 2px 0 0 var(--pop); }
+.review .rv-row .th { width: 52px; height: 34px; background: #000 center/cover; border-radius: 2px; border: 1px solid var(--line); }
+.review .rv-row b { font-weight: 500; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review .rv-row span { color: var(--quiet); font-family: "IBM Plex Mono", monospace; font-size: 10px; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.review .rv-row.group { background: #121212; color: var(--pop); font: 500 10px "IBM Plex Mono", monospace; text-transform: uppercase; letter-spacing: .06em; display: flex; align-items: center; cursor: default; height: 22px; }
+.review .vdot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; background: var(--line); }
+.review .vdot.confirmed { background: var(--ok); } .review .vdot.rejected { background: var(--bad); } .review .vdot.reviewed { background: var(--pop); }
+.review .rv-stage { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: #000; }
+.review .rv-screen { position: relative; flex: 1 1 0; min-height: 80px; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.review .rv-screen video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+.review .rv-screen canvas#rv-ov { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.review .rv-msg { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 4px; padding: 16px; background: repeating-linear-gradient(45deg, #0d0d0d, #0d0d0d 12px, #111 12px, #111 24px); }
+.review .rv-msg b { font-size: 15px; font-weight: 500; } .review .rv-msg span { color: var(--quiet); max-width: 52ch; } .review .rv-msg.bad b { color: var(--support); }
+.review .rv-hud { position: absolute; left: 4px; top: 4px; font-size: 11px; background: rgba(0,0,0,.65); padding: 1px 6px; border-radius: 2px; color: var(--pop); pointer-events: none; max-width: calc(100% - 8px); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.review .rv-sheet { position: absolute; inset: 0; background: #060606; display: grid; grid-template-rows: minmax(0, 1fr) auto; }
+.review .rv-sheet .big { position: relative; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.review .rv-sheet .big img { max-width: 100%; max-height: 100%; object-fit: contain; } .review .rv-sheet .big canvas { position: absolute; pointer-events: none; }
+.review .rv-sheet .grid { display: flex; gap: 3px; overflow-x: auto; padding: 4px; border-top: 1px solid var(--line); }
+.review .rv-sheet .grid button { flex: none; width: 64px; height: 46px; padding: 0; background: #000 center/cover; border-radius: 2px; } .review .rv-sheet .grid button[aria-pressed="true"] { outline: 2px solid var(--pop); }
+.review .rv-transport { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 3px; padding: 3px 6px; border-top: 1px solid var(--line); background: var(--page); }
+.review .rv-play { min-width: 36px; background: var(--lead); border-color: var(--lead); }
+.review .rv-clock { font-size: 13px; min-width: 96px; text-align: center; color: var(--pop); }
+.review .rv-sep { flex: 1; } .review .rv-ovl { display: flex; gap: 2px; flex-wrap: wrap; }
+.review .rv-seekinfo { flex: none; margin: 0; padding: 1px 8px 3px; font-size: 10px; color: var(--quiet); background: var(--page); white-space: nowrap; text-overflow: ellipsis; overflow: hidden; min-height: 16px; }
+.review .rv-edit { flex: 0 0 var(--hed); min-height: 120px; display: flex; flex-direction: column; background: var(--page); padding: 3px 6px 4px; gap: 3px; border-top: 1px solid var(--line); }
+.review .rv-tltools { flex: none; display: flex; flex-wrap: wrap; gap: 3px; align-items: center; }
+.review .rv-seg { display: flex; } .review .rv-seg button:first-child { border-radius: 3px 0 0 3px; } .review .rv-seg button:last-child { border-radius: 0 3px 3px 0; margin-left: -1px; }
+.review .rv-chk { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--quiet); }
+.review .rv-perf { margin-left: auto; font-size: 10px; color: var(--quiet); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.review .rv-tl { flex: 1 1 0; min-height: 60px; }
+.review .rv-rails { flex: none; display: grid; gap: 2px; }
+.review .rv-railrow { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 6px; align-items: center; } .review .rv-raillabel { font-size: 10px; color: var(--quiet); text-transform: uppercase; letter-spacing: .05em; }
+.review .rail { height: 30px; }
+.review .rv-det { flex: 1 1 0; min-height: 0; overflow: auto; padding: 8px 8px 20px; display: grid; gap: 8px; align-content: start; font-size: 12px; }
+.review .rv-right[data-sub=query] .rv-det { display: none; } .review .rv-right[data-sub=details] .rv-qpane { display: none; }
+.review .rv-det h3 { margin: 0 0 4px; font-size: 13px; font-weight: 500; }
+.review .rv-det dl, .review .rv-qpane dl { display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; margin: 0; font-size: 11px; }
+.review .rv-det dt, .review .rv-qpane dt { color: var(--quiet); } .review .rv-det dd, .review .rv-qpane dd { margin: 0; font-family: "IBM Plex Mono", monospace; word-break: break-all; }
+.review .rv-det img.ev { width: 100%; aspect-ratio: 16/9; object-fit: contain; background: #000; border-radius: 2px; }
+.review .rv-det textarea { width: 100%; min-height: 48px; padding: 4px 6px; resize: vertical; }
+.review .rv-seg4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; }
+.review .rv-ev { max-height: 110px; overflow: auto; border: 1px solid var(--line); font: 10px "IBM Plex Mono", monospace; } .review .rv-ev div { padding: 1px 5px; border-bottom: 1px solid var(--line); }
+.review .rv-callout { border: 1px solid var(--line); border-radius: 3px; padding: 5px 7px; background: var(--surface); font-size: 11px; margin-top: 4px; } .review .rv-callout.err { border-color: var(--bad); } .review .rv-callout.ok { border-color: var(--lead); }
+.review .rv-callout .row { margin: 4px 0 0; } .review .row { display: flex; gap: 4px; flex-wrap: wrap; }
+.review progress { width: 100%; accent-color: var(--lead); }
+.review .rv-qpane { flex: 1 1 0; min-height: 0; overflow: auto; padding: 8px; display: grid; gap: 8px; align-content: start; }
+.review .rv-sql { margin: 0; padding: 8px; background: #050505; border: 1px solid var(--line); border-radius: 3px; font: 12px/1.5 "IBM Plex Mono", monospace; white-space: pre-wrap; word-break: break-word; color: var(--text); }
+.review .rv-sql .k { color: #7fb7b7; font-weight: 500; } .review .rv-sql .s { color: #CE7D36; } .review .rv-sql .n { color: #d9b36a; } .review .rv-sql .c { color: #6f7774; font-style: italic; } .review .rv-sql .f { color: #C5CFCB; }
+.review .rv-tip { position: fixed; z-index: 20; pointer-events: none; background: #000; border: 1px solid var(--pop); border-radius: 3px; padding: 3px 6px; font: 11px "IBM Plex Mono", monospace; max-width: 300px; }
+.review .rv-keys { background: var(--surface); color: var(--text); border: 1px solid var(--pop); border-radius: 4px; max-width: 560px; }
+.review .rv-keys table { border-collapse: collapse; width: 100%; } .review .rv-keys td { padding: 2px 8px; border-bottom: 1px solid var(--line); } .review .rv-keys kbd { font: 11px "IBM Plex Mono", monospace; background: #000; padding: 1px 5px; border: 1px solid var(--line); }
+.review .rv-keys::backdrop { background: rgba(0,0,0,.7); }
+/* 2560 and up: scale the dense type a little */
+@media (min-width: 2000px) { .review { --fs: 13px; --wl: 320px; --wr: 380px; } .review .rv-row { height: 48px; } }
+/* medium: right panel overlays less; keep both side panels narrower */
+@media (max-width: 1100px) { .review { --wl: 200px; --wr: 250px; } .review .rv-stats div:nth-child(n+4) { display: none; } }
+/* phone / narrow: player first, tabs for results, details and query. Works down to 320px. */
+@media (max-width: 760px) {
+  .review { height: auto; min-height: 0; overflow: visible; --hed: 300px; }
+  .review .rv-mtabs { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); background: var(--page); position: sticky; top: 0; z-index: 3; }
+  .review .rv-mtabs button { min-height: 40px; border-radius: 0; border-width: 0 0 2px; background: transparent; font-size: 13px; } .review .rv-mtabs button[aria-pressed=true] { border-color: var(--pop); }
+  .review .rv-panelbtns, .review .rv-split, .review .rv-x { display: none; }
+  .review .rv-bar { flex-wrap: wrap; overflow: visible; } .review .rv-stats { flex-wrap: wrap; gap: 2px 10px; } .review .rv-stats div:nth-child(n+4) { display: flex; }
+  .review .rv-work, .review .rv-work.nl, .review .rv-work.nr { display: block; flex: none; }
+  .review .rv-work.nl .rv-left, .review .rv-work.nr .rv-right { visibility: visible; }
+  .review .rv-left, .review .rv-right, .review .rv-stage, .review .rv-edit { display: none; }
+  .review[data-tab=player] .rv-stage, .review[data-tab=player] .rv-edit { display: flex; }
+  .review[data-tab=results] .rv-left { display: flex; height: 70vh; }
+  .review[data-tab=details] .rv-right, .review[data-tab=query] .rv-right { display: flex; min-height: 60vh; }
+  .review[data-tab=details] .rv-right { --x: 1; } .review[data-tab=details] .rv-right[data-sub=query], .review[data-tab=query] .rv-right[data-sub=details] { }
+  .review .rv-right .rv-subtabs { display: none; }
+  .review .rv-screen { flex: none; aspect-ratio: 16 / 10; width: 100%; }
+  .review .rv-edit { flex: none; height: var(--hed); }
+  .review button, .review select { min-height: 36px; min-width: 36px; }
+  .review .rv-transport { gap: 4px; } .review .rv-clock { min-width: 80px; }
+  .review .rv-railrow { grid-template-columns: 1fr; gap: 1px; } .review .rail { height: 34px; }
+  .review .rv-test span { display: none; }
+  .review .rv-row { height: 52px; } .review .rv-split.h { display: none; }
+}
+@media (max-width: 400px) { .review .rv-clock { min-width: 0; font-size: 12px; } .review .rv-ovl { width: 100%; } .review .rv-tltools .rv-perf { display: none; } }
+@media (prefers-reduced-motion: reduce) { .review * { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }

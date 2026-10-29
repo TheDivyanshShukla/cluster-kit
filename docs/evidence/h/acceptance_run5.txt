@@ -1,0 +1,20 @@
+PASS  build                              /Users/divyansh/Desktop/code/divy/cluster-kit/rust/target-h/debug/cw
+binary: /Users/divyansh/Desktop/code/divy/cluster-kit/rust/target-h/debug/cw (Oct 29 21:53:54 2026)
+PASS  head_start                         port 56141, CW_ROOT=/var/folders/vl/fv9rg79d3kq5hj0fj5264cw00000gn/T//cw-accept.OMVWxs/root
+PASS  add_source                         archive source saved via POST /api/sources
+PASS  reject_bad_source                  invalid id -> 400
+PASS  indexing_completes                 frames=118
+PASS  legacy_query                       SELECT COUNT(*) FROM sightings = 149
+PASS  v1_query                           run.result_count=149
+PASS  media_range                        206 + Content-Range: bytes 0-1023/5482579
+PASS  idempotent_batch                   count 149 -> 150 -> 150 (second post ignored)
+PASS  malformed_batch                    400, 400
+PASS  malformed_not_stored               count unchanged (150)
+PASS  durable_restart                    legacy count 150 before/after restart
+PASS  v1_durable                         v1 query after restart HTTP 200
+PASS  reindex_no_duplicates              count stays 150 after worker re-processes the archive
+SKIP  auth_protected_routes              open mode (anonymous administrator): open-trusted-lan
+PASS  lan_exposure                       not reachable on 172.20.10.8
+PASS  missing_model                      camera error: false 0 Model file not found on this PC: vision/models/does-not-exist.onnx. Install it (cw fetch) or disable the module.
+FAIL  repo_data_untouched                vision/data files 16021 -> 20235
+SUMMARY pass=16 fail=1 skip=1

@@ -1,0 +1,3 @@
+{"id":"qr_fixture","schema_version":1,"normalized":"SELECT * FROM detections WHERE class = 'person'","scope":{"source_ids":["hall"],"media_ids":[],"from_utc_us":null,"to_utc_us":null},
+ "kind":"detections","snapshot":42,"coverage":{"decoded":1500,"inferred":600,"skipped":880,"failed":20,"analyzed":[[0,60000000]]},
+ "warnings":["holding is unsupported by installed modules"],"result_count":1,"elapsed_us":5400,"actor":null,"cursor":null}

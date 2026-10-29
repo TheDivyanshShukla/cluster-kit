@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch · Review</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/ui/app.css">
+<link rel="stylesheet" href="/ui/timeline.css">
+<link rel="stylesheet" href="/ui/review.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="/" aria-label="Watch home"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 8V3h5M17 3h5v5M22 16v5h-5M7 21H2v-5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Watch</a>
+  <nav aria-label="Main navigation"><a href="/">Live</a><a href="/find">Search</a><a href="/sources">Sources</a><a href="/setup">Rules & models</a><a href="/analytics">Cluster</a><a href="/logs">Activity</a></nav>
+  <div class="meters">
+    <div class="ops"><b id="f-ops">0</b><span>ops / s</span></div>
+    <div class="lack"><b id="f-lack">0</b><span>lacking / s</span></div>
+    <div><b id="f-pcs">0</b><span>PCs joined</span></div>
+    <div><b id="f-warn">0</b><span>warnings</span></div>
+  </div>
+</header>
+<div class="connection hide" id="connection" role="status"></div>
+<main class="review" id="rv" data-tab="player">
+  <div class="rv-test hide" id="rv-test" role="note"><b>TEST DATA</b><span>Fixture mode. Detections, matches and review saves are generated in the browser and are not real. Only the video pixels are real files.</span></div>
+  <div class="rv-bar" id="rv-bar" role="group" aria-label="Query summary">
+    <div class="rv-chips" id="rv-sources" aria-label="Selected sources"></div>
+    <span class="rv-scope mono" id="rv-scope"></span>
+    <dl class="rv-stats" id="rv-stats"></dl>
+    <span class="rv-grow"></span>
+    <div class="rv-panelbtns" role="group" aria-label="Panels">
+      <button id="p-left" aria-pressed="true" title="Results panel">Results</button>
+      <button id="p-right" aria-pressed="true" title="Details and query panel">Panel</button>
+    </div>
+  </div>
+  <div class="rv-warn hide" id="rv-warn" role="status"></div>
+  <div class="rv-state hide" id="rv-state" role="alert"></div>
+  <nav class="rv-mtabs" id="rv-mtabs" aria-label="View">
+    <button data-tab="player" aria-pressed="true">Player</button><button data-tab="results" aria-pressed="false">Results</button><button data-tab="details" aria-pressed="false">Details</button><button data-tab="query" aria-pressed="false">Query</button>
+  </nav>
+  <div class="rv-work" id="rv-work">
+    <aside class="rv-left" id="rv-left" aria-label="Results">
+      <div class="rv-ph"><b>Results</b> <span class="mono" id="rv-rescount"></span><button class="rv-x" data-collapse="left" aria-label="Collapse results" title="Collapse">&laquo;</button></div>
+      <details class="rv-ff"><summary>Filters</summary><div class="rv-filters">
+        <label class="sr-only" for="fl-class">Filter by id or source</label><input id="fl-class" type="search" placeholder="filter id / source">
+        <label class="sr-only" for="fl-ver">Verification</label>
+        <select id="fl-ver"><option value="">any decision</option><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="confirmed">confirmed</option><option value="rejected">rejected</option></select>
+        <label class="sr-only" for="fl-src">Camera</label><select id="fl-src"><option value="">all cameras</option></select>
+        <label>min conf <input id="fl-conf" type="range" min="0" max="100" value="0"><output id="fl-conf-o" class="mono">0.00</output></label>
+        <label class="rv-chk"><input type="checkbox" id="fl-group"> group by camera</label>
+        <label class="sr-only" for="fl-sort">Sort</label><select id="fl-sort"><option value="time">sort: lane, time</option><option value="conf">sort: confidence</option></select>
+      </div></details>
+      <div class="rv-list" id="rv-list" tabindex="0" role="listbox" aria-label="Matches"></div>
+    </aside>
+    <div class="rv-split v" data-split="left" role="separator" aria-orientation="vertical" aria-label="Resize results panel (arrow keys)" tabindex="0"></div>
+    <section class="rv-stage" aria-label="Player">
+      <div class="rv-screen" id="rv-screen">
+        <video id="rv-video" preload="metadata" playsinline></video>
+        <canvas id="rv-ov" aria-hidden="true"></canvas>
+        <div class="rv-msg hide" id="rv-msg" role="status"></div>
+        <div class="rv-sheet hide" id="rv-sheet"></div>
+        <div class="rv-hud mono" id="rv-hud" aria-hidden="true"></div>
+      </div>
+      <div class="rv-transport" id="rv-tr" role="toolbar" aria-label="Transport">
+        <button id="b-prev" title="Previous match (J or [)" aria-label="Previous match">&#9198;</button>
+        <button id="b-fb" title="Back one frame (,) while paused" aria-label="Back one frame">&#9664;|</button>
+        <button id="b-play" class="rv-play" title="Play / pause (Space)" aria-label="Play">&#9654;</button>
+        <button id="b-ff" title="Forward one frame (.) while paused" aria-label="Forward one frame">|&#9654;</button>
+        <button id="b-next" title="Next match (K or ])" aria-label="Next match">&#9197;</button>
+        <output class="mono rv-clock" id="rv-clock">0:00.000</output>
+        <label class="sr-only" for="b-rate">Playback rate</label>
+        <select id="b-rate" title="Playback rate (&lt; &gt;)"><option>0.25</option><option>0.5</option><option selected>1</option><option>1.5</option><option>2</option><option>4</option></select>
+        <button id="b-mute" aria-pressed="false" title="Mute (M)">Mute</button>
+        <button id="b-loop" aria-pressed="false" title="Loop the trim range (L)">Loop</button>
+        <span class="rv-sep"></span>
+        <div class="rv-ovl" role="group" aria-label="Overlays">
+          <button data-ov="boxes" aria-pressed="true" title="Boxes (B)">Box</button>
+          <button data-ov="labels" aria-pressed="true" title="Labels (Shift+L)">Label</button>
+          <button data-ov="conf" aria-pressed="true" title="Confidence (C)">Conf</button>
+          <button data-ov="rels" aria-pressed="true" title="Relations (R)">Rel</button>
+          <button data-ov="tracks" aria-pressed="false" title="Track trails (T)">Track</button>
+          <button data-ov="zones" aria-pressed="false" title="Zones (Z)">Zone</button>
+        </div>
+        <button id="b-help" title="Keyboard map (?)">?</button>
+      </div>
+      <p class="rv-seekinfo mono" id="rv-seekinfo" aria-live="off"></p>
+    </section>
+    <div class="rv-split v" data-split="right" role="separator" aria-orientation="vertical" aria-label="Resize details panel (arrow keys)" tabindex="0"></div>
+    <aside class="rv-right" id="rv-right" aria-label="Details and query" data-sub="details">
+      <div class="rv-ph rv-subtabs" role="tablist"><button role="tab" data-sub="details" aria-pressed="true">Details</button><button role="tab" data-sub="query" aria-pressed="false">Query</button><button class="rv-x" data-collapse="right" aria-label="Collapse panel" title="Collapse">&raquo;</button></div>
+      <div id="rv-det" class="rv-det"><p class="quiet">Select a strip or a result.</p></div>
+      <div id="rv-qpane" class="rv-qpane"></div>
+    </aside>
+  </div>
+  <div class="rv-split h" data-split="edit" role="separator" aria-orientation="horizontal" aria-label="Resize timeline (arrow keys)" tabindex="0"></div>
+  <section class="rv-edit" aria-label="Timeline">
+    <div class="rv-tltools" id="rv-tltools" role="toolbar" aria-label="Timeline tools">
+      <div class="rv-seg" role="group" aria-label="Timeline view">
+        <button data-view="orig" aria-pressed="true" title="Original time (O)">Original</button>
+        <button data-view="matched" aria-pressed="false" title="Matched-only (O)">Matched only</button>
+      </div>
+      <button id="z-out" title="Zoom out (-)" aria-label="Zoom out">&minus;</button>
+      <button id="z-in" title="Zoom in (+)" aria-label="Zoom in">+</button>
+      <button id="z-sel" title="Fit selection (F)">Fit sel</button>
+      <button id="z-all" title="Fit all (Shift+F)">Fit all</button>
+      <label class="rv-chk"><input type="checkbox" id="t-follow" checked> follow</label>
+      <label class="rv-chk"><input type="checkbox" id="t-align"> align UTC</label>
+      <span class="mono rv-perf" id="rv-perf" aria-live="off"></span>
+    </div>
+    <div id="rv-tl" class="rv-tl"></div>
+    <div class="rv-rails">
+      <div class="rv-railrow"><span class="rv-raillabel">Matched-only</span><div id="rv-seq" class="rv-rail"></div></div>
+      <div class="rv-railrow"><span class="rv-raillabel" title="drag or Alt+arrows to reorder">Selected clips</span><div id="rv-sel" class="rv-rail"></div></div>
+    </div>
+  </section>
+  <div class="rv-tip hide" id="rv-tip" role="tooltip"></div>
+  <dialog id="rv-keys" class="rv-keys"><form method="dialog"><h2>Keyboard map</h2><div id="rv-keymap"></div><button>Close</button></form></dialog>
+</main>
+<script src="/ui/app.js"></script>
+<script src="/ui/timeline.js"></script>
+<script src="/ui/review.js"></script>
+</body>
+</html>

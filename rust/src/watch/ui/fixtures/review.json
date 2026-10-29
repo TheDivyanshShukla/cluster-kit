@@ -1,0 +1,347 @@
+{
+ "_test_data": "TEST DATA - fixture only. Generated deterministically in the browser from this seed. Not real detections, not real recordings.",
+ "_doc": "Shapes follow rust/src/watch/contracts/*.v1.json and domain.rs. fixture_* keys are fixture-only extras, never sent by the real API. Playable media map to the legacy route /api/media/<camera id> (vision/footage files). A media with fixture_wrap_us is a long fake recording whose playback loops the short real file so seeking still exercises a real <video>.",
+ "run": {
+  "id": "qr_fixture",
+  "schema_version": 1,
+  "normalized": "SELECT * FROM detections WHERE class = 'person' AND confidence >= 0.4",
+  "scope": {
+   "source_ids": [
+    "hall",
+    "street",
+    "perimeter",
+    "lobby",
+    "gallery",
+    "dock"
+   ],
+   "media_ids": [],
+   "from_utc_us": 1792746000000000,
+   "to_utc_us": 1792832400000000
+  },
+  "kind": "detections",
+  "snapshot": 42,
+  "coverage": {
+   "decoded": 21400,
+   "inferred": 12950,
+   "skipped": 7900,
+   "failed": 120,
+   "analyzed": [
+    [
+     0,
+     60000000
+    ]
+   ]
+  },
+  "warnings": [
+   "holding is unsupported by installed modules",
+   "lobby recording is missing from disk"
+  ],
+  "result_count": 0,
+  "elapsed_us": 18400,
+  "actor": null,
+  "cursor": null
+ },
+ "models": {
+  "installed": 2,
+  "names": [
+   "yolov5n-coco80 (objects)",
+   "bbox-proximity (near)"
+  ]
+ },
+ "media": [
+  {
+   "id": "med_hall_a",
+   "source_id": "hall",
+   "uri": "vision/footage/people-detection.mp4",
+   "fingerprint": "fixture",
+   "duration_us": 49666667,
+   "width": 768,
+   "height": 432,
+   "codec": "h264",
+   "timebase": "1/24000",
+   "capture_start_utc_us": 1792746000000000,
+   "proxy": "none",
+   "availability": "available",
+   "still": false,
+   "fixture_stream": "/api/media/hall",
+   "fixture_fps": 12,
+   "fixture_zones": [
+    {
+     "name": "Entrance (TEST)",
+     "poly": [
+      [
+       0.05,
+       0.3
+      ],
+      [
+       0.45,
+       0.3
+      ],
+      [
+       0.45,
+       0.95
+      ],
+      [
+       0.05,
+       0.95
+      ]
+     ]
+    }
+   ]
+  },
+  {
+   "id": "med_hall_b",
+   "source_id": "hall",
+   "uri": "vision/footage/people-detection.mp4",
+   "fingerprint": "fixture",
+   "duration_us": 49666667,
+   "width": 768,
+   "height": 432,
+   "codec": "h264",
+   "timebase": "1/24000",
+   "capture_start_utc_us": null,
+   "proxy": "none",
+   "availability": "available",
+   "still": false,
+   "fixture_stream": "/api/media/hall",
+   "fixture_fps": 12
+  },
+  {
+   "id": "med_street_a",
+   "source_id": "street",
+   "uri": "vision/footage/person-bicycle-car-detection.mp4",
+   "fingerprint": "fixture",
+   "duration_us": 53916667,
+   "width": 768,
+   "height": 432,
+   "codec": "h264",
+   "timebase": "1/24000",
+   "capture_start_utc_us": 1792746000000000,
+   "proxy": "none",
+   "availability": "available",
+   "still": false,
+   "fixture_stream": "/api/media/street",
+   "fixture_fps": 12
+  },
+  {
+   "id": "med_perimeter_day",
+   "source_id": "perimeter",
+   "uri": "fixture://perimeter/day",
+   "fingerprint": "fixture",
+   "duration_us": 86400000000,
+   "width": 768,
+   "height": 432,
+   "codec": "h264",
+   "timebase": "1/90000",
+   "capture_start_utc_us": 1792746000000000,
+   "proxy": "ready",
+   "availability": "available",
+   "still": false,
+   "fixture_stream": "/api/media/street",
+   "fixture_wrap_us": 53916667,
+   "fixture_fps": 12
+  },
+  {
+   "id": "med_lobby_a",
+   "source_id": "lobby",
+   "uri": "/recordings/lobby/missing.mp4",
+   "fingerprint": "fixture",
+   "duration_us": 600000000,
+   "width": 1280,
+   "height": 720,
+   "codec": "h264",
+   "timebase": "1/90000",
+   "capture_start_utc_us": 1792750000000000,
+   "proxy": "none",
+   "availability": "missing",
+   "still": false
+  },
+  {
+   "id": "med_gallery",
+   "source_id": "gallery",
+   "uri": "fixture://gallery",
+   "fingerprint": "fixture",
+   "duration_us": null,
+   "width": 640,
+   "height": 480,
+   "codec": "jpeg",
+   "timebase": null,
+   "capture_start_utc_us": null,
+   "proxy": "none",
+   "availability": "available",
+   "still": true
+  }
+ ],
+ "lanes": [
+  {
+   "source_id": "hall",
+   "media_id": "med_hall_a",
+   "clock": {
+    "kind": "utc"
+   },
+   "label": "Hall",
+   "recording": "day 1, 09:00 UTC",
+   "duration_us": 49666667,
+   "capture_start_utc_us": 1792746000000000,
+   "availability": "available",
+   "gen": {
+    "n": 14,
+    "seed": 11,
+    "dur": [
+     1500000,
+     6000000
+    ]
+   }
+  },
+  {
+   "source_id": "hall",
+   "media_id": "med_hall_b",
+   "clock": {
+    "kind": "media",
+    "media_id": "med_hall_b"
+   },
+   "label": "Hall",
+   "recording": "import hall-old.mp4",
+   "duration_us": 49666667,
+   "capture_start_utc_us": null,
+   "availability": "available",
+   "gen": {
+    "n": 9,
+    "seed": 12,
+    "dur": [
+     1500000,
+     6000000
+    ]
+   }
+  },
+  {
+   "source_id": "street",
+   "media_id": "med_street_a",
+   "clock": {
+    "kind": "utc"
+   },
+   "label": "Street",
+   "recording": "day 1, 09:00 UTC",
+   "duration_us": 53916667,
+   "capture_start_utc_us": 1792746000000000,
+   "availability": "available",
+   "gen": {
+    "n": 11,
+    "seed": 13,
+    "dur": [
+     1000000,
+     5000000
+    ]
+   }
+  },
+  {
+   "source_id": "perimeter",
+   "media_id": "med_perimeter_day",
+   "clock": {
+    "kind": "utc"
+   },
+   "label": "Perimeter",
+   "recording": "day 1, 24 h (looped test clip)",
+   "duration_us": 86400000000,
+   "capture_start_utc_us": 1792746000000000,
+   "availability": "available",
+   "gen": {
+    "n": 2950,
+    "seed": 14,
+    "dur": [
+     1500000,
+     40000000
+    ]
+   }
+  },
+  {
+   "source_id": "lobby",
+   "media_id": "med_lobby_a",
+   "clock": {
+    "kind": "utc"
+   },
+   "label": "Lobby",
+   "recording": "day 1, 10:06 UTC",
+   "duration_us": 600000000,
+   "capture_start_utc_us": 1792750000000000,
+   "availability": "missing",
+   "gen": {
+    "n": 6,
+    "seed": 15,
+    "dur": [
+     4000000,
+     20000000
+    ]
+   }
+  },
+  {
+   "source_id": "gallery",
+   "media_id": "med_gallery",
+   "clock": {
+    "kind": "media",
+    "media_id": "med_gallery"
+   },
+   "label": "Gallery",
+   "recording": "image collection",
+   "duration_us": null,
+   "capture_start_utc_us": null,
+   "availability": "available",
+   "gen": {
+    "n": 40,
+    "seed": 16,
+    "still": true
+   }
+  },
+  {
+   "source_id": "dock",
+   "media_id": "",
+   "clock": {
+    "kind": "utc"
+   },
+   "label": "Dock (live)",
+   "recording": "live preview only",
+   "duration_us": null,
+   "capture_start_utc_us": null,
+   "availability": "unknown",
+   "recorded": false,
+   "gen": {
+    "n": 0,
+    "seed": 17
+   }
+  }
+ ],
+ "gaps": [
+  {
+   "media_id": "med_hall_a",
+   "start_us": 22000000,
+   "end_us": 30000000,
+   "reason": "not yet analyzed"
+  },
+  {
+   "media_id": "med_street_a",
+   "start_us": 0,
+   "end_us": 6000000,
+   "reason": "decode failed"
+  },
+  {
+   "media_id": "med_perimeter_day",
+   "start_us": 14400000000,
+   "end_us": 18000000000,
+   "reason": "model not run"
+  },
+  {
+   "media_id": "med_perimeter_day",
+   "start_us": 60000000000,
+   "end_us": 61000000000,
+   "reason": "decode failed"
+  }
+ ],
+ "observations": {
+  "step_us": 500000,
+  "classes": [
+   "person",
+   "cell phone",
+   "bicycle"
+  ]
+ }
+}

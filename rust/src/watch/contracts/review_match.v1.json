@@ -1,0 +1,3 @@
+{"id":"match_fixture_1","query_run_id":"qr_fixture","source_id":"hall","media_id":"med_fixture_hall","clock":{"kind":"media","media_id":"med_fixture_hall"},
+ "start_us":16800000,"end_us":19200000,"context_start_us":13800000,"context_end_us":22200000,"capture_start_utc_us":null,"thumbnail":"/api/v1/media/med_fixture_hall/frame?t_us=16800000",
+ "observation_ids":["obs_fixture_1"],"detection_ids":["det_fixture_1"],"relation_ids":[],"distinct_tracks":1,"max_confidence":0.91,"verification":"unreviewed","still":false}

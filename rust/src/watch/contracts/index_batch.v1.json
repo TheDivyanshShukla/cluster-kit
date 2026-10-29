@@ -1,0 +1,8 @@
+{"schema_version":1,"lease":{"task_id":"task_fixture","generation":1},
+ "observation":{"observation_id":"obs_fixture_1","source_id":"hall","media_id":"med_fixture_hall","job_id":"job_fixture","frame_index":420,"pts":420,"timebase":"1/25","media_time_us":16800000,"capture_time_utc_us":null,"indexed_at_utc_us":1792963258819476,"model_versions":["mv_yolov5n"],"quality":"ok","thumbnail":null},
+ "detections":[
+  {"detection_id":"det_fixture_1","observation_id":"obs_fixture_1","class":"person","confidence":0.91,"bbox":[0.1,0.2,0.3,0.9],"model_version":"mv_yolov5n","track_id":"hall/med_fixture_hall/job_fixture/7","provenance":"model","color":"black"},
+  {"detection_id":"det_fixture_2","observation_id":"obs_fixture_1","class":"cell phone","confidence":0.62,"bbox":[0.22,0.5,0.26,0.56],"model_version":"mv_yolov5n","track_id":null,"provenance":"model","color":null}],
+ "relations":[
+  {"relation_id":"rel_fixture_1","observation_id":"obs_fixture_1","subject_detection_id":"det_fixture_1","subject_track_id":"hall/med_fixture_hall/job_fixture/7","predicate":"near","object_detection_id":"det_fixture_2","object_track_id":null,"object_class":"cell phone","confidence":0.62,"module_version":"mv_proximity","method":"bbox-proximity"}],
+ "thumbnail_hex":null}

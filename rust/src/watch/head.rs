@@ -14,7 +14,7 @@ use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::watch::approx::{self, PcSample};
 use crate::watch::config::{self, Camera, Module, Rule};
-use crate::watch::split::{self, Node};
+use crate::watch::split::Node;
 use crate::watch::{log, now_secs, primary_ip, Opts};
 
 struct Worker {
@@ -44,8 +44,11 @@ struct CamRate {
     at: f64,
     dur: f64,
     error: String,
+    completed: bool,
+    indexed_frames: u64,
     seq: u64,
     boxes: serde_json::Value,
+    ops: serde_json::Value,
 }
 
 struct Preview {
@@ -56,6 +59,7 @@ struct Preview {
     count: u32,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Event {
     id: u64,
     ts: f64,
@@ -66,6 +70,7 @@ struct Event {
     note: String,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Seen {
     id: u64,
     ts: f64,
@@ -73,11 +78,26 @@ struct Seen {
     camera_id: String,
     class: String,
     color: String,
+    #[serde(skip)]
     jpeg: Vec<u8>,
     at: f64,
+    #[serde(default)]
+    confidence: f32,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    track_id: u64,
+    #[serde(default)]
+    near_person: bool,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    thumbnail: String,
 }
 
 struct Hub {
+    journal: Mutex<()>,
+    index_batches: Mutex<HashMap<String, u64>>,
     solo: Mutex<bool>,
     workers: Mutex<HashMap<String, Worker>>,
     previews: Mutex<HashMap<String, Preview>>,
@@ -89,10 +109,35 @@ struct Hub {
     next_seen: Mutex<u64>,
     live: Condvar,
     pipes: Mutex<Vec<Arc<Mutex<Option<Child>>>>>,
+    api: Arc<crate::watch::api::Api>,
 }
 
 pub fn run(opts: Opts) -> Result<(), String> {
+    let root = crate::watch::repo_root();
+    std::fs::create_dir_all(data_path("")).map_err(|e| e.to_string())?;
+    let store = crate::watch::storage::open(&data_path("watch.db")).map_err(|e| format!("metadata store: {}", e.message))?;
+    let auth = crate::watch::auth::Auth::load(&root);
+    log(&auth.startup_notice());
+    let api = Arc::new(crate::watch::api::Api::new(store, data_path(""), auth));
+    for (id, r) in crate::watch::api::register_models(&api) {
+        if let Err(e) = r { log(&format!("module {id}: {}", e.message)); }
+    }
+    crate::watch::api::sync_sources(&api, &config::load_watch().cameras);
+    thread::spawn({
+        let api = api.clone();
+        move || match crate::watch::storage::legacy::import(&*api.store, &data_path("")) {
+            Ok(r) => log(&format!("legacy index: {} imported, {} already present, {} malformed", r.imported, r.duplicates, r.malformed)),
+            Err(e) => log(&format!("legacy import failed: {}", e.message)),
+        }
+    });
+    thread::spawn({
+        let api = api.clone();
+        move || loop { thread::sleep(Duration::from_secs(30)); api.save_alert_state(); }
+    });
     let hub = Arc::new(Hub {
+        api: api.clone(),
+        journal: Mutex::new(()),
+        index_batches: Mutex::new(HashMap::new()),
         solo: Mutex::new(false),
         workers: Mutex::new(HashMap::new()),
         previews: Mutex::new(HashMap::new()),
@@ -110,6 +155,12 @@ pub fn run(opts: Opts) -> Result<(), String> {
         *hub.seen.lock().unwrap() = list;
         *hub.next_seen.lock().unwrap() = next;
     }
+    let events: Vec<Event> = read_journal("events.jsonl").into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+    let mut latest = std::collections::BTreeMap::new();
+    for event in events { latest.insert(event.id, event); }
+    *hub.next_event.lock().unwrap() = latest.keys().max().copied().unwrap_or(0) + 1;
+    *hub.events.lock().unwrap() = latest.into_values().collect();
+    audit(&hub, "server.start", "Vision query service started");
     thread::spawn({
         let hub = hub.clone();
         move || watch_pictures(hub)
@@ -122,6 +173,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
     if !opts.no_local {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut cmd = Command::new(exe);
+        cmd.env("CW_WORKER_TOKEN", hub.api.auth.ephemeral_worker_token());
         cmd.args(["worker", "--head", "127.0.0.1", "--local", "--name", &opts.name, "--port", &opts.port.to_string()]);
         match cmd.spawn() {
             Ok(child) => {
@@ -148,16 +200,37 @@ pub fn run(opts: Opts) -> Result<(), String> {
             Err(e) => log(&format!("local worker did not start: {e}")),
         }
     }
-    let ip = primary_ip();
+    // Without configured users the service is open: keep it on loopback unless told otherwise.
+    let bind = match std::env::var("CW_BIND") {
+        Ok(b) => b,
+        Err(_) if hub.api.auth.mode() == "open-trusted-lan" => "127.0.0.1".into(),
+        Err(_) => "0.0.0.0".into(),
+    };
+    let ip = if bind == "0.0.0.0" { primary_ip() } else { bind.clone() };
     log(&format!("watch  http://{ip}:{}", opts.port));
-    log("other PCs: kit rs watch worker");
-    let server = Server::http(format!("0.0.0.0:{}", opts.port)).map_err(|e| e.to_string())?;
+    if bind == "127.0.0.1" { log("open mode: loopback only. Set CW_BIND=0.0.0.0 for remote workers, after bootstrapping an admin."); }
+    else { log("other PCs: kit rs watch worker"); }
+    let server = Server::http(format!("{bind}:{}", opts.port)).map_err(|e| e.to_string())?;
     for mut req in server.incoming_requests() {
         let hub = hub.clone();
         thread::spawn(move || {
             let method = req.method().clone();
             let url = req.url().to_string();
-            let path = url.split('?').next().unwrap_or(&url);
+            let path = url.split('?').next().unwrap_or(&url).to_string();
+            let path = path.as_str();
+            let headers: Vec<(String, String)> = req.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect();
+            let principal = match hub.api.auth.check(method.as_str(), path, &headers) {
+                Ok(p) => p,
+                Err(e) => { let _ = req.respond(v1_reply(crate::watch::api::Reply::err(e))); return; }
+            };
+            if path == "/api/v1/events" && method == Method::Get {
+                let cursor = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Last-Event-ID")).map(|(_, v)| v.clone())
+                    .or_else(|| crate::watch::api::param(&url, "cursor")).and_then(|c| c.parse().ok()).unwrap_or(0);
+                let body = crate::watch::api::SseBody::new(hub.api.clone(), cursor);
+                let h = vec![Header::from_bytes(b"Content-Type", b"text/event-stream").unwrap(), Header::from_bytes(b"Cache-Control", b"no-store").unwrap()];
+                let _ = req.respond(Response::new(StatusCode(200), h, body, None, None));
+                return;
+            }
             if method == Method::Get {
                 if let Some(id) = path.strip_prefix("/api/live/") {
                     let _ = req.respond(live_response(hub, id.to_string()));
@@ -171,6 +244,36 @@ pub fn run(opts: Opts) -> Result<(), String> {
             }
             let mut body = Vec::new();
             let _ = req.as_reader().take(2_000_000).read_to_end(&mut body);
+            let auth_out = match (method.as_str(), path) {
+                ("POST", "/api/v1/auth/login") => Some(hub.api.auth.login(&body, &req.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default())),
+                ("POST", "/api/v1/auth/logout") => Some(hub.api.auth.logout(&headers)),
+                ("POST", "/api/v1/auth/bootstrap") => Some(hub.api.auth.bootstrap_http(&body)),
+                ("GET", "/api/v1/auth/me") => Some(hub.api.auth.me(&headers)),
+                ("POST", "/api/v1/auth/users") => Some(hub.api.auth.create_user_http(&headers, &body)),
+                ("POST", "/api/v1/auth/worker-tokens") => Some(hub.api.auth.create_worker_token_http(&headers, &body)),
+                ("POST", "/api/v1/auth/password") => Some(hub.api.auth.change_password_http(&headers, &body)),
+                _ => None,
+            };
+            if let Some((status, hs, text)) = auth_out {
+                let mut r = Response::from_data(text.into_bytes()).with_status_code(StatusCode(status));
+                let mut typed = false;
+                for (k, v) in hs { typed |= k.eq_ignore_ascii_case("Content-Type"); if let Ok(h) = Header::from_bytes(k.as_bytes(), v.as_bytes()) { r = r.with_header(h); } }
+                if !typed { r = r.with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap()); }
+                let _ = req.respond(r);
+                return;
+            }
+            let range = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Range")).map(|(_, v)| v.clone());
+            let body = inject_actor(&method, path, body, &principal);
+            if let Some(r) = crate::watch::api::handle(&hub.api, method.as_str(), &url, &body, range.as_deref()) {
+                if path == "/api/v1/index" && r.status == 200 && !r.body.windows(16).any(|w| w == b"\"duplicate\":true") {
+                    // Compatibility: legacy /api/query, /api/find and /api/hit read the JSONL journal.
+                    if let Some(legacy) = legacy_batch(&body) {
+                        if let Err(e) = ingest_index(&hub, &legacy) { log(&format!("legacy journal write failed: {e}")); }
+                    }
+                }
+                let _ = req.respond(v1_reply(r));
+                return;
+            }
             let response = handle(&hub, &method, &url, &body, &req);
             let _ = req.respond(response);
         });
@@ -186,6 +289,7 @@ fn watch_pictures(hub: Arc<Hub>) {
         let want: HashMap<String, (String, Camera)> = watch
             .cameras
             .iter()
+            .filter(|c| !matches!(c.kind.as_str(), "archive" | "image"))
             .map(|c| (c.id.clone(), (format!("{}|{:.3}|{rate}", c.url, c.start), c.clone())))
             .collect();
         let stale: Vec<String> = running
@@ -350,6 +454,27 @@ fn handle(hub: &Hub, method: &Method, url: &str, body: &[u8], _req: &tiny_http::
     if path == "/api/health" {
         return json(serde_json::json!({"ok": true}));
     }
+    if path == "/api/index" && method == &Method::Post {
+        return match ingest_index(hub, body) {
+            Ok(n) => json(serde_json::json!({"ok":true,"indexed":n})), Err(e) => json_err(&e),
+        };
+    }
+    if path == "/api/sources" {
+        if method == &Method::Get {
+            let raw = std::fs::read_to_string(config::watch_path()).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).unwrap_or(serde_json::json!({}));
+            return json(serde_json::json!({"sources":raw.get("cameras").cloned().unwrap_or(serde_json::json!([])),"expanded":config::load_watch().cameras}));
+        }
+        if method == &Method::Post { return save_sources(hub, body); }
+    }
+    if path == "/api/capabilities" && method == &Method::Get { return json(capabilities()); }
+    if path == "/api/logs" && method == &Method::Get {
+        let _journal = hub.journal.lock().unwrap();
+        let logs: Vec<_> = read_journal("audit.jsonl").into_iter().rev().take(500).collect();
+        let records = load_log().0.len();
+        drop(_journal);
+        return json(serde_json::json!({"logs":logs,"events":*hub.events.lock().unwrap(),"index":{"records":records,"storage":"JSONL","query_strategy":"scan durable metadata"}}));
+    }
+    if path == "/api/query" && method == &Method::Post { return run_sql(hub, body); }
     if path == "/api/state" && method == &Method::Get {
         return json(snapshot(hub));
     }
@@ -376,8 +501,15 @@ fn handle(hub: &Hub, method: &Method, url: &str, body: &[u8], _req: &tiny_http::
         if method == &Method::Get {
             let id: u64 = id.parse().unwrap_or(0);
             if let Some(hit) = hub.seen.lock().unwrap().iter().find(|s| s.id == id) {
-                if !hit.jpeg.is_empty() {
-                    return bytes(hit.jpeg.clone(), "image/jpeg");
+                if !hit.jpeg.is_empty() { return bytes(hit.jpeg.clone(), "image/jpeg"); }
+                if !hit.thumbnail.is_empty() {
+                    if let Ok(data) = std::fs::read(data_path("thumbs").join(&hit.thumbnail)) { return bytes(data, "image/jpeg"); }
+                }
+            }
+            drop(hub.seen.lock().unwrap());
+            if let Some(hit) = load_log().0.into_iter().find(|s| s.id == id) {
+                if !hit.thumbnail.is_empty() {
+                    if let Ok(data) = std::fs::read(data_path("thumbs").join(hit.thumbnail)) { return bytes(data, "image/jpeg"); }
                 }
             }
             return empty(StatusCode(404));
@@ -400,7 +532,7 @@ fn handle(hub: &Hub, method: &Method, url: &str, body: &[u8], _req: &tiny_http::
                     }
                 }
                 match config::save_json(&config::rules_path(), &rules) {
-                    Ok(()) => json(serde_json::json!({"ok": true})),
+                    Ok(()) => { audit(hub, "configuration.save", path); json(serde_json::json!({"ok": true})) },
                     Err(e) => json_err(&e),
                 }
             }
@@ -410,7 +542,7 @@ fn handle(hub: &Hub, method: &Method, url: &str, body: &[u8], _req: &tiny_http::
     if path == "/api/modules" && method == &Method::Post {
         return match serde_json::from_slice::<Vec<Module>>(body) {
             Ok(m) => match config::save_json(&config::modules_path(), &m) {
-                Ok(()) => json(serde_json::json!({"ok": true})),
+                Ok(()) => { audit(hub, "configuration.save", path); json(serde_json::json!({"ok": true})) },
                 Err(e) => json_err(&e),
             },
             Err(e) => json_err(&e.to_string()),
@@ -455,8 +587,30 @@ fn handle(hub: &Hub, method: &Method, url: &str, body: &[u8], _req: &tiny_http::
             if let Some(n) = v.get("rate").and_then(|x| x.as_u64()) {
                 proc.rate = n as u32;
             }
+            if let Some(m) = v.get("detect_mode").and_then(|x| x.as_str()) {
+                proc.detect_mode = m.to_string();
+            }
+            if let Some(n) = v.get("motion_sensitivity").and_then(|x| x.as_f64()) {
+                proc.motion_sensitivity = n as f32;
+            }
+            if let Some(n) = v.get("motion_min_area").and_then(|x| x.as_f64()) {
+                proc.motion_min_area = n as f32;
+            }
+            if let Some(n) = v.get("region_margin").and_then(|x| x.as_f64()) {
+                proc.region_margin = n as f32;
+            }
+            if let Some(n) = v.get("detect_interval").and_then(|x| x.as_u64()) {
+                proc.detect_interval = n as u32;
+            }
+            if let Some(n) = v.get("keyframe_secs").and_then(|x| x.as_f64()) {
+                proc.keyframe_secs = n as f32;
+            }
+            if let Some(n) = v.get("max_regions").and_then(|x| x.as_u64()) {
+                proc.max_regions = n as u32;
+            }
         }
-        let _ = config::save_process(&proc, watch.copies);
+        if let Err(e) = config::save_process(&proc, watch.copies) { return json_err(&e); }
+        audit(hub, "settings.save", "Processing or execution mode changed");
         return json(serde_json::json!({"ok": true}));
     }
     if path == "/api/find" && method == &Method::Post {
@@ -465,7 +619,7 @@ fn handle(hub: &Hub, method: &Method, url: &str, body: &[u8], _req: &tiny_http::
     if path == "/api/searches" && method == &Method::Post {
         return match serde_json::from_slice::<Vec<config::SavedSearch>>(body) {
             Ok(list) => match config::save_json(&config::searches_path(), &list) {
-                Ok(()) => json(serde_json::json!({"ok": true})),
+                Ok(()) => { audit(hub, "configuration.save", path); json(serde_json::json!({"ok": true})) },
                 Err(e) => json_err(&e),
             },
             Err(e) => json_err(&e.to_string()),
@@ -479,6 +633,7 @@ fn assignment(hub: &Hub, url: &str) -> serde_json::Value {
     let host = query(url, "host").unwrap_or_else(|| "pc".into());
     let cores = query(url, "cores").and_then(|s| s.parse().ok()).unwrap_or(1usize);
     let local = query(url, "local").as_deref() == Some("1");
+    let cores = cores.max(1);
     if !id.is_empty() {
         let mut workers = hub.workers.lock().unwrap();
         let w = workers.entry(id.clone()).or_insert_with(|| Worker {
@@ -510,10 +665,13 @@ fn assignment(hub: &Hub, url: &str) -> serde_json::Value {
         .filter(|(_, w)| now - w.seen < 6.0)
         .map(|(id, w)| Node { id: id.clone(), cores: w.cores, local: w.local })
         .collect();
-    let ids: Vec<String> = watch.cameras.iter().map(|c| c.id.clone()).collect();
-    let map = split::assign(&nodes, &ids, solo);
-    let mine: Vec<&Camera> = watch.cameras.iter().filter(|c| map.get(&c.id).map(|s| s == &id).unwrap_or(false)).collect();
+    let _ = nodes;
+    crate::watch::api::sync_sources(&hub.api, &watch.cameras);
+    // Solo keeps every camera on the head's own worker.
+    let leases = if id.is_empty() { HashMap::new() } else { crate::watch::api::leases_for(&hub.api, &id, &host_of(hub, &id), cores, !solo || local) };
+    let mine: Vec<&Camera> = watch.cameras.iter().filter(|c| leases.contains_key(&c.id)).collect();
     serde_json::json!({
+        "leases": leases,
         "blur": watch.blur,
         "process": watch.process,
         "cameras": mine,
@@ -558,7 +716,6 @@ fn ingest_stats(hub: &Hub, body: &[u8]) {
         w.ram_total = Some(n);
     }
     let dt = v.get("dt").and_then(|x| x.as_f64()).unwrap_or(1.0).max(0.2);
-    let mut notes = Vec::new();
     if let Some(obj) = v.get("cameras").and_then(|x| x.as_object()) {
         for (cid, cam) in obj {
             let rate = |key: &str| cam.get(key).and_then(|x| x.as_f64()).unwrap_or(0.0) / dt;
@@ -577,8 +734,11 @@ fn ingest_stats(hub: &Hub, body: &[u8]) {
                 at: 0.0,
                 dur: 0.0,
                 error: String::new(),
+                completed: false,
+                indexed_frames: 0,
                 seq: 0,
                 boxes: serde_json::json!([]),
+                ops: serde_json::json!({}),
             });
             if let Some(n) = cam.get("name").and_then(|x| x.as_str()) {
                 entry.name = n.to_string();
@@ -597,61 +757,75 @@ fn ingest_stats(hub: &Hub, body: &[u8]) {
             entry.debt = Some(approx::ema(entry.debt, cam.get("debt").and_then(|x| x.as_f64()).unwrap_or(0.0)));
             entry.persons = Some(approx::ema(entry.persons, cam.get("persons").and_then(|x| x.as_f64()).unwrap_or(0.0)));
             entry.error = cam.get("error").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            entry.completed = cam.get("completed").and_then(|v|v.as_bool()).unwrap_or(false);
+            entry.indexed_frames = cam.get("indexed_frames").and_then(|v|v.as_u64()).unwrap_or(0);
             entry.seq = cam.get("seq").and_then(|x| x.as_u64()).unwrap_or(entry.seq);
             entry.at = cam.get("at").and_then(|x| x.as_f64()).unwrap_or(entry.at);
             entry.dur = cam.get("dur").and_then(|x| x.as_f64()).unwrap_or(entry.dur);
             entry.boxes = cam.get("boxes").cloned().unwrap_or(serde_json::json!([]));
-            let at = entry.at;
-            if let Some(arr) = entry.boxes.as_array() {
-                for b in arr {
-                    let class = b.get("class").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                    if class.is_empty() {
-                        continue;
-                    }
-                    let color = b.get("color").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                    notes.push((cid.clone(), entry.name.clone(), class, color, at));
-                }
-            }
+            if let Some(o) = cam.get("ops") { entry.ops = o.clone(); }
+            let state = cam.get("state").and_then(|x| x.as_str()).unwrap_or(if entry.completed { "completed" } else { "running" });
+            crate::watch::api::camera_state(&hub.api, id, cid, state, cam.get("error_code").and_then(|x| x.as_str()).unwrap_or(""), cam.get("coverage"));
+
         }
     }
     drop(workers);
-    note_seen(hub, notes);
+
 }
 
-fn note_seen(hub: &Hub, notes: Vec<(String, String, String, String, f64)>) {
-    if notes.is_empty() {
-        return;
+/// Every inference batch is journaled before acknowledgment. Stats are display-only.
+fn ingest_index(hub: &Hub, body: &[u8]) -> Result<usize, String> {
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    let cid = v["camera_id"].as_str().filter(|s| !s.is_empty()).ok_or("camera_id required")?;
+    let camera = v["camera"].as_str().unwrap_or(cid);
+    let seq = v["seq"].as_u64().ok_or("seq required")?;
+    let at = v["at"].as_f64().filter(|n| n.is_finite() && *n >= 0.0).ok_or("nonnegative at required")?;
+    let ts = v["ts"].as_f64().filter(|n| n.is_finite() && *n > 0.0).ok_or("positive ts required")?;
+    let detections = v["detections"].as_array().ok_or("detections array required")?;
+    if detections.len() > 10000 { return Err("batch exceeds 10000 detections".into()); }
+    // A timestamp changes across runs, while retries retain it. Do not merge different people.
+    let key = format!("{cid}|{ts:.6}|{seq}");
+    let _journal = hub.journal.lock().unwrap();
+    let mut batches = hub.index_batches.lock().unwrap();
+    if batches.contains_key(&key) { return Ok(0); }
+    let mut seen = hub.seen.lock().unwrap();
+    let mut next = hub.next_seen.lock().unwrap();
+    let mut added = Vec::new();
+    for b in detections {
+        let class = b["class"].as_str().filter(|s| !s.is_empty()).ok_or("detection class required")?;
+        let confidence = b["confidence"].as_f64().filter(|n| (0.0..=1.0).contains(n)).ok_or("confidence must be 0..1")? as f32;
+        added.push(Seen {
+            id: *next + added.len() as u64, ts, at, seq,
+            camera: camera.into(), camera_id: cid.into(), class: class.into(),
+            color: b["color"].as_str().unwrap_or("").into(),
+            confidence, model: b["model"].as_str().unwrap_or("").into(),
+            track_id: b["track_id"].as_u64().unwrap_or(0),
+            near_person: b["near_person"].as_bool().unwrap_or_else(|| b["near_person"].as_u64().is_some()),
+            thumbnail: String::new(),
+            jpeg: Vec::new(),
+        });
     }
-    let now = now_secs();
-    let mut lines = Vec::new();
-    {
-        let mut seen = hub.seen.lock().unwrap();
-        let mut next = hub.next_seen.lock().unwrap();
-        let previews = hub.previews.lock().unwrap();
-        for (cid, camera, class, color, at) in notes {
-            if seen.iter().rev().take(40).any(|s| s.camera_id == cid && s.class == class && s.color == color && now - s.ts < 4.0) {
-                continue;
-            }
-            let jpeg = previews.get(&cid).map(|p| p.jpeg.clone()).unwrap_or_default();
-            let id = *next;
-            *next += 1;
-            seen.push(Seen { id, ts: now, camera: camera.clone(), camera_id: cid.clone(), class: class.clone(), color: color.clone(), jpeg, at });
-            lines.push(serde_json::json!({"id": id, "ts": now, "at": at, "camera": camera, "camera_id": cid, "class": class, "color": color}));
-        }
-        if seen.len() > 40 {
-            let keep = seen.len() - 40;
-            for s in &mut seen[..keep] {
-                s.jpeg.clear();
-            }
-        }
-        if seen.len() > 2000 {
-            let drop_n = seen.len() - 2000;
-            seen.drain(0..drop_n);
-        }
+    if let Some(hex) = v["thumbnail_hex"].as_str().filter(|s| !s.is_empty()) {
+        let jpeg = decode_hex(hex)?;
+        if jpeg.len() > 300000 { return Err("thumbnail exceeds 300KB".into()); }
+        if !jpeg.starts_with(&[0xff,0xd8]) || !jpeg.ends_with(&[0xff,0xd9]) { return Err("thumbnail must be JPEG".into()); }
+        let filename = format!("{}.jpg", *next);
+        let dir = data_path("thumbs");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(&filename), &jpeg).map_err(|e| e.to_string())?;
+        for row in &mut added { row.thumbnail = filename.clone(); }
+        publish_frame(hub, cid, jpeg);
     }
-    for line in lines {
-        append_log(&line);
-    }
+    let lines: Vec<_> = added.iter().map(|s| serde_json::to_value(s).unwrap()).collect();
+    append_journal("seen.jsonl", &lines)?;
+    *next += added.len() as u64;
+    let count = added.len();
+    seen.extend(added);
+    // Bound JPEG memory; durable records retain media offsets for evidence playback.
+    if seen.len() > 100000 { let n = seen.len()-100000; seen.drain(..n); }
+    if batches.len() > 10000 { batches.clear(); }
+    batches.insert(key, seq);
+    Ok(count)
 }
 
 fn run_find(hub: &Hub, body: &[u8]) -> serde_json::Value {
@@ -666,7 +840,8 @@ fn run_find(hub: &Hub, body: &[u8]) -> serde_json::Value {
         to: v.get("to").and_then(|x| x.as_f64()).unwrap_or(0.0),
         lua: v.get("lua").and_then(|x| x.as_str()).unwrap_or("").to_string(),
     };
-    let seen = hub.seen.lock().unwrap();
+    let _journal = hub.journal.lock().unwrap();
+    let (seen, _) = load_log();
     let hits: Vec<crate::watch::query::HitIn> = seen
         .iter()
         .map(|s| crate::watch::query::HitIn {
@@ -677,6 +852,7 @@ fn run_find(hub: &Hub, body: &[u8]) -> serde_json::Value {
             camera_id: s.camera_id.clone(),
             class: s.class.clone(),
             color: s.color.clone(),
+            confidence: s.confidence, model: s.model.clone(), track_id: s.track_id, near_person: s.near_person,
         })
         .collect();
     match crate::watch::query::ask(&hits, &ask) {
@@ -687,7 +863,7 @@ fn run_find(hub: &Hub, body: &[u8]) -> serde_json::Value {
                     out.push(serde_json::json!({
                         "id": s.id, "ts": s.ts, "at": s.at,
                         "camera": s.camera, "camera_id": s.camera_id,
-                        "class": s.class, "color": s.color,
+                        "class": s.class, "color": s.color, "confidence":s.confidence, "model":s.model, "track_id":s.track_id, "near_person":s.near_person,
                     }));
                 }
             }
@@ -697,56 +873,53 @@ fn run_find(hub: &Hub, body: &[u8]) -> serde_json::Value {
     }
 }
 
-fn log_path() -> std::path::PathBuf {
-    crate::watch::repo_root().join("vision/data/seen.jsonl")
+fn data_path(name: &str) -> std::path::PathBuf {
+    crate::watch::repo_root().join("vision/data").join(name)
+}
+
+fn read_journal(name: &str) -> Vec<serde_json::Value> {
+    use std::io::BufRead;
+    let Ok(file) = File::open(data_path(name)) else { return Vec::new() };
+    std::io::BufReader::new(file).lines().map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str(&line).ok()).collect()
 }
 
 fn load_log() -> (Vec<Seen>, u64) {
-    let text = std::fs::read_to_string(log_path()).unwrap_or_default();
-    let mut list = Vec::new();
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        list.push(Seen {
-            id: v.get("id").and_then(|x| x.as_u64()).unwrap_or(0),
-            ts: v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0),
-            at: v.get("at").and_then(|x| x.as_f64()).unwrap_or(0.0),
-            camera: v.get("camera").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            camera_id: v.get("camera_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            class: v.get("class").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            color: v.get("color").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            jpeg: Vec::new(),
-        });
-    }
-    if list.len() > 2000 {
-        let drop_n = list.len() - 2000;
-        list.drain(0..drop_n);
-    }
+    let list: Vec<Seen> = read_journal("seen.jsonl").into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok()).collect();
     let next = list.iter().map(|s| s.id).max().unwrap_or(0) + 1;
     (list, next)
 }
 
-fn append_log(line: &serde_json::Value) {
-    let path = log_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+fn append_journal(name: &str, lines: &[serde_json::Value]) -> Result<(), String> {
     use std::io::Write;
-    let _ = writeln!(file, "{line}");
+    let path = data_path(name);
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
+    let mut batch = Vec::new();
+    for line in lines { writeln!(batch, "{line}").map_err(|e| e.to_string())?; }
+    file.write_all(&batch).and_then(|_| file.sync_data()).map_err(|e| e.to_string())
+}
+
+fn audit(hub: &Hub, action: &str, detail: &str) {
+    let _journal = hub.journal.lock().unwrap();
+    if let Err(e) = append_journal("audit.jsonl", &[serde_json::json!({"ts":now_secs(),"action":action,"detail":detail})]) {
+        log(&format!("audit write failed: {e}"));
+    }
 }
 
 fn media_path(id: &str) -> Option<std::path::PathBuf> {
     let id = id.split('?').next().unwrap_or(id);
     let watch = config::load_watch();
     let cam = watch.cameras.iter().find(|c| c.id == id)?;
-    if cam.kind != "file" {
+    if !matches!(cam.kind.as_str(), "file" | "archive") {
         return None;
     }
     let path = std::path::PathBuf::from(config::resolve_url(&cam.url));
     if path.is_file() { Some(path) } else { None }
 }
 
-fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
+pub(crate) fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
     if len == 0 {
         return None;
     }
@@ -822,6 +995,11 @@ fn ingest_events(hub: &Hub, body: &[u8]) {
         *next += 1;
         events.push(Event { id, ts: now, key, rule, camera, status, note });
     }
+    let records: Vec<_> = events.iter().map(|e| serde_json::to_value(e).unwrap()).collect();
+    drop(events);
+    let _journal = hub.journal.lock().unwrap();
+    if let Err(e) = append_journal("events.jsonl", &records) { log(&format!("event persistence failed: {e}")); }
+    let mut events = hub.events.lock().unwrap();
     if events.len() > 400 {
         let drop_n = events.len() - 400;
         events.drain(0..drop_n);
@@ -840,6 +1018,14 @@ fn confirm(hub: &Hub, body: &[u8]) {
         } else {
             ev.status = "confirmed".into();
         }
+    }
+    let record = events.iter().find(|e| e.id == id).map(|e| serde_json::to_value(e).unwrap());
+    drop(events);
+    if let Some(record) = record {
+        let _journal = hub.journal.lock().unwrap();
+        if let Err(e) = append_journal("events.jsonl", &[record]) { log(&format!("event persistence failed: {e}")); }
+        drop(_journal);
+        audit(hub, "alert.review", &format!("Alert {id}: {verdict}"));
     }
 }
 
@@ -907,7 +1093,10 @@ fn snapshot(hub: &Hub) -> serde_json::Value {
                 "id": cid,
                 "name": cam.name,
                 "status": st,
+                "error": cam.error,
                 "seq": cam.seq,
+                "completed":cam.completed,
+                "indexed_frames":cam.indexed_frames,
                 "people": approx::people(cam.persons.unwrap_or(0.0)),
                 "lacking": approx::fmt_num(lacking),
                 "feed": match feeds.get(cid).copied().unwrap_or(0.0) {
@@ -919,6 +1108,10 @@ fn snapshot(hub: &Hub) -> serde_json::Value {
                 "at": cam.at,
                 "dur": cam.dur,
                 "boxes": if show_boxes { cam.boxes.clone() } else { serde_json::json!([]) },
+                "ops": cam.ops,
+                // Flat copies for the Rules page: detector passes, static skips, regions, keyframes, pixels.
+                "detector_passes": cam.ops.get("detector_passes"), "static": cam.ops.get("static"), "regions": cam.ops.get("regions"),
+                "keyframes": cam.ops.get("keyframes"), "pixels_inferred": cam.ops.get("pixels_inferred"), "pixels_full": cam.ops.get("pixels_full"),
             }));
         }
         let ops = passes * if pass_cost > 0.0 { pass_cost } else { 0.0 };
@@ -1071,9 +1264,21 @@ fn ui_page(path: &str) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
     let (name, ctype) = match path {
         "/" | "/wall" => ("wall.html", "text/html; charset=utf-8"),
         "/find" => ("find.html", "text/html; charset=utf-8"),
+        "/sources" => ("sources.html", "text/html; charset=utf-8"),
+        "/logs" => ("logs.html", "text/html; charset=utf-8"),
+        "/ui/sources.js" => ("sources.js", "text/javascript; charset=utf-8"),
+        "/ui/logs.js" => ("logs.js", "text/javascript; charset=utf-8"),
         "/analytics" => ("analytics.html", "text/html; charset=utf-8"),
         "/setup" => ("setup.html", "text/html; charset=utf-8"),
         "/clip" => ("clip.html", "text/html; charset=utf-8"),
+        "/review" => ("review.html", "text/html; charset=utf-8"),
+        "/login" => ("login.html", "text/html; charset=utf-8"),
+        "/ui/review.js" => ("review.js", "text/javascript; charset=utf-8"),
+        "/ui/review.css" => ("review.css", "text/css; charset=utf-8"),
+        "/ui/timeline.js" => ("timeline.js", "text/javascript; charset=utf-8"),
+        "/ui/timeline.css" => ("timeline.css", "text/css; charset=utf-8"),
+        "/ui/product.css" => ("product.css", "text/css; charset=utf-8"),
+        "/ui/fixtures/review.json" => ("fixtures/review.json", "application/json"),
         "/ui/app.css" => ("app.css", "text/css; charset=utf-8"),
         "/ui/app.js" => ("app.js", "text/javascript; charset=utf-8"),
         "/ui/wall.js" => ("wall.js", "text/javascript; charset=utf-8"),
@@ -1091,9 +1296,21 @@ fn ui_page(path: &str) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
     let embedded: &[u8] = match name {
         "wall.html" => include_str!("ui/wall.html").as_bytes(),
         "find.html" => include_str!("ui/find.html").as_bytes(),
+        "sources.html" => include_str!("ui/sources.html").as_bytes(),
+        "logs.html" => include_str!("ui/logs.html").as_bytes(),
+        "sources.js" => include_str!("ui/sources.js").as_bytes(),
+        "logs.js" => include_str!("ui/logs.js").as_bytes(),
         "analytics.html" => include_str!("ui/analytics.html").as_bytes(),
         "setup.html" => include_str!("ui/setup.html").as_bytes(),
         "clip.html" => include_str!("ui/clip.html").as_bytes(),
+        "review.html" => include_str!("ui/review.html").as_bytes(),
+        "login.html" => include_str!("ui/login.html").as_bytes(),
+        "review.js" => include_str!("ui/review.js").as_bytes(),
+        "review.css" => include_str!("ui/review.css").as_bytes(),
+        "timeline.js" => include_str!("ui/timeline.js").as_bytes(),
+        "timeline.css" => include_str!("ui/timeline.css").as_bytes(),
+        "product.css" => include_str!("ui/product.css").as_bytes(),
+        "fixtures/review.json" => include_str!("ui/fixtures/review.json").as_bytes(),
         "app.css" => include_str!("ui/app.css").as_bytes(),
         "app.js" => include_str!("ui/app.js").as_bytes(),
         "wall.js" => include_str!("ui/wall.js").as_bytes(),
@@ -1121,3 +1338,121 @@ fn empty(code: StatusCode) -> Response<std::io::Cursor<Vec<u8>>> {
 }
 
 use crate::watch::rules;
+
+fn save_sources(hub: &Hub, body: &[u8]) -> Response<std::io::Cursor<Vec<u8>>> {
+    let list = match serde_json::from_slice::<Vec<Camera>>(body) { Ok(v) => v, Err(e) => return json_err(&e.to_string()) };
+    let mut ids = std::collections::HashSet::new();
+    for c in &list {
+        if c.id.is_empty() || !c.id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+            return json_err("Source IDs must contain only letters, digits, underscores or hyphens");
+        }
+        if !ids.insert(&c.id) { return json_err("Source IDs must be unique"); }
+        if c.name.trim().is_empty() || c.url.trim().is_empty() { return json_err("Source name and location are required"); }
+        if !matches!(c.kind.as_str(), "live" | "webcam" | "file" | "archive" | "image" | "folder") {
+            return json_err("Source kind must be live, webcam, archive, image, folder or file (looping demo)");
+        }
+        if !c.start.is_finite() || !(0.0..1.0).contains(&c.start) { return json_err("Start must be a fraction from 0 (inclusive) to 1 (exclusive)"); }
+        for z in &c.zones {
+            if z.rect.iter().any(|n| !n.is_finite() || !(0.0..=1.0).contains(n)) || z.rect[2] <= 0.0 || z.rect[3] <= 0.0 || z.rect[0]+z.rect[2]>1.0 || z.rect[1]+z.rect[3]>1.0 {
+                return json_err("Zone rectangles must fit within normalized image coordinates");
+            }
+        }
+    }
+    let mut v = std::fs::read_to_string(config::watch_path()).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).unwrap_or(serde_json::json!({}));
+    if !v.is_object() { return json_err("watch.json must be an object"); }
+    v["cameras"] = serde_json::to_value(&list).unwrap();
+    // An explicit empty source list must stay empty instead of creating sample feeds.
+    v["configured"] = serde_json::json!(true);
+    match config::save_json(&config::watch_path(), &v) {
+        Ok(()) => { audit(hub, "sources.save", &format!("Saved {} sources", list.len())); json(serde_json::json!({"ok":true,"count":list.len()})) }
+        Err(e) => json_err(&e),
+    }
+}
+
+fn capabilities() -> serde_json::Value {
+    let modules: Vec<_> = config::load_modules().into_iter().map(|m| {
+        let path = config::resolve_url(&m.model);
+        serde_json::json!({"id":m.id,"name":m.name,"kind":m.kind,"enabled":m.enabled,"available":!m.model.is_empty() && std::path::Path::new(&path).is_file(),"labels":m.labels,"model":m.model})
+    }).collect();
+    serde_json::json!({
+        "sources":["live","webcam","archive","image","folder"],
+        "query":{"table":"sightings","language":"SELECT subset; unsupported syntax returns an error","count_unit":"indexed detections, not distinct people","history":"Durable JSONL metadata; queries scan the journal"},
+        "modules":modules,
+        "relationships":{"near":"Spatial proximity heuristic; does not prove holding"},
+        "accuracy":"Model confidence is not an accuracy guarantee. Validate thresholds and recall on labeled footage. Small phones and occluded objects can be missed.",
+        "auth":"No login. Trusted LAN demonstration only. Do not expose this service to the internet.",
+        "cluster":"Camera affinity, weighted by physical cores; paths and models must be accessible on each worker. One camera runs on one worker.",
+        "archive":"Finite scan with backpressure; processing presets still control which frames are sampled. Use Accuracy with filters off to scan every decoded frame."
+    })
+}
+
+fn run_sql(hub: &Hub, body: &[u8]) -> Response<std::io::Cursor<Vec<u8>>> {
+    let v: serde_json::Value = match serde_json::from_slice(body) { Ok(v)=>v, Err(e)=>return json_err(&e.to_string()) };
+    let Some(statement) = v["sql"].as_str() else { return json_err("sql string required") };
+    let _journal = hub.journal.lock().unwrap();
+    let (seen, _) = load_log();
+    let hits: Vec<_> = seen.iter().map(|s| crate::watch::query::HitIn {
+        id:s.id, ts:s.ts, at:s.at, camera:s.camera.clone(), camera_id:s.camera_id.clone(),
+        class:s.class.clone(), color:s.color.clone(), confidence:s.confidence, model:s.model.clone(), track_id:s.track_id, near_person:s.near_person,
+    }).collect();
+    match crate::watch::query::sql(&hits, statement) {
+        Ok(result) => {
+            let ids: std::collections::HashSet<_> = result.ids.iter().copied().collect();
+            let rows: Vec<_> = seen.iter().filter(|s| ids.contains(&s.id)).map(|s| serde_json::to_value(s).unwrap()).collect();
+            json(serde_json::json!({"result":result,"rows":rows,"count_unit":"indexed detections"}))
+        }
+        Err(e) => json_err(&e),
+    }
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() > 600000 || s.len()%2 != 0 { return Err("invalid thumbnail hex length".into()); }
+    s.as_bytes().chunks_exact(2).map(|p| {
+        let text = std::str::from_utf8(p).map_err(|_| "invalid thumbnail hex".to_string())?;
+        u8::from_str_radix(text,16).map_err(|_| "invalid thumbnail hex".to_string())
+    }).collect()
+}
+
+fn host_of(hub: &Hub, id: &str) -> String {
+    hub.workers.lock().unwrap().get(id).map(|w| w.host.clone()).unwrap_or_else(|| "pc".into())
+}
+
+fn v1_reply(r: crate::watch::api::Reply) -> Response<std::io::Cursor<Vec<u8>>> {
+    let n = r.body.len();
+    let mut out = Response::new(StatusCode(r.status), vec![Header::from_bytes(b"Content-Type", r.ctype.as_bytes()).unwrap()], std::io::Cursor::new(r.body), Some(n), None).with_chunked_threshold(usize::MAX);
+    let mut cached = false;
+    for (k, v) in r.headers {
+        cached |= k.eq_ignore_ascii_case("Cache-Control");
+        if let Ok(h) = Header::from_bytes(k.as_bytes(), v.as_bytes()) { out = out.with_header(h); }
+    }
+    if !cached { out = out.with_header(Header::from_bytes(b"Cache-Control", b"no-store").unwrap()); }
+    out
+}
+
+/// Audited v1 mutations carry the authenticated actor, not whatever the client claims.
+fn inject_actor(method: &Method, path: &str, body: Vec<u8>, p: &crate::watch::auth::Principal) -> Vec<u8> {
+    if p.anonymous || p.worker || method == &Method::Get || !path.starts_with("/api/v1/") { return body; }
+    match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(mut v) if v.is_object() => { v["actor"] = serde_json::json!(p.name); serde_json::to_vec(&v).unwrap_or(body) }
+        _ => body,
+    }
+}
+
+/// v1 IndexBatch -> legacy `/api/index` body, so the seconds-based compatibility endpoints keep working.
+fn legacy_batch(body: &[u8]) -> Option<Vec<u8>> {
+    let b: crate::watch::domain::IndexBatch = serde_json::from_slice(body).ok()?;
+    let o = &b.observation;
+    let near: std::collections::HashSet<&str> = b.relations.iter().map(|r| r.object_detection_id.as_str()).collect();
+    let dets: Vec<_> = b.detections.iter().map(|d| serde_json::json!({
+        "class": d.class, "confidence": d.confidence, "model": d.model_version, "color": d.color,
+        "track_id": d.track_id.as_deref().and_then(|t| t.rsplit(|c| c == '/' || c == 't').next()).and_then(|n| n.parse::<u64>().ok()),
+        "near_person": near.contains(d.detection_id.as_str()),
+    })).collect();
+    let v = serde_json::json!({
+        "camera_id": o.source_id, "camera": o.source_id,
+        "seq": o.frame_index.unwrap_or((o.media_time_us / 1000) as u64),
+        "at": o.media_time_us as f64 / 1e6, "ts": o.indexed_at_utc_us as f64 / 1e6,
+        "detections": dets, "thumbnail_hex": b.thumbnail_hex,
+    });
+    serde_json::to_vec(&v).ok()
+}

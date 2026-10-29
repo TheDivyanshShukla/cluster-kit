@@ -1,0 +1,175 @@
+{
+ "annotator": "Claude, single, visual; not human-verified",
+ "frames": [
+  {
+   "frame": "meva-g419_0033133ms",
+   "label_people": 1,
+   "model_people": 1,
+   "model_conf": [
+    0.93
+   ]
+  },
+  {
+   "frame": "meva-g419_0033666ms",
+   "label_people": 1,
+   "model_people": 1,
+   "model_conf": [
+    0.93
+   ]
+  },
+  {
+   "frame": "meva-g419_0037733ms",
+   "label_people": 0,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g419_0050400ms",
+   "label_people": 0,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g419_0078533ms",
+   "label_people": null,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g419_0080466ms",
+   "label_people": 1,
+   "model_people": 1,
+   "model_conf": [
+    0.94
+   ]
+  },
+  {
+   "frame": "meva-g420_0022533ms",
+   "label_people": 2,
+   "model_people": 2,
+   "model_conf": [
+    0.91,
+    0.91
+   ]
+  },
+  {
+   "frame": "meva-g420_0024000ms",
+   "label_people": 1,
+   "model_people": 1,
+   "model_conf": [
+    0.91
+   ]
+  },
+  {
+   "frame": "meva-g420_0024800ms",
+   "label_people": null,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g420_0043800ms",
+   "label_people": 0,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g420_0086933ms",
+   "label_people": 1,
+   "model_people": 1,
+   "model_conf": [
+    0.92
+   ]
+  },
+  {
+   "frame": "meva-g420_0099200ms",
+   "label_people": 0,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g421_0094933ms",
+   "label_people": null,
+   "model_people": 1,
+   "model_conf": [
+    0.45
+   ]
+  },
+  {
+   "frame": "meva-g421_0096400ms",
+   "label_people": 1,
+   "model_people": 1,
+   "model_conf": [
+    0.95
+   ]
+  },
+  {
+   "frame": "meva-g421_0099000ms",
+   "label_people": 1,
+   "model_people": 1,
+   "model_conf": [
+    0.59
+   ]
+  },
+  {
+   "frame": "meva-g421_0100800ms",
+   "label_people": null,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g421_0111266ms",
+   "label_people": 1,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g421_0111400ms",
+   "label_people": 1,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g423_0011066ms",
+   "label_people": 2,
+   "model_people": 2,
+   "model_conf": [
+    0.83,
+    0.68
+   ]
+  },
+  {
+   "frame": "meva-g423_0020533ms",
+   "label_people": 1,
+   "model_people": 1,
+   "model_conf": [
+    0.8
+   ]
+  },
+  {
+   "frame": "meva-g423_0026666ms",
+   "label_people": 1,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g423_0092800ms",
+   "label_people": 1,
+   "model_people": 1,
+   "model_conf": [
+    0.88
+   ]
+  },
+  {
+   "frame": "meva-g423_0103666ms",
+   "label_people": null,
+   "model_people": 0,
+   "model_conf": []
+  },
+  {
+   "frame": "meva-g423_0108266ms",
+   "label_people": 1,
+   "model_people": 0,
+   "model_conf": []
+  }
+ ]
+}

@@ -19,6 +19,7 @@ ureq = { version = "2.12", optional = true, features = ["native-tls", "json"] }
 jpeg-encoder = { version = "0.6", optional = true }
 ctrlc = { version = "3", optional = true }
 mlua = { version = "0.10", optional = true, features = ["lua54", "vendored", "send"] }
+rusqlite = { version = "=0.32.1", optional = true, features = ["bundled"] }
 
 [profile.release]
 lto = true
@@ -27,7 +28,8 @@ codegen-units = 1
 [features]
 default = ["gpu"]
 gpu = ["dep:wgpu", "dep:pollster"]   # `ck worker --gpu`; build without it: cargo build --release --no-default-features
-watch = ["dep:ort", "dep:ndarray", "dep:half", "dep:tiny_http", "dep:serde", "dep:serde_json", "dep:ureq", "dep:jpeg-encoder", "dep:ctrlc", "dep:mlua"]
+coreml = ["ort/coreml"]   # Apple Neural Engine / GPU for the detector (macOS); build: --features watch,coreml
+watch = ["dep:ort", "dep:ndarray", "dep:half", "dep:tiny_http", "dep:serde", "dep:serde_json", "dep:ureq", "dep:jpeg-encoder", "dep:ctrlc", "dep:mlua", "dep:rusqlite"]
 
 [[bin]]
 name = "cw"

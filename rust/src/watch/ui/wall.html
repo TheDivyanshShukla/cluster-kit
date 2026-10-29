@@ -7,16 +7,12 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/ui/app.css">
+<link rel="stylesheet" href="/ui/product.css">
 </head>
 <body>
 <header>
-  <a class="brand" href="/">Watch</a>
-  <nav>
-    <a href="/" aria-current="page">Wall</a>
-    <a href="/find">Find</a>
-    <a href="/analytics">Analytics</a>
-    <a href="/setup">Setup</a>
-  </nav>
+  <a class="brand" href="/" aria-label="Watch home"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 8V3h5M17 3h5v5M22 16v5h-5M7 21H2v-5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Watch</a>
+  <nav aria-label="Main navigation"><a href="/" aria-current="page">Live</a><a href="/find">Search</a><a href="/sources">Sources</a><a href="/setup">Rules & models</a><a href="/analytics">Cluster</a><a href="/logs">Activity</a></nav>
   <div class="meters">
     <div class="ops"><b id="f-ops">0</b><span>ops / s</span></div>
     <div class="lack"><b id="f-lack">0</b><span>lacking / s</span></div>
@@ -24,19 +20,30 @@
     <div><b id="f-warn">0</b><span>warnings</span></div>
   </div>
 </header>
-<main>
-  <p class="sentence" id="sentence"></p>
-  <div class="row">
-    <button type="button" id="mode-one">One PC</button>
-    <button type="button" id="mode-all" aria-pressed="true">All PCs</button>
+<div class="connection hide" id="connection" role="status"></div>
+<main class="cctv-main">
+  <div class="cctv-bar">
+    <div class="seg" id="layouts" role="group" aria-label="Wall layout"><button type="button" data-l="1" aria-pressed="false" title="1 camera (key 1)">1</button><button type="button" data-l="2" aria-pressed="false" title="2x2 (key 2)">2&times;2</button><button type="button" data-l="3" aria-pressed="false" title="3x3 (key 3)">3&times;3</button><button type="button" data-l="4" aria-pressed="false" title="4x4 (key 4)">4&times;4</button><button type="button" data-l="auto" aria-pressed="true" title="Auto (key A)">Auto</button></div>
+    <div class="seg" role="group" aria-label="Execution"><button type="button" id="mode-one">One PC</button><button type="button" id="mode-all" aria-pressed="true">All PCs</button></div>
+    <div class="seg" id="pager" hidden><button type="button" id="pg-prev" aria-label="Previous page">&lsaquo;</button><span class="mono" id="pg-label"></span><button type="button" id="pg-next" aria-label="Next page">&rsaquo;</button></div>
+    <div class="seg" role="group" aria-label="Tile view"><button type="button" id="view-sync" aria-pressed="true" title="Show each analyzed frame with its own boxes (key V toggles)">Analyzed + boxes</button><button type="button" id="view-video" aria-pressed="false" title="Smooth preview video, no boxes">Smooth video</button></div>
+    <button type="button" id="trails" aria-pressed="true" title="Motion trails behind tracked objects">Trails</button>
+    <button type="button" id="fs" title="Fullscreen wall (key F)">Fullscreen</button>
+    <span class="quiet cctv-sentence" id="sentence">Waiting for the vision engine…</span>
+    <a class="btn" href="/sources">Sources</a>
+    <button type="button" id="rail-toggle" aria-expanded="true">Alerts <span class="tag" id="alert-count">0</span></button>
   </div>
-  <p class="quiet" id="proc-live"></p>
   <div id="warnings"></div>
-  <div class="wall" id="tiles"></div>
-  <p class="empty hide" id="wall-empty"></p>
-  <h2>Checks</h2>
-  <div id="events"></div>
-  <p class="footnote" id="foot"></p>
+  <div class="cctv" id="cctv">
+    <div class="cctv-grid" id="tiles" role="list"></div>
+    <aside class="cctv-rail" id="rail" aria-label="Alerts to review">
+      <div class="section-heading"><h2>Alerts</h2><a href="/logs">Activity &rarr;</a></div>
+      <div id="alert-msg" class="msg" role="status"></div>
+      <div id="events" aria-live="polite"></div>
+      <p class="footnote" id="proc-live"></p><p class="footnote" id="foot"></p>
+    </aside>
+  </div>
+  <div class="empty hide" id="wall-empty"></div>
 </main>
 <script src="/ui/app.js"></script>
 <script src="/ui/wall.js"></script>

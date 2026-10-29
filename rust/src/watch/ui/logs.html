@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Watch · Activity</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/ui/app.css"><link rel="stylesheet" href="/ui/product.css"></head><body>
+<header><a class="brand" href="/" aria-label="Watch home"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 8V3h5M17 3h5v5M22 16v5h-5M7 21H2v-5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Watch</a><nav aria-label="Main navigation"><a href="/">Live</a><a href="/find">Search</a><a href="/sources">Sources</a><a href="/setup">Rules & models</a><a href="/analytics">Cluster</a><a href="/logs" aria-current="page">Activity</a></nav><span class="workspace">Video intelligence</span></header>
+<div class="connection hide" id="connection" role="status"></div>
+<main>
+<div class="page-heading"><div><h1>Activity</h1><p class="sentence">Configuration changes, query runs, index jobs, failures, model changes and alert decisions.</p></div><button type="button" id="logs-refresh">Refresh activity</button></div>
+<div class="modes" id="log-tabs" role="group" aria-label="Activity view"><button type="button" data-tab="audit" aria-pressed="true">Audit log</button><button type="button" data-tab="jobs" aria-pressed="false">Index jobs</button><button type="button" data-tab="alerts" aria-pressed="false">Alert review</button></div>
+<div id="audit-tools">
+<div class="chips" id="log-cats" role="group" aria-label="Category"><button type="button" data-cat="" aria-pressed="true">All</button><button type="button" data-cat="query" aria-pressed="false">Query runs</button><button type="button" data-cat="index" aria-pressed="false">Index jobs</button><button type="button" data-cat="fail" aria-pressed="false">Failures</button><button type="button" data-cat="model" aria-pressed="false">Model changes</button><button type="button" data-cat="alert" aria-pressed="false">Alert decisions</button></div>
+</div>
+<form class="toolbar" id="log-search" role="search"><div><label for="log-filter" class="sr-only">Search activity</label><input type="search" id="log-filter" placeholder="Search activity"></div><span class="quiet" id="log-count">Loading…</span></form>
+<div class="msg" id="log-error" role="alert"></div><div id="activity-list" aria-live="polite"></div>
+<div class="pager"><button type="button" id="log-more" class="hide">Load more</button></div>
+<p class="footnote" id="index-note"></p>
+</main><script src="/ui/app.js"></script><script src="/ui/logs.js"></script></body></html>

@@ -1,0 +1,43 @@
+[
+ {
+  "label": "fit-all (all 2950 perimeter strips in range), scroll",
+  "frames": 240,
+  "p50": 16.5,
+  "p95": 17.3,
+  "max": 23,
+  "maxDrawMs": 7.2,
+  "maxStripsDrawn": 2985,
+  "longTasks": 0
+ },
+ {
+  "label": "zoomed to ~3 min across, scroll",
+  "frames": 240,
+  "p50": 16.7,
+  "p95": 17,
+  "max": 55.5,
+  "maxDrawMs": 4.8,
+  "maxStripsDrawn": 42,
+  "longTasks": 0
+ },
+ {
+  "label": "zoomed 40 px/s (filmstrips drawn), scroll",
+  "frames": 240,
+  "p50": 16.7,
+  "p95": 16.9,
+  "max": 18.9,
+  "maxDrawMs": 1.7,
+  "maxStripsDrawn": 35,
+  "longTasks": 0
+ },
+ {
+  "list": {
+   "rows": 8,
+   "p50": 16.7,
+   "p95": 16.8,
+   "max": 17.4
+  }
+ },
+ {
+  "domNodes": 459
+ }
+]

@@ -10,13 +10,8 @@
 </head>
 <body>
 <header>
-  <a class="brand" href="/">Watch</a>
-  <nav>
-    <a href="/">Wall</a>
-    <a href="/find">Find</a>
-    <a href="/analytics" aria-current="page">Analytics</a>
-    <a href="/setup">Setup</a>
-  </nav>
+  <a class="brand" href="/" aria-label="Watch home"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 8V3h5M17 3h5v5M22 16v5h-5M7 21H2v-5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Watch</a>
+  <nav aria-label="Main navigation"><a href="/">Live</a><a href="/find">Search</a><a href="/sources">Sources</a><a href="/setup">Rules & models</a><a href="/analytics" aria-current="page">Cluster</a><a href="/logs">Activity</a></nav>
   <div class="meters">
     <div class="ops"><b id="f-ops">0</b><span>ops / s</span></div>
     <div class="lack"><b id="f-lack">0</b><span>lacking / s</span></div>
@@ -24,8 +19,9 @@
     <div><b id="f-warn">0</b><span>warnings</span></div>
   </div>
 </header>
+<div class="connection hide" id="connection" role="status"></div>
 <main>
-  <h1>Analytics</h1>
+  <h1>Cluster performance</h1>
   <p class="quiet" id="sentence"></p>
   <div class="charts">
     <section>

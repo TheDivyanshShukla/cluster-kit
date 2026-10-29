@@ -1,0 +1,4 @@
+{"observation_id":"obs_fixture_classroom","source_id":"classroom-a","media_id":"med_fixture_a","media_time_us":12000000,"capture_time_utc_us":null,"zone":null,"min_confidence":0.4,
+ "class_counts":{"person":{"state":"known","value":60},"cell phone":{"state":"known","value":14}},
+ "relation_counts":{"holding:cell phone":{"state":"known","value":12},"near:cell phone":{"state":"known","value":13}},
+ "quality":"ok"}

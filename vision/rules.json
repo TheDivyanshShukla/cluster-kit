@@ -5,7 +5,7 @@
     "camera": "",
     "line": "seen(\"fight\")",
     "hold": 8,
-    "enabled": true
+    "enabled": false
   },
   {
     "id": "weapon",
@@ -13,7 +13,7 @@
     "camera": "",
     "line": "seen(\"pistol\") or seen(\"knife\") or seen(\"gun\")",
     "hold": 6,
-    "enabled": true
+    "enabled": false
   },
   {
     "id": "phones-many",

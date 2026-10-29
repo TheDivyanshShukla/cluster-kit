@@ -10,13 +10,8 @@
 </head>
 <body>
 <header>
-  <a class="brand" href="/">Watch</a>
-  <nav>
-    <a href="/">Wall</a>
-    <a href="/find">Find</a>
-    <a href="/analytics">Analytics</a>
-    <a href="/setup">Setup</a>
-  </nav>
+  <a class="brand" href="/" aria-label="Watch home"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 8V3h5M17 3h5v5M22 16v5h-5M7 21H2v-5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Watch</a>
+  <nav aria-label="Main navigation"><a href="/">Live</a><a href="/find">Search</a><a href="/sources">Sources</a><a href="/setup">Rules & models</a><a href="/analytics">Cluster</a><a href="/logs">Activity</a></nav>
   <div class="meters">
     <div class="ops"><b id="f-ops">0</b><span>ops / s</span></div>
     <div class="lack"><b id="f-lack">0</b><span>lacking / s</span></div>
@@ -24,6 +19,7 @@
     <div><b id="f-warn">0</b><span>warnings</span></div>
   </div>
 </header>
+<div class="connection hide" id="connection" role="status"></div>
 <main>
   <div class="film" id="film"></div>
   <div class="monitor" id="monitor"><video id="vid" controls playsinline></video></div>
@@ -31,7 +27,7 @@
     <div class="tl-head">
       <b id="ed-name">Clip</b>
       <span id="ed-clock" class="mono">0:00</span>
-      <a class="save" href="/">Wall</a>
+      <a class="save" href="/">Live</a>
     </div>
     <div class="sheet" id="sheet">
       <div class="ruler" id="ruler"></div>

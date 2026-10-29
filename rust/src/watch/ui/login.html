@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Watch · Sign in</title>
+<link rel="stylesheet" href="/ui/app.css">
+<style>
+.login { max-width: 360px; margin: 10vh auto 0; padding: 0 16px; }
+.login h1 { font-size: 1.15rem; margin: 0 0 4px; }
+.login p { color: var(--quiet); margin: 0 0 16px; }
+.login form { display: grid; gap: 10px; border: 1px solid var(--line); background: var(--surface); padding: 16px; }
+.login label { display: grid; gap: 4px; font-size: .92rem; color: var(--quiet); }
+.login input { width: 100%; min-height: 32px; }
+.login button { min-height: 34px; }
+.login .msg { min-height: 1.2em; font-size: .92rem; }
+.login .msg.bad { color: var(--bad); }
+.login .msg.ok { color: var(--ok); }
+.login details { margin-top: 14px; }
+.login summary { cursor: pointer; color: var(--quiet); }
+</style></head><body>
+<header><a class="brand" href="/" aria-label="Watch home"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 8V3h5M17 3h5v5M22 16v5h-5M7 21H2v-5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Watch</a></header>
+<main class="login">
+  <h1 id="title">Sign in</h1>
+  <p id="state">Checking session…</p>
+  <form id="signin">
+    <label>Username<input id="user" name="username" autocomplete="username" required></label>
+    <label>Password<input id="pass" name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit">Sign in</button>
+    <div class="msg" id="msg" role="status"></div>
+  </form>
+  <details id="pw" hidden>
+    <summary>Change password</summary>
+    <form id="change">
+      <label>Current password<input id="cur" type="password" autocomplete="current-password" required></label>
+      <label>New password (12+ characters)<input id="new" type="password" autocomplete="new-password" minlength="12" required></label>
+      <button type="submit">Change password</button>
+      <div class="msg" id="pwmsg" role="status"></div>
+    </form>
+  </details>
+  <p style="margin-top:14px"><button type="button" id="out" hidden>Sign out</button></p>
+</main>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const next = new URLSearchParams(location.search).get("next") || "/";
+  const safeNext = next.startsWith("/") && !next.startsWith("//") ? next : "/";
+  async function call(method, url, body) {
+    const r = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined, credentials: "same-origin" });
+    let j = null; try { j = await r.json(); } catch (_) {}
+    return { ok: r.ok, status: r.status, body: j };
+  }
+  function say(el, text, cls) { el.textContent = text; el.className = "msg " + (cls || ""); }
+  async function refresh() {
+    const me = await call("GET", "/api/v1/auth/me");
+    const p = me.ok && me.body && me.body.principal;
+    if (p && !p.anonymous) {
+      $("state").textContent = "Signed in as " + p.name + " (" + p.role + ").";
+      $("signin").hidden = true; $("pw").hidden = false; $("out").hidden = false;
+    } else if (p && p.anonymous) {
+      $("state").textContent = "No login is configured: this server runs in open mode on a trusted network.";
+      $("signin").hidden = true;
+    } else {
+      $("state").textContent = "Sign in to use this server.";
+      $("signin").hidden = false; $("pw").hidden = true; $("out").hidden = true;
+      $("user").focus();
+    }
+  }
+  $("signin").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    say($("msg"), "Signing in…");
+    const r = await call("POST", "/api/v1/auth/login", { username: $("user").value, password: $("pass").value });
+    if (r.ok) { location.href = safeNext; return; }
+    say($("msg"), (r.body && r.body.error && r.body.error.message) || ("Sign-in failed (" + r.status + ")"), "bad");
+    $("pass").select();
+  });
+  $("change").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const r = await call("POST", "/api/v1/auth/password", { current: $("cur").value, new: $("new").value });
+    say($("pwmsg"), r.ok ? "Password changed." : ((r.body && r.body.error && r.body.error.message) || ("Failed (" + r.status + ")")), r.ok ? "ok" : "bad");
+    if (r.ok) { $("cur").value = ""; $("new").value = ""; }
+  });
+  $("out").addEventListener("click", async () => { await call("POST", "/api/v1/auth/logout"); refresh(); });
+  refresh();
+})();
+</script>
+</body></html>

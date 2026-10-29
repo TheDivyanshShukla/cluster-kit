@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Watch · Sources</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/ui/app.css"><link rel="stylesheet" href="/ui/product.css"></head><body>
+<header><a class="brand" href="/" aria-label="Watch home"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M2 8V3h5M17 3h5v5M22 16v5h-5M7 21H2v-5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>Watch</a><nav aria-label="Main navigation"><a href="/">Live</a><a href="/find">Search</a><a href="/sources" aria-current="page">Sources</a><a href="/setup">Rules & models</a><a href="/analytics">Cluster</a><a href="/logs">Activity</a></nav><span class="workspace">Video intelligence</span></header>
+<div class="connection hide" id="connection" role="status"></div>
+<main>
+<div class="page-heading"><div><h1>Sources</h1><p class="sentence">Connect a camera or index recorded footage. Each source keeps its own timeline.</p></div><a class="text-link" href="/">Open live view →</a></div>
+<div class="source-layout"><section aria-labelledby="source-list-heading"><div class="section-heading"><h2 id="source-list-heading">Source library</h2><span class="quiet" id="source-count">Loading…</span></div>
+<label for="source-filter" class="sr-only">Filter sources</label><input id="source-filter" type="search" placeholder="Filter by source name or address">
+<div id="source-list" aria-live="polite"><p class="quiet">Loading sources…</p></div><div id="source-feedback" class="msg" role="status"></div>
+
+<div class="card" id="groups-card"><h3>Source groups</h3>
+<p class="field-help">Tick sources above, name the selection, and save it as a group. Groups are stored only in this browser (a per-viewer convenience, not on the server) and are offered as a scope on the Search page.</p>
+<div class="row"><label for="group-name" class="sr-only">Group name</label><input id="group-name" placeholder="Group name, e.g. Ground floor" style="max-width:260px"><button type="button" id="group-save">Save selection as group</button><a class="save" id="group-search" href="/find" hidden>Search selection</a></div>
+<div id="group-list" class="chips" aria-live="polite"></div><div id="group-msg" class="msg" role="status"></div></div>
+
+<h2>Import progress and coverage</h2>
+<p class="field-help">Each job reports how many frames were decoded, inferred, skipped and failed. A completed job does not mean every frame was inferred; searches only cover analyzed intervals.</p>
+<div id="jobs" aria-live="polite"><p class="quiet">Loading index jobs…</p></div><div id="jobs-msg" class="msg"></div>
+
+<div class="notice"><h2>One computer or a cluster</h2><p>The head runs a local worker by default. Joined workers receive camera assignments automatically. Archived files must be accessible from the assigned worker at the configured path.</p><a href="/analytics">Inspect joined computers →</a></div>
+</section>
+<section class="editor-panel"><h2 id="form-title">Add a source</h2><form id="source-form" novalidate>
+<label for="s-name">Source name</label><input id="s-name" required maxlength="100" placeholder="Classroom 204">
+<label for="s-kind">Input type</label><select id="s-kind"><option value="live">Live camera · RTSP / HTTP</option><option value="webcam">Attached webcam</option><option value="archive">Recorded video · index once</option><option value="image">Single image</option><option value="folder">Image folder</option><option value="file" id="opt-file">Video · loop for demonstration</option></select>
+<label for="s-url" id="s-url-label">Stream address</label><input id="s-url" required placeholder="rtsp://192.168.1.20:554/stream" autocomplete="off" spellcheck="false"><p class="field-help" id="s-url-help">Use a camera address reachable from the workers.</p>
+<div id="cred-wrap"><label for="s-cred">Credential (optional)</label><input id="s-cred" type="password" autocomplete="new-password" placeholder="user:password or token"><p class="field-help" id="cred-help">Write-only. It is sent once and stored as a reference; it is never shown again. Leave blank to keep the current one.</p></div>
+<div id="tz-wrap"><label for="s-tz">Capture time zone (optional)</label><input id="s-tz" placeholder="Asia/Kolkata" autocomplete="off"><p class="field-help">Only set when the recording's real capture time is known. Without it, results use media time.</p></div>
+<div class="row"><button type="submit" id="source-add" class="primary">Add source</button><button type="button" id="source-cancel" hidden>Cancel edit</button></div><div class="msg" id="source-error" role="alert"></div></form>
+<h2>Detection coverage</h2><p class="quiet">Searches can only find the classes produced by enabled, installed models.</p><div id="capabilities"><p class="quiet">Checking installed models…</p></div><a class="text-link" href="/setup">Configure models →</a>
+</section></div>
+</main><script src="/ui/app.js"></script><script src="/ui/sources.js"></script></body></html>

@@ -1,0 +1,1 @@
+{"task_id":"task_fixture","job_id":"job_fixture","media_id":"med_fixture_hall","segment":[0,30000000],"worker":"worker-a","generation":1,"expires_utc_us":1792963288000000,"attempt":1,"overlap_us":2000000,"settings":{"every":2,"width":512}}

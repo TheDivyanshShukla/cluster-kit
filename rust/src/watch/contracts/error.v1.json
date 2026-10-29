@@ -1,0 +1,1 @@
+{"error":{"code":"unsupported","message":"predicate 'holding' requires a relation module that declares it; installed: near (approximate)","retryable":false,"correlation_id":"corr_fixture"}}

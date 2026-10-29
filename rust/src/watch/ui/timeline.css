@@ -1,0 +1,7 @@
+/* Timeline and rails. Scoped under .review. Canvas is sticky so native scrollbars and touch scrolling drive a windowed draw. */
+.review .tl, .review .rail { position: relative; overflow: auto; background: var(--page); border: 1px solid var(--line); border-radius: 6px; overscroll-behavior: contain; }
+.review .tl { height: 100%; min-height: 150px; touch-action: pan-x pan-y; }
+.review .rail { height: 54px; }
+.review .tl-sizer { position: absolute; top: 0; left: 0; pointer-events: none; }
+.review .tl-cv { position: sticky; top: 0; left: 0; display: block; outline-offset: -2px; }
+.review .tl-cv:focus-visible { outline: 2px solid var(--pop); }

@@ -1,0 +1,352 @@
+{
+ "annotator": "Claude (single annotator, visual inspection of 480px frames); not human-verified",
+ "model": "vision/models/yolov5n.onnx, conf 0.4, CPU, 640 input, accuracy preset (every frame)",
+ "frames": [
+  {
+   "frame": "people_00",
+   "media": "people-detection.mp4",
+   "media_time_us": 0,
+   "labels": {
+    "person": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "people_01",
+   "media": "people-detection.mp4",
+   "media_time_us": 3500000,
+   "labels": {
+    "person": 1
+   },
+   "model": {
+    "person": 1
+   },
+   "note": null
+  },
+  {
+   "frame": "people_02",
+   "media": "people-detection.mp4",
+   "media_time_us": 7083333,
+   "labels": {
+    "person": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "people_03",
+   "media": "people-detection.mp4",
+   "media_time_us": 10583333,
+   "labels": {
+    "person": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "people_04",
+   "media": "people-detection.mp4",
+   "media_time_us": 14166667,
+   "labels": {
+    "person": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "people_05",
+   "media": "people-detection.mp4",
+   "media_time_us": 17666667,
+   "labels": {
+    "person": 2
+   },
+   "model": {
+    "person": 2
+   },
+   "note": null
+  },
+  {
+   "frame": "people_06",
+   "media": "people-detection.mp4",
+   "media_time_us": 21250000,
+   "labels": {
+    "person": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "people_07",
+   "media": "people-detection.mp4",
+   "media_time_us": 24750000,
+   "labels": {
+    "person": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "people_08",
+   "media": "people-detection.mp4",
+   "media_time_us": 28333333,
+   "labels": {
+    "person": 2
+   },
+   "model": {
+    "person": 1
+   },
+   "note": "two people partly cut off at the bottom edge"
+  },
+  {
+   "frame": "people_09",
+   "media": "people-detection.mp4",
+   "media_time_us": 31833333,
+   "labels": {
+    "person": 3
+   },
+   "model": {
+    "person": 3
+   },
+   "note": null
+  },
+  {
+   "frame": "people_10",
+   "media": "people-detection.mp4",
+   "media_time_us": 35416667,
+   "labels": {
+    "person": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "people_11",
+   "media": "people-detection.mp4",
+   "media_time_us": 38916667,
+   "labels": {
+    "person": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "people_12",
+   "media": "people-detection.mp4",
+   "media_time_us": 42500000,
+   "labels": {
+    "person": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "people_13",
+   "media": "people-detection.mp4",
+   "media_time_us": 46000000,
+   "labels": {
+    "person": 1
+   },
+   "model": {
+    "person": 1
+   },
+   "note": null
+  },
+  {
+   "frame": "people_14",
+   "media": "people-detection.mp4",
+   "media_time_us": 49583333,
+   "labels": {
+    "person": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "person_00",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 0,
+   "labels": {
+    "person": 0,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "person_01",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 3833333,
+   "labels": {
+    "person": 1,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {
+    "person": 1
+   },
+   "note": null
+  },
+  {
+   "frame": "person_02",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 7666667,
+   "labels": {
+    "person": 0,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "person_03",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 11500000,
+   "labels": {
+    "person": 0,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "person_04",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 15333333,
+   "labels": {
+    "person": 0,
+    "car": 1,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "person_05",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 19166667,
+   "labels": {
+    "person": 0,
+    "car": 1,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": "car partly out of frame at left edge"
+  },
+  {
+   "frame": "person_06",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 23000000,
+   "labels": {
+    "person": 0,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "person_07",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 26916667,
+   "labels": {
+    "person": 1,
+    "car": 0,
+    "bicycle": 1
+   },
+   "model": {
+    "bicycle": 1
+   },
+   "note": "cyclist: one person on one bicycle"
+  },
+  {
+   "frame": "person_08",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 30750000,
+   "labels": {
+    "person": 0,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "person_09",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 34583333,
+   "labels": {
+    "person": 0,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "person_10",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 38416667,
+   "labels": {
+    "person": 0,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "person_11",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 42250000,
+   "labels": {
+    "person": 1,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {
+    "person": 1
+   },
+   "note": null
+  },
+  {
+   "frame": "person_12",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 46083333,
+   "labels": {
+    "person": 1,
+    "car": 1,
+    "bicycle": 1
+   },
+   "model": {},
+   "note": "a further tiny figure at the top-left edge is ambiguous and not counted"
+  },
+  {
+   "frame": "person_13",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 49916667,
+   "labels": {
+    "person": 0,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": null
+  },
+  {
+   "frame": "person_14",
+   "media": "person-bicycle-car-detection.mp4",
+   "media_time_us": 53833333,
+   "labels": {
+    "person": 0,
+    "car": 0,
+    "bicycle": 0
+   },
+   "model": {},
+   "note": null
+  }
+ ]
+}

@@ -3,11 +3,22 @@
     "id": "objects",
     "name": "Objects",
     "kind": "object",
-    "model": "vision/models/yolov5n.onnx",
-    "labels": ["person", "bicycle", "car", "motorcycle", "bus", "truck", "backpack", "handbag", "suitcase", "cell phone"],
-    "conf": 0.4,
+    "model": "vision/models/yolo26s.onnx",
+    "labels": [
+      "person",
+      "bicycle",
+      "car",
+      "motorcycle",
+      "bus",
+      "truck",
+      "backpack",
+      "handbag",
+      "suitcase",
+      "cell phone"
+    ],
+    "conf": 0.35,
     "confirm": 3,
-    "gflops": 4.5,
+    "gflops": 20.0,
     "enabled": true
   },
   {
@@ -26,7 +37,10 @@
     "name": "Weapon",
     "kind": "weapon",
     "model": "",
-    "labels": ["pistol", "knife"],
+    "labels": [
+      "pistol",
+      "knife"
+    ],
     "conf": 0.45,
     "confirm": 6,
     "gflops": 8,

@@ -1,0 +1,21 @@
+PASS  build                              /Users/divyansh/Desktop/code/divy/cluster-kit/rust/target-h/debug/cw
+binary: /Users/divyansh/Desktop/code/divy/cluster-kit/rust/target-h/debug/cw (Oct 29 17:50:10 2026)
+PASS  head_start                         port 56128, CW_ROOT=/var/folders/vl/fv9rg79d3kq5hj0fj5264cw00000gn/T//cw-accept.3ZmQRH/root
+PASS  add_source                         archive source saved via POST /api/sources
+PASS  reject_bad_source                  invalid id -> 400
+PASS  indexing_completes                 frames=58
+PASS  legacy_query                       SELECT COUNT(*) FROM sightings = 108
+SKIP  v1_query                           v1 not wired (POST /api/v1/queries -> 404)
+PASS  media_range                        206 + Content-Range: bytes 0-1023/5482579
+PASS  idempotent_batch                   count 108 -> 109 -> 109 (second post ignored)
+PASS  malformed_batch                    400, 400
+PASS  malformed_not_stored               count unchanged (109)
+PASS  durable_restart                    legacy count 109 before/after restart
+SKIP  v1_durable                         v1 not wired
+FAIL  reindex_no_duplicates              count 109 -> 217 after restart + re-index (JSONL idempotency key is in memory only)
+SKIP  auth_protected_routes              auth not wired (GET /api/v1/auth/me -> 404)
+FAIL  lan_exposure                       head reachable on 10.97.31.96:56128 with no authentication (binds 0.0.0.0)
+FAIL  missing_model                      no failure reported within 90s (state='false 0 ', indexed rows=0); capabilities: {"accuracy":"Model confidence is not an accuracy guarantee. Validate thresholds and recall on labeled footage. Small phones and occluded objects can be missed.","archive":"Finite scan with backpressure; processing presets still control which frames are sampled. Use Accuracy with filters off to scan 
+PASS  repo_data_untouched                vision/data file count 9
+SUMMARY pass=12 fail=3 skip=3
+exit=1

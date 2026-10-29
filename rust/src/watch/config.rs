@@ -86,6 +86,58 @@ pub struct Process {
     pub width: u32,
     #[serde(default = "default_rate")]
     pub rate: u32,
+    /// "motion" (default): the detector only sees what changed, the way Frigate gates detection on motion and
+    /// DeepStream runs it every N frames with a tracker in between. "full": every sampled frame, whole picture (old behaviour).
+    #[serde(default = "default_detect_mode")]
+    pub detect_mode: String,
+    /// 0..1. Higher notices smaller brightness changes (pixel-difference threshold 40 grey levels at 0, 8 at 1).
+    #[serde(default = "default_motion_sensitivity")]
+    pub motion_sensitivity: f32,
+    /// Smallest moving blob that counts, as a fraction of the picture area (0.001 = 0.1 %). Filters sensor noise.
+    #[serde(default = "default_motion_min_area")]
+    pub motion_min_area: f32,
+    /// Extra room around a moving thing when its detector crop is cut, as a fraction of the object size on each side.
+    #[serde(default = "default_region_margin")]
+    pub region_margin: f32,
+    /// While objects are tracked, the detector runs on every Nth sampled frame; the tracker predicts the frames between
+    /// (shown live, never indexed). New motion outside tracked boxes triggers the detector at once. 1 = every sampled frame.
+    #[serde(default = "default_detect_interval")]
+    pub detect_interval: u32,
+    /// Seconds between full-picture passes (also forced at start and after a scene cut). Catches anything motion missed.
+    #[serde(default = "default_keyframe_secs")]
+    pub keyframe_secs: f32,
+    /// More separate motion crops than this on one frame: run one full-picture pass instead.
+    #[serde(default = "default_max_regions")]
+    pub max_regions: u32,
+}
+
+impl Process {
+    /// Width FFmpeg decodes to. Motion mode cuts crops out of this picture, so it never drops below 960 px.
+    pub fn decode_width(&self) -> u32 {
+        if self.detect_mode == "motion" { self.width.max(960) } else { self.width }
+    }
+}
+
+fn default_detect_mode() -> String {
+    "motion".into()
+}
+fn default_motion_sensitivity() -> f32 {
+    0.6
+}
+fn default_motion_min_area() -> f32 {
+    0.001
+}
+fn default_region_margin() -> f32 {
+    0.25
+}
+fn default_detect_interval() -> u32 {
+    2
+}
+fn default_keyframe_secs() -> f32 {
+    2.0
+}
+fn default_max_regions() -> u32 {
+    4
 }
 
 fn default_mode() -> String {
@@ -141,7 +193,20 @@ pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    fs::write(path, text + "\n").map_err(|e| e.to_string())
+    // Write beside the destination so rename stays on the same filesystem.
+    // Unique temporary names also prevent concurrent requests clobbering each other.
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let temp = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all((text + "\n").as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temp); }
+    result.map_err(|e| e.to_string())
 }
 
 pub fn preset(mode: &str) -> Process {
@@ -154,8 +219,15 @@ pub fn preset(mode: &str) -> Process {
             same_on: true,
             same: 6.0,
             every: 3,
-            width: 416,
+            width: 960,
             rate: 60,
+            detect_mode: "motion".into(),
+            motion_sensitivity: 0.5,
+            motion_min_area: 0.002,
+            region_margin: 0.2,
+            detect_interval: 3,
+            keyframe_secs: 3.0,
+            max_regions: 3,
         },
         "accuracy" => Process {
             mode: "accuracy".into(),
@@ -165,8 +237,15 @@ pub fn preset(mode: &str) -> Process {
             same_on: true,
             same: 1.2,
             every: 1,
-            width: 640,
+            width: 1280,
             rate: 60,
+            detect_mode: "motion".into(),
+            motion_sensitivity: 0.75,
+            motion_min_area: 0.0005,
+            region_margin: 0.35,
+            detect_interval: 1,
+            keyframe_secs: 1.0,
+            max_regions: 6,
         },
         _ => Process {
             mode: "balanced".into(),
@@ -176,8 +255,15 @@ pub fn preset(mode: &str) -> Process {
             same_on: true,
             same: 3.5,
             every: 2,
-            width: 512,
+            width: 1280,
             rate: 60,
+            detect_mode: default_detect_mode(),
+            motion_sensitivity: default_motion_sensitivity(),
+            motion_min_area: default_motion_min_area(),
+            region_margin: default_region_margin(),
+            detect_interval: default_detect_interval(),
+            keyframe_secs: default_keyframe_secs(),
+            max_regions: default_max_regions(),
         },
     }
 }
@@ -194,8 +280,19 @@ pub fn clamp_process(mut p: Process) -> Process {
         w if w <= 368 => 320,
         w if w <= 464 => 416,
         w if w <= 576 => 512,
-        _ => 640,
+        w if w <= 800 => 640,
+        w if w <= 1100 => 960,
+        _ => 1280,
     };
+    if !matches!(p.detect_mode.as_str(), "motion" | "full") {
+        p.detect_mode = default_detect_mode();
+    }
+    p.motion_sensitivity = if p.motion_sensitivity.is_finite() { p.motion_sensitivity.clamp(0.0, 1.0) } else { default_motion_sensitivity() };
+    p.motion_min_area = if p.motion_min_area.is_finite() { p.motion_min_area.clamp(0.0001, 0.2) } else { default_motion_min_area() };
+    p.region_margin = if p.region_margin.is_finite() { p.region_margin.clamp(0.0, 1.0) } else { default_region_margin() };
+    p.detect_interval = p.detect_interval.clamp(1, 10);
+    p.keyframe_secs = if p.keyframe_secs.is_finite() { p.keyframe_secs.clamp(0.5, 30.0) } else { default_keyframe_secs() };
+    p.max_regions = p.max_regions.clamp(1, 8);
     p
 }
 
@@ -210,15 +307,22 @@ pub fn process_line(p: &Process) -> String {
     let blank = if p.blank_on { "blank pictures skipped" } else { "blank pictures still looked at" };
     let same = if p.same_on { "unchanged pictures skipped" } else { "still pictures still looked at" };
     let every = if p.every <= 1 { "every sharp frame".into() } else { format!("every {} sharp frames", p.every) };
-    format!("{mode}. {} px. Picture {} fps. {blur}. {blank}. {same}. {every}.", p.width, p.rate)
+    let detect = if p.detect_mode == "motion" {
+        format!("Detector on motion only (sensitivity {:.2}), every {} pass{} while tracking, full picture every {} s.", p.motion_sensitivity, p.detect_interval, if p.detect_interval == 1 { "" } else { "es" }, p.keyframe_secs)
+    } else {
+        "Detector on every sampled frame, whole picture.".into()
+    };
+    format!("{mode}. {} px. Picture {} fps. {blur}. {blank}. {same}. {every}. {detect}", p.decode_width(), p.rate)
 }
 
 pub fn load_watch() -> WatchCfg {
     let mut copies = 8usize;
     let mut process = preset("balanced");
     let mut cameras: Vec<Value> = Vec::new();
+    let mut configured = false;
     if let Ok(text) = fs::read_to_string(watch_path()) {
         if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            configured = v.get("configured").and_then(Value::as_bool).unwrap_or(false);
             if let Some(n) = v.get("copies").and_then(|x| x.as_u64()) {
                 copies = n.max(1) as usize;
             }
@@ -239,7 +343,7 @@ pub fn load_watch() -> WatchCfg {
         blur: process.blur,
         copies,
         process,
-        cameras: expand(&cameras, copies),
+        cameras: if configured && cameras.is_empty() { Vec::new() } else { expand(&cameras, copies) },
     }
 }
 
@@ -268,12 +372,31 @@ fn expand(raw: &[Value], copies: usize) -> Vec<Camera> {
             continue;
         }
         let n = i + 1;
+        // A folder becomes independently schedulable still-image sources, with
+        // deterministic IDs so repeated imports address the same images.
+        let resolved = resolve_url(url);
+        if Path::new(&resolved).is_dir() {
+            let mut files: Vec<_> = fs::read_dir(&resolved).ok().into_iter().flatten().filter_map(Result::ok)
+                .map(|e| e.path()).filter(|p| p.is_file() && is_image(p)).collect();
+            files.sort();
+            for file in files {
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                file.to_string_lossy().hash(&mut hash);
+                out.push(Camera {
+                    id: format!("{}-{:016x}", c.get("id").and_then(|v| v.as_str()).unwrap_or("images"), hash.finish()),
+                    name: file.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                    url: file.to_string_lossy().into_owned(), start: 0.0, kind: "image".into(), zones: Vec::new(),
+                });
+            }
+            continue;
+        }
         out.push(Camera {
             id: c.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             name: c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             url: url.to_string(),
             start: c.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            kind: kind_of(url),
+            kind: c.get("kind").and_then(|v| v.as_str()).filter(|k| matches!(*k, "archive" | "image" | "file" | "live" | "webcam")).map(str::to_string).unwrap_or_else(|| kind_of(url)),
             zones: c.get("zones").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
         });
         let cam = out.last_mut().unwrap();
@@ -316,7 +439,12 @@ fn expand(raw: &[Value], copies: usize) -> Vec<Camera> {
     out
 }
 
+fn is_image(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()).is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png" | "bmp" | "webp"))
+}
+
 pub fn kind_of(url: &str) -> String {
+    if is_image(Path::new(url)) { return "image".into(); }
     if url.chars().all(|c| c.is_ascii_digit()) {
         "webcam".into()
     } else if url.contains("://") {
@@ -378,6 +506,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_archive_kind_survives_source_expansion() {
+        let cams = expand(&[serde_json::json!({"id":"recording", "url":"recording.mp4", "kind":"archive"})], 1);
+        assert_eq!(cams[0].kind, "archive");
+        assert_eq!(kind_of("image.JPG"), "image");
+    }
+
+    #[test]
+    fn image_folders_expand_deterministically() {
+        let dir = std::env::temp_dir().join(format!("cw-sources-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("b.jpg"), []).unwrap();
+        fs::write(dir.join("a.PNG"), []).unwrap();
+        fs::write(dir.join("other.txt"), []).unwrap();
+        let raw = [serde_json::json!({"id":"folder", "url":dir.to_string_lossy()})];
+        let first = expand(&raw, 1);
+        let second = expand(&raw, 1);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].kind, "image");
+        assert_eq!(first[0].id, second[0].id);
+        assert_eq!(first[0].name, "a.PNG");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn speed_skips_more_than_accuracy() {
         let speed = preset("speed");
         let accuracy = preset("accuracy");
@@ -389,5 +541,18 @@ mod tests {
         assert_eq!(odd.width, 320);
         assert_eq!(odd.every, 4);
         assert_eq!(odd.mode, "balanced");
+    }
+
+    #[test]
+    fn old_settings_load_with_motion_defaults_and_clamp() {
+        let p: Process = serde_json::from_str(r#"{"mode":"custom","every":2,"width":512}"#).unwrap();
+        assert_eq!(p.detect_mode, "motion");
+        assert_eq!((p.detect_interval, p.max_regions), (2, 4));
+        assert_eq!(p.decode_width(), 960, "motion crops need more than 512 px");
+        let wild = clamp_process(Process { detect_mode: "x".into(), motion_sensitivity: 9.0, motion_min_area: -1.0, region_margin: f32::NAN, detect_interval: 0, keyframe_secs: 0.0, max_regions: 99, width: 5000, ..p });
+        assert_eq!((wild.detect_mode.as_str(), wild.motion_sensitivity, wild.detect_interval, wild.max_regions, wild.width), ("motion", 1.0, 1, 8, 1280));
+        assert!(wild.motion_min_area > 0.0 && wild.region_margin == 0.25 && wild.keyframe_secs == 0.5);
+        let full = Process { detect_mode: "full".into(), width: 416, ..preset("balanced") };
+        assert_eq!(full.decode_width(), 416);
     }
 }

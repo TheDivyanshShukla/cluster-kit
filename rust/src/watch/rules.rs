@@ -4,6 +4,7 @@
 //! A "less than" rule is frozen on frames the detector did not run, so a blurry
 //! classroom is not reported as "no phones".
 
+use crate::watch::domain::{Count, FrameSummary};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -16,7 +17,18 @@ pub struct Compiled {
 #[derive(Clone, Debug)]
 enum Expr {
     Seen(String),
-    Count { class: String, op: Op, n: u32 },
+    Ratio {
+        numerator: String,
+        denominator: String,
+        op: Op,
+        value: f64,
+    },
+    Lua(String),
+    Count {
+        class: String,
+        op: Op,
+        n: u32,
+    },
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
 }
@@ -42,8 +54,96 @@ impl Compiled {
     }
 }
 
+impl Compiled {
+    /// Three-valued evaluation over a typed summary: `Ok(None)` is Unknown. A class the
+    /// frame was not analyzed for (or is unsupported) is never read as zero, and a ratio with a
+    /// zero denominator is Unknown. Kleene logic: `false and unknown` = false, `true or unknown` = true.
+    pub fn eval_summary(&self, s: &FrameSummary) -> Result<Option<bool>, String> {
+        eval3(&self.expr, s, &self.classes)
+    }
+}
+
+fn eval3(expr: &Expr, s: &FrameSummary, classes: &[String]) -> Result<Option<bool>, String> {
+    let known = |c: &str| match s.class(c) {
+        Count::Known(n) => Some(n),
+        _ => None,
+    };
+    Ok(match expr {
+        Expr::Seen(c) => known(c).map(|n| n >= 1),
+        Expr::Count { class, op, n } => known(class).map(|v| compare(v as f64, *op, *n as f64)),
+        Expr::Ratio { numerator, denominator, op, value } => match (known(numerator), known(denominator)) {
+            (Some(a), Some(d)) if d > 0 => Some(compare(a as f64 / d as f64, *op, *value)),
+            _ => None,
+        },
+        Expr::And(a, b) => match (eval3(a, s, classes)?, eval3(b, s, classes)?) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        },
+        Expr::Or(a, b) => match (eval3(a, s, classes)?, eval3(b, s, classes)?) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        },
+        // Legacy `lua:` line: count()/seen() globals; every referenced class must be known.
+        Expr::Lua(code) => {
+            let mut counts = HashMap::new();
+            for c in classes {
+                match known(c) {
+                    Some(n) => {
+                        counts.insert(c.clone(), n);
+                    }
+                    None => return Ok(None),
+                }
+            }
+            Some(lua_eval(code, &counts)?)
+        }
+    })
+}
+
 pub fn compile(line: &str) -> Result<Compiled, String> {
-    let mut p = Parser { s: line.as_bytes(), i: 0 };
+    if line.len() > 4096 {
+        return Err("rule exceeds 4096 bytes".into());
+    }
+    if let Some(code) = line.trim().strip_prefix("lua:") {
+        let code = code.trim();
+        if code.is_empty() || code.len() > 4096 {
+            return Err("Lua rule must contain 1..4096 bytes".into());
+        }
+        let mut classes = Vec::new();
+        // Literal class names make model capability gating possible before evaluation.
+        for (i, _) in code.char_indices() {
+            let tail = &code[i..];
+            if (tail.starts_with("count") || tail.starts_with("seen"))
+                && (i == 0 || !code.as_bytes()[i - 1].is_ascii_alphanumeric())
+            {
+                let len = if tail.starts_with("count") { 5 } else { 4 };
+                let mut p = Parser {
+                    s: tail.as_bytes(),
+                    i: len,
+                    depth: 0,
+                };
+                let class = p
+                    .quoted_arg()
+                    .map_err(|_| "Lua count/seen requires a literal double-quoted class name")?;
+                push_class(&mut classes, &class);
+            }
+        }
+        if classes.is_empty() {
+            return Err("Lua rule must reference count(\"class\") or seen(\"class\")".into());
+        }
+        lua_eval(code, &HashMap::new())?;
+        return Ok(Compiled {
+            expr: Expr::Lua(code.into()),
+            needs_look: true,
+            classes,
+        });
+    }
+    let mut p = Parser {
+        s: line.as_bytes(),
+        i: 0,
+        depth: 0,
+    };
     p.skip();
     if p.eof() {
         return Err("rule is empty".into());
@@ -56,17 +156,22 @@ pub fn compile(line: &str) -> Result<Compiled, String> {
     let mut classes = Vec::new();
     let mut needs_look = false;
     walk(&expr, &mut classes, &mut needs_look);
-    Ok(Compiled { expr, needs_look, classes })
+    Ok(Compiled {
+        expr,
+        needs_look,
+        classes,
+    })
 }
 
 pub fn line_for(class: &str, op: &str, n: u32) -> String {
+    let class = serde_json::to_string(class).expect("string serialization cannot fail");
     match op {
-        "seen" => format!("seen(\"{class}\")"),
-        "lt" => format!("count(\"{class}\") < {n}"),
-        "le" => format!("count(\"{class}\") <= {n}"),
-        "ge" => format!("count(\"{class}\") >= {n}"),
-        "eq" => format!("count(\"{class}\") == {n}"),
-        _ => format!("count(\"{class}\") > {n}"),
+        "seen" => format!("seen({class})"),
+        "lt" => format!("count({class}) < {n}"),
+        "le" => format!("count({class}) <= {n}"),
+        "ge" => format!("count({class}) >= {n}"),
+        "eq" => format!("count({class}) == {n}"),
+        _ => format!("count({class}) > {n}"),
     }
 }
 
@@ -95,6 +200,21 @@ pub fn step(s: &mut Streak, on: bool, freeze: bool, hold: u32) -> Option<&'stati
 
 fn eval(expr: &Expr, counts: &HashMap<String, u32>) -> bool {
     match expr {
+        Expr::Lua(code) => lua_eval(code, counts).unwrap_or(false),
+        Expr::Ratio {
+            numerator,
+            denominator,
+            op,
+            value,
+        } => {
+            let den = counts.get(denominator).copied().unwrap_or(0);
+            den > 0
+                && compare(
+                    counts.get(numerator).copied().unwrap_or(0) as f64 / den as f64,
+                    *op,
+                    *value,
+                )
+        }
         Expr::Seen(c) => counts.get(c).copied().unwrap_or(0) >= 1,
         Expr::Count { class, op, n } => {
             let v = counts.get(class).copied().unwrap_or(0);
@@ -113,10 +233,20 @@ fn eval(expr: &Expr, counts: &HashMap<String, u32>) -> bool {
 
 fn walk(expr: &Expr, classes: &mut Vec<String>, needs_look: &mut bool) {
     match expr {
+        Expr::Lua(_) => *needs_look = true,
+        Expr::Ratio {
+            numerator,
+            denominator,
+            ..
+        } => {
+            push_class(classes, numerator);
+            push_class(classes, denominator);
+            *needs_look = true;
+        }
         Expr::Seen(c) => push_class(classes, c),
         Expr::Count { class, op, .. } => {
             push_class(classes, class);
-            if matches!(op, Op::Lt | Op::Le) {
+            if matches!(op, Op::Lt | Op::Le | Op::Eq) {
                 *needs_look = true;
             }
         }
@@ -124,6 +254,60 @@ fn walk(expr: &Expr, classes: &mut Vec<String>, needs_look: &mut bool) {
             walk(a, classes, needs_look);
             walk(b, classes, needs_look);
         }
+    }
+}
+
+fn compare(a: f64, op: Op, b: f64) -> bool {
+    match op {
+        Op::Gt => a > b,
+        Op::Ge => a >= b,
+        Op::Lt => a < b,
+        Op::Le => a <= b,
+        Op::Eq => a == b,
+    }
+}
+
+fn lua_eval(code: &str, counts: &HashMap<String, u32>) -> Result<bool, String> {
+    use mlua::{HookTriggers, Lua, LuaOptions, StdLib, Value};
+    let lua = Lua::new_with(
+        StdLib::MATH | StdLib::STRING | StdLib::TABLE,
+        LuaOptions::new(),
+    )
+    .map_err(|e| e.to_string())?;
+    lua.set_memory_limit(2 * 1024 * 1024)
+        .map_err(|e| e.to_string())?;
+    lua.set_hook(
+        HookTriggers {
+            every_nth_instruction: Some(10_000),
+            ..HookTriggers::default()
+        },
+        |_, _| {
+            Err(mlua::Error::external(
+                "Lua rule exceeded instruction budget",
+            ))
+        },
+    );
+    let data = counts.clone();
+    let count = lua
+        .create_function(move |_, class: String| Ok(data.get(&class).copied().unwrap_or(0)))
+        .map_err(|e| e.to_string())?;
+    lua.globals()
+        .set("count", count)
+        .map_err(|e| e.to_string())?;
+    let data = counts.clone();
+    let seen = lua
+        .create_function(move |_, class: String| Ok(data.get(&class).copied().unwrap_or(0) > 0))
+        .map_err(|e| e.to_string())?;
+    lua.globals().set("seen", seen).map_err(|e| e.to_string())?;
+    let wrapped = if code.starts_with("return ") {
+        code.to_owned()
+    } else {
+        format!("return ({code})")
+    };
+    let result: Value = lua.load(&wrapped).eval().map_err(|e| e.to_string())?;
+    match result {
+        Value::Boolean(v) => Ok(v),
+        _ => Err("Lua rule must return a boolean".into()),
     }
 }
 
@@ -136,6 +320,7 @@ fn push_class(classes: &mut Vec<String>, c: &str) {
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -143,11 +328,14 @@ impl<'a> Parser<'a> {
         self.i >= self.s.len()
     }
     fn rest(&self) -> String {
-        String::from_utf8_lossy(&self.s[self.i..]).chars().take(24).collect()
+        String::from_utf8_lossy(&self.s[self.i..])
+            .chars()
+            .take(24)
+            .collect()
     }
     fn skip(&mut self) {
         while let Some(c) = self.peek() {
-            if c == b' ' || c == b'\t' {
+            if c.is_ascii_whitespace() {
                 self.i += 1;
             } else {
                 break;
@@ -193,7 +381,7 @@ impl<'a> Parser<'a> {
         if self.s[self.i..].starts_with(b) {
             let after = self.i + b.len();
             let boundary = self.s.get(after).copied().unwrap_or(b' ');
-            if boundary.is_ascii_alphanumeric() {
+            if boundary.is_ascii_alphanumeric() || boundary == b'_' {
                 return false;
             }
             self.i = after;
@@ -205,13 +393,59 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Result<Expr, String> {
         self.skip();
         if self.peek() == Some(b'(') {
+            self.depth += 1;
+            if self.depth > 24 {
+                return Err("rule nesting exceeds 24 levels".into());
+            }
             self.bump();
             let e = self.parse_or()?;
+            self.depth -= 1;
             self.skip();
             if self.bump() != Some(b')') {
                 return Err("missing )".into());
             }
             return Ok(e);
+        }
+        if self.word("ratio") {
+            self.skip();
+            if self.bump() != Some(b'(') {
+                return Err("expected (".into());
+            }
+            self.skip();
+            let numerator = self.quoted()?;
+            self.skip();
+            if self.bump() != Some(b',') {
+                return Err("ratio needs two quoted class names".into());
+            }
+            self.skip();
+            let denominator = self.quoted()?;
+            self.skip();
+            if self.bump() != Some(b')') {
+                return Err("expected )".into());
+            }
+            if numerator.is_empty() || denominator.is_empty() {
+                return Err("ratio classes cannot be empty".into());
+            }
+            self.skip();
+            let op = self.op()?;
+            self.skip();
+            let start = self.i;
+            while self.peek().is_some_and(|c| c.is_ascii_digit() || c == b'.') {
+                self.i += 1;
+            }
+            let value: f64 = std::str::from_utf8(&self.s[start..self.i])
+                .unwrap_or("")
+                .parse()
+                .map_err(|_| "expected a nonnegative ratio")?;
+            if !value.is_finite() || value < 0.0 {
+                return Err("ratio must be finite and nonnegative".into());
+            }
+            return Ok(Expr::Ratio {
+                numerator,
+                denominator,
+                op,
+                value,
+            });
         }
         if self.word("seen") {
             let class = self.quoted_arg()?;
@@ -225,7 +459,7 @@ impl<'a> Parser<'a> {
             let n = self.number()?;
             return Ok(Expr::Count { class, op, n });
         }
-        Err("expected seen(...) or count(...)".into())
+        Err("expected seen(...), count(...) or ratio(...)".into())
     }
     fn quoted_arg(&mut self) -> Result<String, String> {
         self.skip();
@@ -247,18 +481,18 @@ impl<'a> Parser<'a> {
         if self.bump() != Some(b'"') {
             return Err("class name needs quotes".into());
         }
-        let mut out = String::new();
+        let mut out = Vec::new();
         while let Some(c) = self.bump() {
             if c == b'"' {
-                return Ok(out);
+                return String::from_utf8(out).map_err(|_| "class must be valid UTF-8".into());
             }
             if c == b'\\' {
                 if let Some(n) = self.bump() {
-                    out.push(n as char);
+                    out.push(n);
                     continue;
                 }
             }
-            out.push(c as char);
+            out.push(c);
         }
         Err("missing closing quote".into())
     }
@@ -288,7 +522,10 @@ impl<'a> Parser<'a> {
         if start == self.i {
             return Err("expected a number".into());
         }
-        std::str::from_utf8(&self.s[start..self.i]).unwrap_or("0").parse().map_err(|_| "number too large".into())
+        std::str::from_utf8(&self.s[start..self.i])
+            .unwrap_or("0")
+            .parse()
+            .map_err(|_| "number too large".into())
     }
 }
 
@@ -348,8 +585,43 @@ mod tests {
 
     #[test]
     fn form_line_and_bad_line() {
-        assert_eq!(line_for("cell phone", "lt", 5), r#"count("cell phone") < 5"#);
+        assert_eq!(
+            line_for("cell phone", "lt", 5),
+            r#"count("cell phone") < 5"#
+        );
         assert_eq!(line_for("pistol", "seen", 0), r#"seen("pistol")"#);
         assert!(compile("count(phone) > 1").is_err());
+    }
+    #[test]
+    fn ratio_supports_classroom_threshold_without_dividing_by_zero() {
+        let r = compile(r#"ratio("cell phone", "person") >= 0.2"#).unwrap();
+        assert!(r.needs_look);
+        assert!(r.eval(&counts(&[("cell phone", 12), ("person", 60)])));
+        assert!(!r.eval(&counts(&[("cell phone", 11), ("person", 60)])));
+        assert!(!r.eval(&counts(&[])));
+        assert_eq!(r.classes, vec!["cell phone", "person"]);
+    }
+
+    #[test]
+    fn zero_equality_requires_detector_evidence() {
+        assert!(compile(r#"count("cell phone") == 0"#).unwrap().needs_look);
+    }
+
+    #[test]
+    fn lua_alert_is_boolean_sandboxed_and_model_gated() {
+        let r = compile(r#"lua: count("cell phone") >= 4 and count("person") > 0"#).unwrap();
+        assert!(r.eval(&counts(&[("cell phone", 4), ("person", 10)])));
+        assert!(!r.eval(&counts(&[("cell phone", 3), ("person", 10)])));
+        assert!(r.needs_look);
+        assert_eq!(r.classes, vec!["cell phone", "person"]);
+        assert!(compile(r#"lua: os.execute("true") or seen("person")"#).is_err());
+        assert!(compile(r#"lua: count("person")"#).is_err());
+        assert!(compile(r#"lua: (function() while true do end end)() or seen("person")"#).is_err());
+    }
+    #[test]
+    fn rules_reject_resource_exhaustion_inputs() {
+        assert!(compile(&" ".repeat(4097)).is_err());
+        let nested = format!("{}seen(\"person\"){}", "(".repeat(26), ")".repeat(26));
+        assert!(compile(&nested).is_err());
     }
 }

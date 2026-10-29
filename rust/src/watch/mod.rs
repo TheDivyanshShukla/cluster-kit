@@ -4,17 +4,37 @@
 //! Rates on the panel are a smoothed once-a-second sample: counting inside the model
 //! would spend the cores the cameras need.
 
+#[allow(dead_code)]
+mod alerts;
+#[allow(dead_code)]
+mod api;
 mod approx;
+#[allow(dead_code)]
+mod auth;
 mod config;
 mod decode;
+#[allow(dead_code)]
+mod domain;
 mod fetch;
 mod fight;
 mod gate;
 mod head;
+#[allow(dead_code)]
+mod ingest;
+#[allow(dead_code)]
+mod matches;
+#[allow(dead_code)]
+mod media_catalog;
+#[allow(dead_code)]
+mod models;
 mod net;
 mod query;
 mod rules;
+#[allow(dead_code)]
+mod scheduler;
 mod split;
+#[allow(dead_code)]
+mod storage;
 mod track;
 mod worker;
 mod yolo;
@@ -77,6 +97,7 @@ pub fn now_secs() -> f64 {
 }
 
 pub fn repo_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("CW_ROOT") { return PathBuf::from(root); }
     if let Ok(cwd) = std::env::current_dir() {
         if cwd.join("kit").exists() || cwd.join("kit.bat").exists() {
             return cwd;
