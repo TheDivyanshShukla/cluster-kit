@@ -54,7 +54,7 @@ pub fn missing_asset(source_id: &str, path: &Path) -> MediaAsset {
     MediaAsset {
         id: media_id(source_id, &fp), source_id: source_id.into(), uri, fingerprint: fp,
         duration_us: None, width: None, height: None, codec: None, timebase: None, capture_start_utc_us: None,
-        proxy: ProxyStatus::None, availability: Availability::Missing, still: is_still(path),
+        proxy: ProxyStatus::None, availability: Availability::Missing, still: is_still(path), node_id: None,
     }
 }
 
@@ -90,6 +90,7 @@ pub fn probe_with(source_id: &str, path: &Path, capture_start_utc_us: Option<Us>
         proxy: ProxyStatus::None,
         availability: Availability::Available,
         still,
+        node_id: None,
     })
 }
 

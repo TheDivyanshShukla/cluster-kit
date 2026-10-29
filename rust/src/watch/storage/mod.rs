@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub mod legacy;
-mod sqlite;
+pub(crate) mod sqlite;
 #[cfg(test)]
 pub(crate) mod tests;
 

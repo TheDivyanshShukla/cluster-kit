@@ -155,7 +155,7 @@ fn unavailable_media_roundtrip() {
     let s = memory();
     let m = MediaAsset {
         id: "m1".into(), source_id: "s".into(), uri: "/gone/x.mp4".into(), fingerprint: "fp".into(), duration_us: Some(5), width: None,
-        height: None, codec: None, timebase: None, capture_start_utc_us: None, proxy: ProxyStatus::None, availability: Availability::Available, still: false,
+        height: None, codec: None, timebase: None, capture_start_utc_us: None, proxy: ProxyStatus::None, availability: Availability::Available, still: false, node_id: None,
     };
     s.upsert_media(&m).unwrap();
     let mut gone = m.clone();

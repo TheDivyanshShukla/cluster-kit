@@ -251,6 +251,7 @@ static POLICY: &[(&str, &str, Access)] = &[
     ("GET", "/clip", Public),
     ("GET", "/review", Public),
     ("GET", "/login", Public),
+    ("GET", "/nodes", Public),
     ("GET", "/favicon.ico", Public),
     ("GET", "/ui", Public),
     // auth
@@ -264,6 +265,11 @@ static POLICY: &[(&str, &str, Access)] = &[
     // worker credential routes (legacy and v1)
     ("POST", "/api/index", Worker),
     ("POST", "/api/v1/index", Worker),
+    ("POST", "/api/v1/heartbeat", Worker),
+    ("POST", "/api/v1/shard/ack", Worker),
+    ("POST", "/api/v1/shard/events", Worker),
+    ("GET", "/api/v1/nodes", RO),
+    ("POST", "/api/v1/federated", RO),
     ("GET", "/api/work", Worker),
     ("POST", "/api/stats", Worker),
     ("POST", "/api/events", Worker),

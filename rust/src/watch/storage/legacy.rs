@@ -150,7 +150,7 @@ fn seen_row(
         store.upsert_media(&MediaAsset {
             id: mid.clone(), source_id: cam.into(), uri: format!("legacy:{cam}"), fingerprint: fp.clone(),
             duration_us: None, width: None, height: None, codec: None, timebase: None, capture_start_utc_us: None,
-            proxy: ProxyStatus::None, availability: Availability::Unknown, still: false,
+            proxy: ProxyStatus::None, availability: Availability::Unknown, still: false, node_id: None,
         })?;
     }
     media.insert(mid.clone());

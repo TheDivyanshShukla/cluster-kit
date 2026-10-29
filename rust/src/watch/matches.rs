@@ -176,7 +176,7 @@ mod tests {
         MediaAsset {
             id: id.into(), source_id: "s".into(), uri: "x".into(), fingerprint: "f".into(), duration_us: dur,
             width: None, height: None, codec: None, timebase: None, capture_start_utc_us: utc,
-            proxy: ProxyStatus::None, availability: Availability::Available, still,
+            proxy: ProxyStatus::None, availability: Availability::Available, still, node_id: None,
         }
     }
     fn row(media: &str, t: Us, det: &str, track: Option<&str>, conf: f32) -> (FrameObservation, Detection) {

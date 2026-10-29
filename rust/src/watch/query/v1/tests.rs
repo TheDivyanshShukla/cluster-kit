@@ -93,7 +93,7 @@ fn asset(id: &str, dur: Option<Us>, utc: Option<Us>) -> MediaAsset {
     MediaAsset {
         id: id.into(), source_id: "cam".into(), uri: format!("/v/{id}.mp4"), fingerprint: "f".into(), duration_us: dur,
         width: None, height: None, codec: None, timebase: None, capture_start_utc_us: utc,
-        proxy: ProxyStatus::None, availability: Availability::Available, still: false,
+        proxy: ProxyStatus::None, availability: Availability::Available, still: false, node_id: None,
     }
 }
 pub(super) fn row(media: &str, t: Us, id: &str, class: &str, conf: f32, track: Option<&str>, model: &str) -> (FrameObservation, Detection) {

@@ -108,6 +108,9 @@ pub struct MediaAsset {
     /// True for a still image; review shows it on a contact sheet, not a fake-duration strip.
     #[serde(default)]
     pub still: bool,
+    /// Computer that ingested this recording and holds its observations (`CW_SHARDS=1`). `None` = the head.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 impl MediaAsset {
@@ -709,7 +712,7 @@ mod tests {
         let m = MediaAsset {
             id: "m1".into(), source_id: "s".into(), uri: "x.mp4".into(), fingerprint: "f".into(),
             duration_us: Some(1), width: None, height: None, codec: None, timebase: None,
-            capture_start_utc_us: None, proxy: ProxyStatus::None, availability: Availability::Available, still: false,
+            capture_start_utc_us: None, proxy: ProxyStatus::None, availability: Availability::Available, still: false, node_id: None,
         };
         assert_eq!(m.clock_domain(), ClockDomain::Media { media_id: "m1".into() });
     }
