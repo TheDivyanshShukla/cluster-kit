@@ -13,7 +13,7 @@ Defaults chosen (no answer from the user yet): the demo cluster is a mix of mach
 | 4 | Cluster benchmark: run, per-worker live progress, 1/2/3/4 PC results, speed-up and efficiency, honest same-machine warning | same | Not started | docs/evidence/k/ |
 | 5 | Realtime view: per-camera lag and keeping-up, camera to worker map, capacity versus demand, phone camera helper (test URL, add as live source) | same | Not started | docs/evidence/k/ |
 | 6 | `docs/CLUSTER_DEMO.md` runbook for the multi-PC demo | same | Not started | |
-| 7 | Distributed search: per-node shards, fan-out and merge, partial results, realtime events, media proxy | feature/distributed-search | Not started | docs/DISTRIBUTED.md |
+| 7 | Distributed search: per-node shards, fan-out and merge, partial results, realtime events, media proxy | worktree branch (3 commits, base eff6465) | Built behind CW_SHARDS=1 (default off); 199 unit tests pass (re-run by coordinator); chaos run 98/98 on one machine. To do: merge onto the cluster work (api.rs, head.rs, worker.rs, auth, domain.rs, mod.rs integration points), re-run tests and the chaos script on the merged tree, wire nodes strip into Search/Review | docs/evidence/d/, docs/DISTRIBUTED.md (in the worktree) |
 | 8 | Final pass: full test suite, acceptance, demo rehearsal, docs refresh, commit | each branch | Not started | |
 
 Verification gates for "Done": `cargo test` green; the acceptance script has no FAIL; the real-browser rehearsal passes with no console errors; for cluster items a real run with a head and at least two worker processes (killing one mid-run); anything that needs several physical PCs for a number is labelled as measured on one machine.
