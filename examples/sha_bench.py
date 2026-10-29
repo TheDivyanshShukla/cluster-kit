@@ -217,6 +217,7 @@ def main() -> None:
     if args.repeats < 5:
         sys.exit("--repeats must be at least 5 for the significance tests")
 
+    t_all = time.perf_counter()
     try:
         workers = stats(args.head)
     except OSError as e:
@@ -246,8 +247,8 @@ def main() -> None:
         for c, only in configs.items():
             r = measure(args.head, sizes[c], args.prefix, only)
             raw.append({"config": c, "repeat": rep, **r})
-            line.append(f"{names[c]} {r['rate'] / 1e6:,.1f}")
-        print(f"  repeat {rep}/{args.repeats}: " + "  ".join(line) + "  M/s")
+            line.append(f"{names[c]} {r['rate'] / 1e6:,.1f} M/s {r['secs']:.2f}s")
+        print(f"  repeat {rep}/{args.repeats}: " + "  ".join(line))
 
     # --- correctness: same range, same hits, every time
     for c in configs:
@@ -296,9 +297,9 @@ def main() -> None:
             w.writerow([names[r["config"]], r["repeat"], sizes[r["config"]], r["secs"], round(r["rate"]), r["hits"]])
     with open(out / "summary.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["config", "pcs", "threads", "n", *summary[top]])
+        w.writerow(["config", "pcs", "threads", "n", "avg_seconds", *summary[top]])
         for c, s in summary.items():
-            w.writerow([names[c], len(configs[c].split(",")), threads[c], sizes[c], *(round(v, 3) for v in s.values())])
+            w.writerow([names[c], len(configs[c].split(",")), threads[c], sizes[c], round(statistics.fmean(r["secs"] for r in raw if r["config"] == c), 3), *(round(v, 3) for v in s.values())])
     with open(out / "tests.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(test_rows[0]))
         w.writeheader()
@@ -306,7 +307,8 @@ def main() -> None:
 
     M = 1e6
     rows = [f"| {names[c]} | {len(configs[c].split(','))} | {threads[c]} | {sizes[c]:,} | **{v['median'] / M:,.2f}** "
-            f"| ±{v['ci95'] / M:,.2f} | {v['cv_pct']:.2f}% | {v['min'] / M:,.2f} | {v['max'] / M:,.2f} |"
+            f"| ±{v['ci95'] / M:,.2f} | {v['cv_pct']:.2f}% | {v['min'] / M:,.2f} | {v['max'] / M:,.2f} "
+            f"| {statistics.fmean(r['secs'] for r in raw if r['config'] == c):.2f} |"
             for c, v in summary.items()]
     trows = [f"| {t['test']} | {t['gain']:.2f}x | {t['p']:.4f} | {'**yes**' if t['significant'] else 'NO'} |"
              for t in test_rows]
@@ -347,8 +349,8 @@ def main() -> None:
 
 Every repeat of every config found exactly the same hits (correctness check). {consistency}
 
-| Config | PCs | Threads | n per run | Median (M/s) | 95% CI | CV | Min | Max |
-|---|---|---|---|---|---|---|---|---|
+| Config | PCs | Threads | n per run | Median (M/s) | 95% CI | CV | Min | Max | Avg time (s) |
+|---|---|---|---|---|---|---|---|---|---|
 {chr(10).join(rows)}
 
 ## Scaling
@@ -393,9 +395,11 @@ Expected time to find one hash with k leading zeros:
     (out / "report.md").write_text(report)
     plot(out, args.label, names, addrs, scale, summary, raw, combined, speedup)
 
-    print(f"\n{'config':<16}{'median M/s':>12}{'±95% CI':>10}{'CV':>8}")
+    print(f"\n{'config':<16}{'median M/s':>12}{'±95% CI':>10}{'CV':>8}{'avg s':>10}{'median s':>10}{'total s':>9}")
     for c, v in summary.items():
-        print(f"{names[c]:<16}{v['median'] / M:>12,.2f}{v['ci95'] / M:>10,.2f}{v['cv_pct']:>7.2f}%")
+        secs = [r["secs"] for r in raw if r["config"] == c]
+        print(f"{names[c]:<16}{v['median'] / M:>12,.2f}{v['ci95'] / M:>10,.2f}{v['cv_pct']:>7.2f}%"
+              f"{statistics.fmean(secs):>10.2f}{statistics.median(secs):>10.2f}{sum(secs):>9.2f}")
     print()
     for t in test_rows:
         print(f"{t['test']:<40} {t['gain']:5.2f}x  p = {t['p']:.4f}  {'significant' if t['significant'] else 'NOT significant'}")
@@ -404,6 +408,7 @@ Expected time to find one hash with k leading zeros:
     if noisy:
         print(f"WARNING: noisy configs (CV > {args.max_cv:g}%): {', '.join(noisy)}")
     print(f"Saved: {out.relative_to(ROOT)}/ (report.md, summary.csv, tests.csv, raw.csv, bench.png)")
+    print(f"Total benchmark time: {time.perf_counter() - t_all:.1f} s")
 
 
 if __name__ == "__main__":
