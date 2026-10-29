@@ -251,6 +251,7 @@ static POLICY: &[(&str, &str, Access)] = &[
     ("GET", "/clip", Public),
     ("GET", "/review", Public),
     ("GET", "/login", Public),
+    ("GET", "/favicon.ico", Public),
     ("GET", "/ui", Public),
     // auth
     ("POST", "/api/v1/auth/login", Public),

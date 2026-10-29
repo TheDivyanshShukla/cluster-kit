@@ -830,6 +830,10 @@ fn conjuncts<'a>(x: &'a X, out: &mut Vec<&'a X>) {
 
 /// Narrow a string list (empty = unrestricted). Sets `dead` when no value can match.
 fn narrow(dst: &mut Vec<String>, vals: Vec<String>, dead: &mut bool) {
+    // No request of its own (e.g. a Lua call that names no source) leaves the search scope untouched.
+    if vals.is_empty() {
+        return;
+    }
     if dst.is_empty() {
         *dst = vals;
     } else {

@@ -408,6 +408,19 @@ fn lua_loop_over_frames_computes_ratio() {
 }
 
 #[test]
+fn lua_script_without_sources_keeps_the_search_scope() {
+    // Regression: a Lua call that names no source must not empty a scope that names one.
+    let mut st = Fake { media: vec![asset("a", Some(60 * S), None)], models: vec![model(true)], ..Default::default() };
+    st.sums = vec![sum(S, Some(60), Some(12)), sum(2 * S, Some(60), Some(5))];
+    let mut r = lreq("return {frames = count(db.frames{})}");
+    r.scope.source_ids = vec!["cam".into()];
+    let scoped = run_detailed(&st, &r).unwrap();
+    let open = run_detailed(&st, &lreq("return {frames = count(db.frames{})}")).unwrap();
+    assert_eq!(scoped.values[0]["frames"], open.values[0]["frames"]);
+    assert!(scoped.values[0]["frames"].as_u64().unwrap() > 0);
+}
+
+#[test]
 fn lua_nested_loops_emit_and_same_script_same_run() {
     let st = store_with(vec![
         row("a", S, "1", "person", 0.9, Some("t1"), "m"),

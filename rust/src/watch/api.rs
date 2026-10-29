@@ -144,6 +144,9 @@ pub struct Api {
     /// Rule diagnostics already written to the audit log: (rule, version, source, code). Each is logged once.
     /// Result of validating the configured models, valid while the module list and model files are unchanged.
     model_cache: Mutex<Option<(String, Vec<(String, Result<ModelVersion, ApiError>)>)>>,
+    /// Per task: coverage already earned before this worker run, and the last counters it reported. A worker
+    /// (or head) restart resets the worker's counters; adding the base keeps the job's totals across restarts.
+    cov_base: Mutex<HashMap<String, (Coverage, Coverage)>>,
     diag_seen: Mutex<std::collections::HashSet<(String, String, String, String)>>,
     pub auth: crate::watch::auth::Auth,
 }
@@ -171,6 +174,7 @@ impl Api {
             catalog: Mutex::new(HashMap::new()),
             latest: Mutex::new(HashMap::new()),
             model_cache: Mutex::new(None),
+            cov_base: Mutex::new(HashMap::new()),
             diag_seen: Mutex::new(Default::default()),
             auth,
         }
@@ -254,7 +258,10 @@ pub fn handle(api: &Arc<Api>, method: &str, url: &str, body: &[u8], range: Optio
         })(),
         ("GET", ["models"]) => models(api),
         // No analyzed frame yet is a normal state for a camera that just started: 204, not an error.
-        ("GET", ["live", id, "latest"]) => Ok(api.latest.lock().unwrap().get(*id).cloned().map(|v| Reply::json(&v)).unwrap_or(Reply { status: 204, ctype: "application/json", body: Vec::new(), headers: Vec::new() })),
+        ("GET", ["live", id, "latest"]) => {
+            let live = api.latest.lock().unwrap().get(*id).cloned();
+            Ok(live.or_else(|| last_analyzed(api, id)).map(|v| Reply::json(&v)).unwrap_or(Reply { status: 204, ctype: "application/json", body: Vec::new(), headers: Vec::new() }))
+        }
         ("GET", ["observations", id, "thumbnail"]) => {
             std::fs::read(api.data_dir.join("thumbs").join(format!("{}.jpg", sanitize(id)))).map(|b| Reply::bytes(b, "image/jpeg")).map_err(|_| missing("thumbnail"))
         }
@@ -916,7 +923,12 @@ pub fn sync_sources(api: &Api, cams: &[Camera]) {
             eligible_workers: Vec::new(),
             settings: serde_json::json!({ "camera_id": c.id }),
         };
-        if media.availability != Availability::Missing {
+        // A finished import stays finished across restarts: re-leasing it would re-read its tail and flip it
+        // back to "running". Live and looping sources are never "completed", so they are always scheduled.
+        let finished = !matches!(kind, SourceKind::Live | SourceKind::Webcam)
+            && c.kind != "file"
+            && api.store.job(&job_id).ok().flatten().is_some_and(|j| j.state == JobState::Completed);
+        if media.availability != Availability::Missing && !finished {
             let _ = api.sched.lock().unwrap().submit(job, vec![spec]);
         }
         cat.insert(c.id.clone(), (key, task_id));
@@ -970,13 +982,40 @@ fn resume_from_checkpoint(api: &Api, l: &mut TaskLease) {
     }
 }
 
+/// Totals for a job across worker restarts. First report of a task after the head started: what the store
+/// already holds is the base. Counters going backwards means the worker restarted: fold its last counters into
+/// the base. Reported values are never summed twice.
+fn merge_coverage(api: &Api, task: &str, stored: &Coverage, new: Coverage) -> Coverage {
+    let mut g = api.cov_base.lock().unwrap();
+    let e = g.entry(task.to_string()).or_insert_with(|| (stored.clone(), Coverage::default()));
+    if new.decoded < e.1.decoded {
+        e.0 = add_coverage(&e.0, &e.1);
+    }
+    e.1 = new.clone();
+    add_coverage(&e.0, &new)
+}
+
+fn add_coverage(a: &Coverage, b: &Coverage) -> Coverage {
+    let mut analyzed = a.analyzed.clone();
+    analyzed.extend(b.analyzed.iter().copied());
+    analyzed.sort();
+    let mut merged: Vec<[Us; 2]> = Vec::new();
+    for iv in analyzed {
+        match merged.last_mut() {
+            Some(last) if iv[0] <= last[1] => last[1] = last[1].max(iv[1]),
+            _ => merged.push(iv),
+        }
+    }
+    Coverage { decoded: a.decoded + b.decoded, inferred: a.inferred + b.inferred, skipped: a.skipped + b.skipped, failed: a.failed + b.failed, analyzed: merged }
+}
+
 /// Worker-reported camera state: finished archives complete their task; permanent errors fail it.
-pub fn camera_state(api: &Api, worker: &str, camera: &str, state: &str, error_code: &str, coverage: Option<&serde_json::Value>) {
+pub fn camera_state(api: &Api, worker: &str, camera: &str, state: &str, error_code: &str, coverage: Option<&serde_json::Value>, ops: Option<&serde_json::Value>) {
     let lease = api.held.lock().unwrap().values().find(|l| l.worker == worker && l.settings.get("camera_id").and_then(|c| c.as_str()) == Some(camera)).cloned();
     let Some(l) = lease else { return };
     if let Some(cov) = coverage.and_then(|c| serde_json::from_value::<Coverage>(c.clone()).ok()) {
         if let Ok(Some(mut j)) = api.store.job(&l.job_id) {
-            j.coverage = cov;
+            j.coverage = merge_coverage(api, &l.task_id, &j.coverage, cov);
             j.state = match state {
                 "completed" => JobState::Completed,
                 "error" => JobState::Failed,
@@ -987,6 +1026,11 @@ pub fn camera_state(api: &Api, worker: &str, camera: &str, state: &str, error_co
             }
             if j.state == JobState::Completed && j.finished_utc_us.is_none() {
                 j.finished_utc_us = Some(now_us());
+            }
+            // Keep the final pipeline figures with the job, so the page can show them after the worker moves on.
+            if let Some(o) = ops.filter(|o| o.is_object() && o.get("pixels_full").is_some()) {
+                if !j.sampling.is_object() { j.sampling = serde_json::json!({}); }
+                j.sampling["ops"] = o.clone();
             }
             let _ = api.store.upsert_job(&j);
         }
@@ -1224,6 +1268,26 @@ fn tidy_timeline(api: &Api, mut v: serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    fn cov(d: u64, i: u64, a: [Us; 2]) -> Coverage {
+        Coverage { decoded: d, inferred: i, skipped: d - i, failed: 0, analyzed: vec![a] }
+    }
+
+    #[test]
+    fn coverage_adds_up_across_a_worker_restart() {
+        let api = Api::new(crate::watch::storage::memory(), std::env::temp_dir(), crate::watch::auth::Auth::load(&std::env::temp_dir().join("cw-api-test2")));
+        // Head restarted: the store already holds 100 decoded from the earlier run.
+        let stored = cov(100, 40, [0, 10]);
+        let a = merge_coverage(&api, "t", &stored, cov(10, 4, [10, 11]));
+        assert_eq!((a.decoded, a.inferred), (110, 44));
+        // Same run keeps reporting growing counters: not summed twice.
+        let b = merge_coverage(&api, "t", &stored, cov(30, 12, [10, 13]));
+        assert_eq!((b.decoded, b.inferred), (130, 52));
+        // Worker restarts and its counters begin again: the earlier run's last counters join the base.
+        let c = merge_coverage(&api, "t", &stored, cov(5, 2, [13, 14]));
+        assert_eq!((c.decoded, c.inferred), (135, 54));
+        assert_eq!(c.analyzed, vec![[0, 14]], "adjacent analyzed intervals merge");
+    }
+
     #[test]
     fn adjacent_gaps_merge_and_live_lanes_are_unrecorded() {
         let api = Api::new(crate::watch::storage::memory(), std::env::temp_dir(), crate::watch::auth::Auth::load(&std::env::temp_dir().join("cw-api-test")));
@@ -1249,5 +1313,47 @@ mod tests {
             availability: Availability::Available, still: false,
         };
         assert_eq!(public_media(m).uri, "clip.mp4");
+    }
+}
+
+/// The media of a source whose import completed. A source can own older media rows (a file replaced since), so
+/// pick the one with a completed job rather than the first.
+fn finished_media(api: &Api, id: &str) -> Option<(MediaAsset, IndexJob)> {
+    api.store.media_for_source(id).ok()?.into_iter().find_map(|m| {
+        let j = api.store.job(&stable_id("job", &[id, &m.id])).ok().flatten().filter(|j| j.state == JobState::Completed)?;
+        Some((m, j))
+    })
+}
+
+/// A configured camera that no worker reports any more because its import finished: the view the wall and the
+/// Rules page need, built from the stored job. `None` when the source has no finished job.
+pub fn finished_camera(api: &Api, id: &str, name: &str) -> Option<serde_json::Value> {
+    let (media, job) = finished_media(api, id)?;
+    let ops = job.sampling.get("ops").cloned().unwrap_or(serde_json::json!({}));
+    Some(serde_json::json!({
+        "id": id, "name": name, "status": "done", "completed": true, "seq": 0, "indexed_frames": job.coverage.inferred,
+        "people": "", "lacking": "0", "feed": "", "skip": "", "host": "", "at": 0, "dur": media.duration_us.unwrap_or(0) as f64 / 1e6, "boxes": [],
+        "ops": ops,
+        "detector_passes": ops.get("detector_passes"), "static": ops.get("static"), "regions": ops.get("regions"),
+        "keyframes": ops.get("keyframes"), "pixels_inferred": ops.get("pixels_inferred"), "pixels_full": ops.get("pixels_full"),
+    }))
+}
+
+/// The last analysed frame of a finished import with its detections, for a wall tile that has no live feed.
+fn last_analyzed(api: &Api, source: &str) -> Option<serde_json::Value> {
+    let (media, _) = finished_media(api, source)?;
+    let dur = media.duration_us?;
+    let mut from = (dur - 30_000_000).max(0);
+    loop {
+        let rows = api.store.observations(&media.id, from, dur).ok()?;
+        if let Some((o, d, _)) = rows.into_iter().rev().find(|(o, _, _)| o.thumbnail.is_some()) {
+            let dets: Vec<_> = d.iter().map(|d| serde_json::json!({ "class": d.class, "confidence": d.confidence, "bbox": d.bbox, "track_id": d.track_id, "color": d.color })).collect();
+            return Some(serde_json::json!({
+                "observation_id": o.observation_id, "media_id": o.media_id, "media_time_us": o.media_time_us,
+                "frame": format!("/api/v1/observations/{}/thumbnail", sanitize(&o.observation_id)), "detections": dets,
+            }));
+        }
+        if from == 0 { return None; }
+        from = (from - 120_000_000).max(0);
     }
 }

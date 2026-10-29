@@ -451,6 +451,8 @@ fn handle(hub: &Hub, method: &Method, url: &str, body: &[u8], _req: &tiny_http::
             return page;
         }
     }
+    // Browsers ask for an icon on every page; there is none, and a 404 would show as a console error.
+    if path == "/favicon.ico" { return empty(StatusCode(204)); }
     if path == "/api/health" {
         return json(serde_json::json!({"ok": true}));
     }
@@ -765,7 +767,7 @@ fn ingest_stats(hub: &Hub, body: &[u8]) {
             entry.boxes = cam.get("boxes").cloned().unwrap_or(serde_json::json!([]));
             if let Some(o) = cam.get("ops") { entry.ops = o.clone(); }
             let state = cam.get("state").and_then(|x| x.as_str()).unwrap_or(if entry.completed { "completed" } else { "running" });
-            crate::watch::api::camera_state(&hub.api, id, cid, state, cam.get("error_code").and_then(|x| x.as_str()).unwrap_or(""), cam.get("coverage"));
+            crate::watch::api::camera_state(&hub.api, id, cid, state, cam.get("error_code").and_then(|x| x.as_str()).unwrap_or(""), cam.get("coverage"), cam.get("ops"));
 
         }
     }
@@ -1161,6 +1163,15 @@ fn snapshot(hub: &Hub) -> serde_json::Value {
     if ops_total > 0.0 {
         for pc in &mut pcs {
             pc.share = pc.ops / ops_total * 100.0;
+        }
+    }
+    // Finished imports are no longer reported by any worker; keep them on the wall and in the savings panel.
+    {
+        let have: std::collections::HashSet<String> = cam_views.iter().filter_map(|v| v["id"].as_str().map(String::from)).collect();
+        for c in &watch.cameras {
+            if !have.contains(&c.id) {
+                if let Some(v) = crate::watch::api::finished_camera(&hub.api, &c.id, &c.name) { cam_views.push(v); }
+            }
         }
     }
     let (headers, rows) = approx::matrix(&pcs);
