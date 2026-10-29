@@ -11,3 +11,4 @@ vision/footage/*
 vision/models/*
 vision/data/
 vision/watch.json
+.claude/worktrees/
