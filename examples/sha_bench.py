@@ -12,12 +12,12 @@ What it runs (head PC first, then the others in IP order):
 How it stays consistent:
   - every config is sized to take about --seconds, so fixed costs weigh the same everywhere
   - one discarded warm-up run per config (calibration doubles as warm-up)
-  - repeats run round-robin (A B C 2PC 3PC, A B C 2PC 3PC, ...) so drift such as heat hits all equally
-  - each config hashes the same range every time, so its hit count must not change; a change aborts
+  - repeats run round-robin (A B C 2PC 3PC, A B C 2PC 3PC, ...) to reduce drift effects
+  - each config hashes the same range every time, so its hit count must not change; a change aborts (this does not prove correctness)
   - reports median, mean, stdev, CV and a 95% confidence interval; CV above --max-cv is flagged
 
 How it shows the PCs help:
-  - exact one-sided permutation test: k PCs faster than k-1 PCs, and all PCs faster than the best
+  - one-sided permutation test: k PCs faster than k-1 PCs, and all PCs faster than the best
     single PC (no normality assumption; with 7 repeats the smallest possible p is 1/3432)
   - speedup of all PCs over the head alone, with a bootstrap 95% CI
   - parallel efficiency: measured throughput / sum of the PCs' solo throughputs
@@ -42,11 +42,6 @@ ROOT = Path(__file__).resolve().parent.parent
 CK = ROOT / "rust" / "target" / "release" / ("ck.exe" if sys.platform == "win32" else "ck")
 T95 = {1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31, 9: 2.26, 10: 2.23}
 ALPHA = 0.01
-# Reference points for the time-to-find chart. Measured: the Python Dask run. Estimates: the rest.
-REFS = {"Python Dask, this cluster (measured)": 5.55e6,
-        "1 datacenter GPU (est.)": 1e10,
-        "Frontier supercomputer (est.)": 3.8e14,
-        "Bitcoin network (est.)": 1e21}
 
 
 # ------------------------------------------------------------------ running --
@@ -91,7 +86,11 @@ def calibrate(head: str, prefix: str, only: str, target: float) -> int:
 def summarize(rates: list[float]) -> dict:
     k, med, mean = len(rates), statistics.median(rates), statistics.fmean(rates)
     sd = statistics.stdev(rates) if k > 1 else 0.0
-    ci = T95.get(k - 1, 2.0) * sd / k ** 0.5 if k > 1 else 0.0
+    df = k - 1
+    # Cornish-Fisher approximation for degrees of freedom beyond the table.
+    z = 1.959963984540054
+    t = T95.get(df, z + (z**3 + z) / (4 * df) + (5*z**5 + 16*z**3 + 3*z) / (96 * df**2)) if df else 0
+    ci = t * sd / k ** 0.5 if k > 1 else 0.0
     return {"median": med, "mean": mean, "stdev": sd, "cv_pct": 100 * sd / mean,
             "ci95": ci, "min": min(rates), "max": max(rates)}
 
@@ -111,7 +110,7 @@ def perm_p(slow: list[float], fast: list[float]) -> float:
         s = sum(pool[i] for i in idx)
         hit += s / k - (total - s) / len(slow) >= obs - 1e-9
         n += 1
-    return hit / n
+    return hit / n if comb(len(pool), k) <= 200_000 else (hit + 1) / (n + 1)
 
 
 def boot_ratio(num: list[float], den: list[float]) -> tuple[float, float]:
@@ -140,12 +139,12 @@ def plot(out: Path, label: str, names: dict, addrs: list, scale: list, summary: 
     M = 1e6
     fig, ax = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(f"SHA-256 prefix search on ck{f' ({label})' if label else ''}: "
-                 f"median of repeats, error bars = 95% CI", fontsize=13)
+                 f"points = mean throughput, error bars = 95% CI of mean", fontsize=13)
 
     a = ax[0][0]
     ks = list(range(1, len(scale) + 1))
-    med = [summary[c]["median"] / M for c in scale]
-    ideal = [sum(summary[x]["median"] for x in addrs[:k]) / M for k in ks]
+    med = [summary[c]["mean"] / M for c in scale]
+    ideal = [sum(summary[x]["mean"] for x in addrs[:k]) / M for k in ks]
     a.errorbar(ks, med, yerr=[summary[c]["ci95"] / M for c in scale], fmt="o-", capsize=5, lw=2,
                color="#F58518", label="measured")
     a.plot(ks, ideal, "s--", color="gray", label="ideal: sum of those PCs alone")
@@ -158,7 +157,7 @@ def plot(out: Path, label: str, names: dict, addrs: list, scale: list, summary: 
 
     a = ax[0][1]
     x = range(len(addrs))
-    a.bar([i - 0.2 for i in x], [summary[c]["median"] / M for c in addrs], 0.4,
+    a.bar([i - 0.2 for i in x], [summary[c]["mean"] / M for c in addrs], 0.4,
           yerr=[summary[c]["ci95"] / M for c in addrs], capsize=4, label="alone", color="#4C78A8")
     if combined:
         a.bar([i + 0.2 for i in x], [combined[c]["rate"] / M for c in addrs], 0.4,
@@ -183,9 +182,9 @@ def plot(out: Path, label: str, names: dict, addrs: list, scale: list, summary: 
     a = ax[1][1]
     ks = list(range(6, 21))
     series = {f"head alone (measured)": summary[addrs[0]]["median"],
-              f"all {len(scale)} PCs (measured)": summary[scale[-1]]["median"]} | REFS
+              f"all {len(scale)} PCs (measured)": summary[scale[-1]]["median"]}
     for lbl, rate in series.items():
-        a.plot(ks, [16 ** k / rate for k in ks], "o-" if "measured" in lbl else "--", ms=3, label=lbl)
+        a.plot(ks, [16 ** k / rate for k in ks], "o-", ms=3, label=lbl)
     for t, txt in ((1, "1 s"), (3600, "1 h"), (86_400 * 365, "1 yr")):
         a.axhline(t, color="gray", lw=0.6, ls=":")
         a.text(ks[0], t, txt, fontsize=8, va="bottom")
@@ -307,7 +306,7 @@ def main() -> None:
 
     M = 1e6
     rows = [f"| {names[c]} | {len(configs[c].split(','))} | {threads[c]} | {sizes[c]:,} | **{v['median'] / M:,.2f}** "
-            f"| ±{v['ci95'] / M:,.2f} | {v['cv_pct']:.2f}% | {v['min'] / M:,.2f} | {v['max'] / M:,.2f} "
+            f"| {v['mean'] / M:,.2f} ±{v['ci95'] / M:,.2f} | {v['cv_pct']:.2f}% | {v['min'] / M:,.2f} | {v['max'] / M:,.2f} "
             f"| {statistics.fmean(r['secs'] for r in raw if r['config'] == c):.2f} |"
             for c, v in summary.items()]
     trows = [f"| {t['test']} | {t['gain']:.2f}x | {t['p']:.4f} | {'**yes**' if t['significant'] else 'NO'} |"
@@ -347,9 +346,9 @@ def main() -> None:
 
 ## Consistency
 
-Every repeat of every config found exactly the same hits (correctness check). {consistency}
+Every repeat of each config returned the same hit count. This checks consistency, not correctness against an independent reference. {consistency}
 
-| Config | PCs | Threads | n per run | Median (M/s) | 95% CI | CV | Min | Max | Avg time (s) |
+| Config | PCs | Threads | n per run | Median (M/s) | Mean ± 95% CI (M/s) | CV | Min | Max | Avg time (s) |
 |---|---|---|---|---|---|---|---|---|---|
 {chr(10).join(rows)}
 
@@ -365,7 +364,7 @@ Every repeat of every config found exactly the same hits (correctness check). {c
 |---|---|---|---|---|
 {chr(10).join(crows)}
 
-Busy below 100% means the PC waited on the network or on the tail of the job.
+Busy is the sum of chunk compute durations divided by elapsed job time. Concurrent chunks can make it exceed 100%; it is not a direct measurement of idle time.
 
 ## What it means for a real job
 
@@ -384,9 +383,10 @@ Expected time to find one hash with k leading zeros:
 ## Method
 
 - Each config is sized to run ~{args.seconds:g} s and hashes the same numbers in every repeat.
-- Repeats are interleaved round-robin, so slow drift (heat, background load) affects every config equally.
+- Repeats are interleaved round-robin, which helps reduce the effect of slow drift (heat, background load).
 - Throughput = numbers / seconds as timed by `ck run` from job submit to last result.
-- Significance: exact one-sided permutation test on the repeat throughputs (no normality assumption).
+- Significance: one-sided permutation test on mean repeat throughput; exact up to 200,000 splits, otherwise 50,000 random splits. Tests are exploratory and not adjusted for multiple comparisons.
+- Throughput confidence intervals use a t interval for the mean, not the median; with few repeats they are approximate.
 - Speedup CI: 5000 bootstrap resamples of the ratio of medians.
 - "Busy" and "while computing" come from the compute time each worker reports per chunk.
 
@@ -395,10 +395,10 @@ Expected time to find one hash with k leading zeros:
     (out / "report.md").write_text(report)
     plot(out, args.label, names, addrs, scale, summary, raw, combined, speedup)
 
-    print(f"\n{'config':<16}{'median M/s':>12}{'±95% CI':>10}{'CV':>8}{'avg s':>10}{'median s':>10}{'total s':>9}")
+    print(f"\n{'config':<16}{'mean M/s':>12}{'±95% CI':>10}{'CV':>8}{'avg s':>10}{'median s':>10}{'total s':>9}")
     for c, v in summary.items():
         secs = [r["secs"] for r in raw if r["config"] == c]
-        print(f"{names[c]:<16}{v['median'] / M:>12,.2f}{v['ci95'] / M:>10,.2f}{v['cv_pct']:>7.2f}%"
+        print(f"{names[c]:<16}{v['mean'] / M:>12,.2f}{v['ci95'] / M:>10,.2f}{v['cv_pct']:>7.2f}%"
               f"{statistics.fmean(secs):>10.2f}{statistics.median(secs):>10.2f}{sum(secs):>9.2f}")
     print()
     for t in test_rows:
