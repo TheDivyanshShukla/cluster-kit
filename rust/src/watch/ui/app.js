@@ -971,7 +971,7 @@ function makeEditor(box, onRun, opts) {
   function autoPair(e) {
     const k = e.key, v = ta.value, s = ta.selectionStart, nx = v[s], pv = v[s - 1];
     if (ta.selectionStart !== ta.selectionEnd) return false;
-    if ((")]}'\"".includes(k)) && nx === k && (k in BRC ? (OPENS.includes(BRC[k])) : QUOTES.includes(k))) { e.preventDefault(); ta.setSelectionRange(s + 1, s + 1); return true; }
+    if ((")]}'\"".includes(k)) && nx === k && (k in BRC ? (OPENS.includes(BRC[k])) : QUOTES.includes(k))) { e.preventDefault(); closePop(); ta.setSelectionRange(s + 1, s + 1); return true; }
     const okNext = nx === undefined || /[\s)\]};,]/.test(nx);
     if (OPENS.includes(k) && k in BR && okNext) { e.preventDefault(); ins(k + BR[k]); ta.setSelectionRange(s + 1, s + 1); if (k === "{") sched(false); return true; }
     if (QUOTES.includes(k) && okNext && !/\w/.test(pv || "") && !inLit(v, s)) { e.preventDefault(); ins(k + k); ta.setSelectionRange(s + 1, s + 1); sched(false); return true; }
@@ -1087,10 +1087,10 @@ function makeEditor(box, onRun, opts) {
   }
   const renderSigPlain = (n) => (n === "seen" ? 'seen("class")' : n === "count" ? 'count("class") >= n' : 'ratio("a", "b") >= x');
   ta.addEventListener("mousemove", (e) => {
-    clearTimeout(hovT); const i = indexAt(e.clientX, e.clientY);
-    if (i === hovAt) return; if (hov && !hov.hidden) hov.hidden = true; hovAt = i; if (i < 0) return;
+    const i = indexAt(e.clientX, e.clientY);
+    if (i === hovAt) return; clearTimeout(hovT); if (hov && !hov.hidden) hov.hidden = true; hovAt = i; if (i < 0) return;
     hovT = setTimeout(() => {
-      let it = null; try { it = hoverDoc(ta.value, i); } catch (er2) { it = null; console.error("hover", er2); } if (!it || isOpen()) return;
+      let it = null; try { it = hoverDoc(ta.value, i); } catch (er2) { it = null; } if (!it || isOpen()) return;
       if (!hov) { hov = document.createElement("div"); hov.className = "ed-hover"; hov.setAttribute("role", "tooltip"); document.body.appendChild(hov); }
       hov.innerHTML = docHtml(it); hov.hidden = false; const vw = document.documentElement.clientWidth, w = Math.min(hov.offsetWidth, vw - 16), h = hov.offsetHeight;
       hov.style.left = Math.max(8, Math.min(e.clientX, vw - w - 8)) + "px"; hov.style.top = (e.clientY + 18 + h > innerHeight ? Math.max(6, e.clientY - h - 8) : e.clientY + 18) + "px";
@@ -1145,7 +1145,7 @@ function makeEditor(box, onRun, opts) {
     if (e.key === "Escape") { if (session) { session = null; e.stopPropagation(); } hideSig(); hideHover(); return; }
     if (session && e.key === "Tab" && plain) { e.preventDefault(); stop(e.shiftKey ? -1 : 1); return; }
     if (mod && e.key === "/" && kind === "lua") { e.preventDefault(); toggleComment(); return; }
-    if (plain && e.key.length === 1 && autoPair(e)) { closePop(); return; }
+    if (plain && e.key.length === 1 && autoPair(e)) return;
     if (e.key === "Backspace" && plain && ta.selectionStart === ta.selectionEnd) {
       const v = ta.value, s = ta.selectionStart, a = v[s - 1], b = v[s];
       if (a && b && ((a in BR && BR[a] === b && OPENS.includes(a)) || (QUOTES.includes(a) && a === b))) { e.preventDefault(); ta.setSelectionRange(s - 1, s + 1); document.execCommand("delete"); return; }
@@ -1163,6 +1163,7 @@ function makeEditor(box, onRun, opts) {
       e.preventDefault(); ins("\n" + ind + extra);
     }
   });
+  ed.hoverDoc = hoverDoc; ed.sigAt = sigAt;
   paint(); status(); return ed;
 }
   return { highlight, makeEditor, data: DATA, loadData, fuzzy, sqlComplete, luaComplete, ruleComplete };

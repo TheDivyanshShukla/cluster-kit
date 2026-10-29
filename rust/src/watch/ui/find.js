@@ -221,7 +221,7 @@ function holdingUnsupported() { return !models.some((m) => (m.supported_relation
 // Info only: say so when the analysed intervals cover < 95% of the matched media's duration (durations come from GET /api/v1/media/{id}).
 async function coverageNote(c, matches) {
   const ids = [...new Set(matches.map((m) => m.media_id))].slice(0, 8), an = V.analyzed(c);
-  if (!ids.length || !(c.decoded > 0)) return;
+  if (!ids.length || !(c.decoded > 0) || !(an > 0)) return; // an = 0 means the server sent no intervals for a multi-media scope: unknown, say nothing
   try {
     const ms = await Promise.all(ids.map((id) => V.call("GET", "/api/v1/media/" + encodeURIComponent(id)).catch(() => null)));
     const dur = ms.reduce((a, m) => a + ((m && Number(m.duration_us)) || 0), 0), el = $("cov-note");
