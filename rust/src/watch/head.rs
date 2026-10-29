@@ -117,6 +117,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
     let root = crate::watch::repo_root();
     std::fs::create_dir_all(data_path("")).map_err(|e| e.to_string())?;
     let store = crate::watch::storage::open(&data_path("watch.db")).map_err(|e| format!("metadata store: {}", e.message))?;
+    let store = crate::watch::shard::wrap_store(store, &data_path("")); // CW_SHARDS=1: read through the federated store
     let auth = crate::watch::auth::Auth::load(&root);
     log(&auth.startup_notice());
     let api = Arc::new(crate::watch::api::Api::new(store, data_path(""), auth));
@@ -1355,6 +1356,9 @@ fn ui_page(path: &str) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
         "/ui/clip.js" => ("clip.js", "text/javascript; charset=utf-8"),
         "/ui/analytics.js" => ("analytics.js", "text/javascript; charset=utf-8"),
         "/ui/setup.js" => ("setup.js", "text/javascript; charset=utf-8"),
+        "/ui/nodes.js" => ("nodes.js", "text/javascript; charset=utf-8"),
+        "/ui/nodes.css" => ("nodes.css", "text/css; charset=utf-8"),
+        "/nodes" => ("nodes.html", "text/html; charset=utf-8"),
         _ => return None,
     };
     // The files in rust/src/watch/ui are the pages. Read them so an edit shows up on refresh.
@@ -1391,6 +1395,9 @@ fn ui_page(path: &str) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
         "clip.js" => include_str!("ui/clip.js").as_bytes(),
         "analytics.js" => include_str!("ui/analytics.js").as_bytes(),
         "setup.js" => include_str!("ui/setup.js").as_bytes(),
+        "nodes.js" => include_str!("ui/nodes.js").as_bytes(),
+        "nodes.css" => include_str!("ui/nodes.css").as_bytes(),
+        "nodes.html" => include_str!("ui/nodes.html").as_bytes(),
         _ => return None,
     };
     Some(bytes(embedded.to_vec(), ctype))

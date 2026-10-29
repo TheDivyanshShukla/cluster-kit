@@ -155,6 +155,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
         log("head not up yet");
         thread::sleep(Duration::from_secs(2));
     };
+    crate::watch::shard::node::start(&id, &base); // CW_SHARDS=1: local shard store + shard server
     let shared = Arc::new(Shared {
         proc: Mutex::new(config::preset("balanced")),
         modules: Mutex::new(Vec::new()),
@@ -207,6 +208,7 @@ pub fn run(opts: Opts) -> Result<(), String> {
             *shared.modules.lock().unwrap() = m;
         }
         if let Ok(r) = serde_json::from_value::<Vec<Rule>>(v.get("rules").cloned().unwrap_or(serde_json::json!([]))) {
+            crate::watch::shard::node::set_rules(&r);
             *shared.rules.lock().unwrap() = r;
         }
         if let Some(l) = v.get("leases").and_then(|l| serde_json::from_value::<HashMap<String, TaskLease>>(l.clone()).ok()) {
@@ -738,6 +740,7 @@ fn infer_loop(shared: Arc<Shared>, threads: usize, base: String) {
                     });
                 }
             }
+            crate::watch::shard::node::note_media(&batch.observation.media_id, &id, &resolved);
             let legacy = serde_json::json!({"camera_id": id, "camera": name, "at": slot.at, "ts": slot.ts, "seq": slot.seq, "detections": drawn, "thumbnail_hex": thumbnail_hex});
             post_index(&shared, if slot.archive { &arch_agent } else { &live_agent }, &base, &batch, &legacy, slot.archive)
         };
@@ -931,6 +934,14 @@ fn try_once(shared: &Shared, agent: &ureq::Agent, base: &str, batch: &IndexBatch
         }
         ureq::Error::Transport(t) => Posted::Unreachable(format!("head unreachable: {t}")),
     };
+    if let Some(p) = crate::watch::shard::node::commit_and_ack(batch, agent, base) {
+        return match p {
+            crate::watch::shard::node::Post::Ok => Ok(()),
+            crate::watch::shard::node::Post::Stale(e) => Err(Posted::Stale(e)),
+            crate::watch::shard::node::Post::Permanent(e) => Err(Posted::Permanent(e)),
+            crate::watch::shard::node::Post::Unreachable(m) => Err(Posted::Unreachable(m)),
+        };
+    }
     if now_ms() >= shared.legacy_until_ms.load(Ordering::Relaxed) {
         match auth(agent.post(&format!("{base}/api/v1/index"))).send_json(batch) {
             Ok(_) => return Ok(()),
@@ -1019,7 +1030,7 @@ fn heartbeat_loop(shared: Arc<Shared>, base: String, id: String, cores: usize) {
             }
         };
         caps.measured_fps = *shared.measured_fps.lock().unwrap();
-        match auth(agent.post(&format!("{base}/api/v1/heartbeat"))).send_json(serde_json::json!({"worker": id, "caps": caps})) {
+        match auth(agent.post(&format!("{base}/api/v1/heartbeat"))).send_json(serde_json::json!({"worker": id, "caps": caps, "shard": crate::watch::shard::node::announce()})) {
             Ok(r) => {
                 let v: serde_json::Value = r.into_json().unwrap_or_default();
                 if let Some(held) = v.get("leases").and_then(|l| serde_json::from_value::<Vec<LeaseRef>>(l.clone()).ok()) {

@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8"><title>Computers</title>
+<link rel="stylesheet" href="/ui/nodes.css">
+<body style="background:#10141b;color:#d7dde8;font:14px system-ui,sans-serif;margin:24px">
+<h2>Computers</h2>
+<div id="strip"></div>
+<table class="wn-table"><thead><tr><th>Computer</th><th>State</th><th>Recordings</th><th>Frames</th><th>Commit</th><th>Last seen</th></tr></thead><tbody id="rows"></tbody></table>
+<script src="/ui/nodes.js"></script>
+<script>
+async function tick() {
+  try {
+    const j = await (await fetch('/api/v1/nodes')).json();
+    if (!j.shards) { document.getElementById('rows').innerHTML = '<tr><td colspan=6>Shards are off (CW_SHARDS=1 turns them on).</td></tr>'; return; }
+    Watch.nodes.render(document.getElementById('strip'), j.nodes.map((n) => ({ id: n.id, state: n.state, rows: n.observations, elapsed_ms: 0 })));
+    document.getElementById('rows').innerHTML = j.nodes.map((n) => `<tr><td>${n.id}</td><td>${n.state}</td><td>${n.media}</td><td>${n.observations}</td><td>${n.snapshot}</td><td>${n.last_seen_s_ago == null ? 'never' : n.last_seen_s_ago.toFixed(1) + ' s ago'}</td></tr>`).join('');
+  } catch (e) {}
+}
+tick(); setInterval(tick, 2000);
+</script>

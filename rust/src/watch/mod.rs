@@ -36,6 +36,8 @@ mod net;
 mod query;
 mod rules;
 #[allow(dead_code)]
+mod shard;
+#[allow(dead_code)]
 mod scheduler;
 mod split;
 #[allow(dead_code)]

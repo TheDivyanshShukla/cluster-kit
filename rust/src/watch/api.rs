@@ -152,7 +152,7 @@ pub struct Api {
     /// Per job, per segment task: that task's totals. The job's coverage is their sum.
     seg_cov: Mutex<HashMap<String, HashMap<String, Coverage>>>,
     /// Last analyzed frame per source with its own detections, for an in-sync live overlay.
-    latest: Mutex<HashMap<String, serde_json::Value>>,
+    pub(crate) latest: Mutex<HashMap<String, serde_json::Value>>,
     /// Rule diagnostics already written to the audit log: (rule, version, source, code). Each is logged once.
     /// Result of validating the configured models, valid while the module list and model files are unchanged.
     model_cache: Mutex<Option<(String, Vec<(String, Result<ModelVersion, ApiError>)>)>>,
@@ -276,6 +276,10 @@ pub fn handle(api: &Arc<Api>, method: &str, url: &str, body: &[u8], range: Optio
     let parts: Vec<&str> = rest.split('/').collect();
     if rest == "benchmarks" || rest.starts_with("benchmarks/") {
         return crate::watch::bench::handle(api, method, url, body);
+    }
+    // CW_SHARDS=1: shard ack/events, node list, federated browse, media proxy (rust/src/watch/shard).
+    if let Some(r) = crate::watch::shard::route(api, method, url, body, range) {
+        return Some(r);
     }
     let r = match (method, parts.as_slice()) {
         ("POST", ["index"]) => index(api, body),
@@ -413,7 +417,7 @@ pub fn validate_batch(b: &IndexBatch) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn save_thumbnail(api: &Api, obs: &str, hex: &str) -> Result<String, ApiError> {
+pub(crate) fn save_thumbnail(api: &Api, obs: &str, hex: &str) -> Result<String, ApiError> {
     if hex.len() > 600_000 || hex.len() % 2 != 0 {
         return Err(ApiError::new("too_large", "thumbnail exceeds 300KB or has odd hex length"));
     }
@@ -868,10 +872,16 @@ fn evaluate(api: &Api, o: &FrameObservation) {
 #[derive(serde::Deserialize)]
 struct Beat {
     caps: WorkerCaps,
+    /// Present when the worker runs a shard server (`CW_SHARDS=1`).
+    #[serde(default)]
+    shard: Option<crate::watch::shard::Announce>,
 }
 
 fn heartbeat(api: &Api, body: &[u8]) -> Result<Reply, ApiError> {
     let b: Beat = body_json(body)?;
+    if let Some(a) = &b.shard {
+        crate::watch::shard::registry().announce(a);
+    }
     let mut s = api.sched.lock().unwrap();
     s.reap(now_us());
     s.register(b.caps.clone());
@@ -937,6 +947,7 @@ pub fn sync_sources(api: &Api, cams: &[Camera]) {
                 // No recording is retained for live sources yet; replay is unavailable.
                 availability: Availability::Unknown,
                 still: false,
+                node_id: None,
             }
         } else {
             match crate::watch::media_catalog::probe(&c.id, Path::new(&resolved)) {
@@ -1192,11 +1203,14 @@ pub fn camera_state(api: &Api, worker: &str, camera: &str, state: &str, error_co
 
 fn run_query(api: &Api, body: &[u8]) -> Result<Reply, ApiError> {
     let req: q::Request = body_json(body)?;
-    let o = q::run_detailed(&*api.store, &req)?;
+    let mut o = q::run_detailed(&*api.store, &req)?;
+    let fed = crate::watch::shard::finish_run(&*api.store, &mut o.run, &o.matches);
     let (page, next) = q::matches_page(&*api.store, &o.run.id, None, 200)?;
     let match_count = o.matches.len();
     audit(api, req.actor.as_deref(), "query.run", &[&o.run.id], "ok", &format!("{} ({} {})", o.run.normalized, o.run.result_count, o.unit));
-    Ok(Reply::json(&serde_json::json!({ "run": o.run, "match_count": match_count, "matches": page, "next": next, "unit": o.unit, "distinct_tracks": o.distinct_tracks, "values": o.values })))
+    let mut out = serde_json::json!({ "run": o.run, "match_count": match_count, "matches": page, "next": next, "unit": o.unit, "distinct_tracks": o.distinct_tracks, "values": o.values });
+    crate::watch::shard::decorate(&mut out, fed.as_ref());
+    Ok(Reply::json(&out))
 }
 
 /// Validate every configured module against its artifact and record the version.
@@ -1481,7 +1495,7 @@ mod tests {
         api.store.upsert_media(&MediaAsset {
             id: "live1".into(), source_id: "s".into(), uri: "rtsp://cam".into(), fingerprint: "f".into(), duration_us: None,
             width: None, height: None, codec: None, timebase: None, capture_start_utc_us: None, proxy: ProxyStatus::None,
-            availability: Availability::Unknown, still: false,
+            availability: Availability::Unknown, still: false, node_id: None,
         }).unwrap();
         let v = tidy_timeline(&api, serde_json::json!({
             "lanes": [{"media_id": "live1"}],
@@ -1497,7 +1511,7 @@ mod tests {
         let m = MediaAsset {
             id: "m".into(), source_id: "s".into(), uri: "/Users/x/secret/clip.mp4".into(), fingerprint: "f".into(), duration_us: Some(1),
             width: None, height: None, codec: None, timebase: None, capture_start_utc_us: None, proxy: ProxyStatus::None,
-            availability: Availability::Available, still: false,
+            availability: Availability::Available, still: false, node_id: None,
         };
         assert_eq!(public_media(m).uri, "clip.mp4");
     }
