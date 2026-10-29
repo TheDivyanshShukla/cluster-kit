@@ -9,6 +9,16 @@ rayon = "1"
 sha2 = { version = "0.10", features = ["compress"] }   # picks SHA-NI / ARMv8 SHA instructions at runtime when the CPU has them
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 wgpu = { version = "30.0.1", optional = true }
+ort = { version = "=2.0.0-rc.10", optional = true, default-features = false, features = ["std", "download-binaries", "copy-dylibs", "ndarray", "half"] }
+half = { version = "2.1", optional = true, default-features = false }
+ndarray = { version = "0.16", optional = true }
+tiny_http = { version = "0.12", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
+ureq = { version = "2.12", optional = true, features = ["native-tls", "json"] }
+jpeg-encoder = { version = "0.6", optional = true }
+ctrlc = { version = "3", optional = true }
+mlua = { version = "0.10", optional = true, features = ["lua54", "vendored", "send"] }
 
 [profile.release]
 lto = true
@@ -17,3 +27,9 @@ codegen-units = 1
 [features]
 default = ["gpu"]
 gpu = ["dep:wgpu", "dep:pollster"]   # `ck worker --gpu`; build without it: cargo build --release --no-default-features
+watch = ["dep:ort", "dep:ndarray", "dep:half", "dep:tiny_http", "dep:serde", "dep:serde_json", "dep:ureq", "dep:jpeg-encoder", "dep:ctrlc", "dep:mlua"]
+
+[[bin]]
+name = "cw"
+path = "src/cw.rs"
+required-features = ["watch"]

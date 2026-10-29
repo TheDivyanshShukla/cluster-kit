@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 CK="$ROOT/rust/target/release/ck"
+CW="$ROOT/rust/target/release/cw"
 
 usage() {
   cat <<'EOF'
@@ -27,6 +28,11 @@ Cluster Kit
   ./kit rs ping --head IP                   round-trip latency
   ./kit rs build               rebuild after changing rust/
 
+  Cameras (Rust, panel :7710). ffmpeg must be on PATH.
+  ./kit rs watch fetch         download the sample clips and the object model
+  ./kit rs watch head          this PC serves the panel and works too
+  ./kit rs watch worker        every other PC
+
   ./kit fw-clean               remove leftover firewall rules (both engines)
   ./kit tune [on|off]          low-latency network tuning (Linux; until reboot or "off")
 
@@ -38,6 +44,12 @@ py() { uv --project "$ROOT/python" run "$@"; }  # runs from the repo root
 
 need_uv() { command -v uv >/dev/null || { echo "uv missing. Run: ./kit setup"; exit 1; }; }
 need_ck() { [ -x "$CK" ] || { echo "ck not built. Run: ./kit setup rs"; exit 1; }; }
+need_cw() {
+  if [ ! -x "$CW" ]; then
+    echo ">> Building cw. The first build is slow: it downloads the detector runtime."
+    cargo build --release --manifest-path rust/Cargo.toml --bin cw --no-default-features --features watch
+  fi
+}
 
 setup_py() {
   if ! command -v uv >/dev/null; then
@@ -58,7 +70,10 @@ setup_rs() {
   fi
   echo ">> Building ck (release) ..."
   cargo build --release --manifest-path rust/Cargo.toml
+  echo ">> Building cw (release). The first build downloads the detector runtime."
+  cargo build --release --manifest-path rust/Cargo.toml --bin cw --no-default-features --features watch
   echo ">> OK  $CK"
+  echo ">> OK  $CW"
 }
 
 no_sleep() {
@@ -119,7 +134,20 @@ case "$engine" in
     esac ;;
   rs)
     case "$cmd" in
-      build) cargo build --release --manifest-path rust/Cargo.toml ;;
+      build)
+        cargo build --release --manifest-path rust/Cargo.toml
+        cargo build --release --manifest-path rust/Cargo.toml --bin cw --no-default-features --features watch
+        ;;
+      watch)
+        sub="${1:-}"
+        if [ $# -gt 0 ]; then shift; fi
+        case "$sub" in
+          head) need_uv; need_cw; py python/cluster.py fwrun --role vi-head --tcp 7710 -- "$CW" head "$@" ;;
+          worker) need_uv; need_cw; py python/cluster.py fwrun --role vi-worker --udp 7711 -- "$CW" worker "$@" ;;
+          fetch) need_cw; exec "$CW" fetch "$@" ;;
+          *) usage; exit 1 ;;
+        esac
+        ;;
       head) need_uv; need_ck; py python/cluster.py fwrun --role ck-head --tcp 7700,7702 -- "$CK" head "$@" ;;
       worker) need_uv; need_ck; py python/cluster.py fwrun --role ck-worker --udp 7701 -- "$CK" worker "$@" ;;
       run|ping) need_ck; exec "$CK" "$cmd" "$@" ;;

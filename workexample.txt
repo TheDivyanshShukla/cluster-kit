@@ -1,0 +1,1 @@
+./kit py run examples/dask_sha256.py --n 5e7 --chunk 5e5 --prefix 000000 

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch · Setup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="/">Watch</a>
+  <nav>
+    <a href="/">Wall</a>
+    <a href="/find">Find</a>
+    <a href="/analytics">Analytics</a>
+    <a href="/setup" aria-current="page">Setup</a>
+  </nav>
+  <div class="meters">
+    <div class="ops"><b id="f-ops">0</b><span>ops / s</span></div>
+    <div class="lack"><b id="f-lack">0</b><span>lacking / s</span></div>
+    <div><b id="f-pcs">0</b><span>PCs joined</span></div>
+    <div><b id="f-warn">0</b><span>warnings</span></div>
+  </div>
+</header>
+<main>
+  <h1>Setup</h1>
+  <p class="quiet" id="proc-live"></p>
+  <div class="setup-grid">
+    <form id="rule-form">
+      <fieldset>
+        <legend>Rules</legend>
+        <label for="r-name">Name</label>
+        <input id="r-name" required placeholder="Few phones open">
+        <label for="r-cam">Camera</label>
+        <input id="r-cam" placeholder="Empty means each camera on its own">
+        <label for="r-class">Class</label>
+        <input id="r-class" placeholder="cell phone" required>
+        <label for="r-op">When</label>
+        <select id="r-op">
+          <option value="seen">it is seen</option>
+          <option value="gt">count is more than</option>
+          <option value="lt" selected>count is less than</option>
+          <option value="ge">count is at least</option>
+          <option value="le">count is at most</option>
+          <option value="eq">count equals</option>
+        </select>
+        <label for="r-n">Number</label>
+        <input id="r-n" type="number" min="0" value="5">
+        <label for="r-hold">Frames before it asks a person</label>
+        <input id="r-hold" type="number" min="1" value="8">
+        <label for="r-line">Line</label>
+        <textarea id="r-line" rows="2">count("cell phone") &lt; 5</textarea>
+        <p class="quiet">A line can join tests: seen("pistol") or seen("knife"). A count below a number waits until the picture is sharp.</p>
+        <div class="row">
+          <button type="submit">Add rule</button>
+          <button type="button" id="r-save">Save list</button>
+        </div>
+        <p class="err" id="r-err"></p>
+      </fieldset>
+      <div id="rule-list"></div>
+    </form>
+    <form id="mod-form">
+      <fieldset>
+        <legend>Processing</legend>
+        <div class="row" id="presets">
+          <button type="button" data-preset="speed">Speed</button>
+          <button type="button" data-preset="balanced">Balanced</button>
+          <button type="button" data-preset="accuracy">Accuracy</button>
+        </div>
+        <label><input id="blur-on" type="checkbox" checked> Blur filter</label>
+        <label for="blur">Blur threshold</label>
+        <input id="blur" type="number" min="1" max="400" value="40">
+        <label><input id="blank-on" type="checkbox" checked> Skip a blank picture</label>
+        <label><input id="same-on" type="checkbox" checked> Skip a picture that has not changed</label>
+        <label for="same">Change needed</label>
+        <input id="same" type="number" min="0.2" max="40" step="0.1" value="3.5">
+        <label for="every">Look every</label>
+        <select id="every">
+          <option value="1">Every sharp frame</option>
+          <option value="2" selected>Every 2nd</option>
+          <option value="3">Every 3rd</option>
+          <option value="4">Every 4th</option>
+        </select>
+        <label for="width">Detector picture size</label>
+        <select id="width">
+          <option value="320">320</option>
+          <option value="416">416</option>
+          <option value="512" selected>512</option>
+          <option value="640">640</option>
+        </select>
+        <label for="rate">Wall rate</label>
+        <select id="rate">
+          <option value="30">30 fps</option>
+          <option value="60" selected>60 fps</option>
+        </select>
+        <div class="row"><button type="button" id="save-set">Save processing</button></div>
+      </fieldset>
+      <fieldset>
+        <legend>Models</legend>
+        <div id="mod-list"></div>
+        <div class="row"><button type="submit">Save models</button></div>
+        <p class="err" id="m-err"></p>
+      </fieldset>
+    </form>
+  </div>
+</main>
+<script src="/ui/app.js"></script>
+<script src="/ui/setup.js"></script>
+</body>
+</html>

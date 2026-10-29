@@ -5,3 +5,8 @@ rust/target
 examples/primes
 examples/primes.exe
 bench_out
+vision/footage/*
+!vision/footage/.gitkeep
+vision/models/*
+vision/data/
+vision/watch.json

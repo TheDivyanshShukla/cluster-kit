@@ -1,0 +1,17 @@
+{
+  "copies": 8,
+  "blur": 40,
+  "expect_pcs": 0,
+  "process": {
+    "mode": "balanced",
+    "blur_on": true,
+    "blur": 40,
+    "blank_on": true,
+    "same_on": true,
+    "same": 3.5,
+    "every": 2,
+    "width": 512,
+    "rate": 60
+  },
+  "cameras": []
+}

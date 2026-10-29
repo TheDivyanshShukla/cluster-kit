@@ -1,0 +1,34 @@
+[
+  {
+    "id": "fight",
+    "name": "Fight",
+    "camera": "",
+    "line": "seen(\"fight\")",
+    "hold": 8,
+    "enabled": true
+  },
+  {
+    "id": "weapon",
+    "name": "Weapon",
+    "camera": "",
+    "line": "seen(\"pistol\") or seen(\"knife\") or seen(\"gun\")",
+    "hold": 6,
+    "enabled": true
+  },
+  {
+    "id": "phones-many",
+    "name": "Many phones",
+    "camera": "",
+    "line": "count(\"cell phone\") > 40",
+    "hold": 5,
+    "enabled": false
+  },
+  {
+    "id": "phones-few",
+    "name": "Few phones open",
+    "camera": "",
+    "line": "count(\"cell phone\") < 5",
+    "hold": 8,
+    "enabled": false
+  }
+]

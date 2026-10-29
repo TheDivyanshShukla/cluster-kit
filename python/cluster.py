@@ -37,7 +37,7 @@ DISC_PORT = 8785          # UDP discovery beacon
 WORKER_PORTS = "9000:9100"
 NANNY_PORTS = "9101:9200"
 RULE_TAG = "daskcluster"  # every firewall rule we create carries this tag
-ROLES = ("head", "worker", "ck-head", "ck-worker")  # rule groups fw-clean removes
+ROLES = ("head", "worker", "ck-head", "ck-worker", "vi-head", "vi-worker")  # rule groups fw-clean removes
 MAGIC = "pc-cluster/1"
 IS_WIN = os.name == "nt"
 

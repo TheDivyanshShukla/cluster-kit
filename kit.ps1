@@ -4,6 +4,7 @@ $Root = $PSScriptRoot
 Set-Location $Root
 $env:Path = "$env:USERPROFILE\.local\bin;$env:USERPROFILE\.cargo\bin;$env:Path"
 $CK = Join-Path $Root 'rust\target\release\ck.exe'
+$CW = Join-Path $Root 'rust\target\release\cw.exe'
 
 $engine = if ($args.Count -gt 0) { $args[0] } else { 'help' }
 $cmd = if ($args.Count -gt 1) { $args[1] } else { '' }
@@ -30,6 +31,11 @@ Cluster Kit
   kit rs ping --head IP                   round-trip latency
   kit rs build               rebuild after changing rust\
 
+  Cameras (Rust, panel :7710). ffmpeg must be on PATH.
+  kit rs watch fetch         download the sample clips and the object model
+  kit rs watch head          this PC serves the panel and works too
+  kit rs watch worker        every other PC
+
   kit fw-clean               remove leftover firewall rules (both engines)
   kit tune [on|off]          low-latency network tuning (interrupt moderation off, High performance power plan)
 
@@ -53,6 +59,12 @@ function Invoke-Elevated {
 
 function Need-Uv { if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { Write-Host "uv missing. Run: kit setup" -ForegroundColor Red; exit 1 } }
 function Need-Ck { if (-not (Test-Path $CK)) { Write-Host "ck not built. Run: kit setup rs" -ForegroundColor Red; exit 1 } }
+function Need-Cw {
+    if (Test-Path $CW) { return }
+    Write-Host ">> Building cw. The first build is slow: it downloads the detector runtime."
+    cargo build --release --manifest-path rust\Cargo.toml --bin cw --no-default-features --features watch
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 function Py { uv --project "$Root\python" run @args; exit $LASTEXITCODE }  # runs from the repo root
 
 function Setup-Py {
@@ -81,7 +93,11 @@ function Setup-Rs {
         Write-Host "then run: kit setup rs"
         exit 1
     }
+    Write-Host ">> Building cw (release). The first build downloads the detector runtime."
+    cargo build --release --manifest-path rust\Cargo.toml --bin cw --no-default-features --features watch
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Write-Host ">> OK  $CK"
+    Write-Host ">> OK  $CW"
 }
 
 switch ($engine) {
@@ -110,7 +126,20 @@ switch ($engine) {
     }
     'rs' {
         switch ($cmd) {
-            'build' { cargo build --release --manifest-path rust\Cargo.toml }
+            'build' {
+                cargo build --release --manifest-path rust\Cargo.toml
+                cargo build --release --manifest-path rust\Cargo.toml --bin cw --no-default-features --features watch
+            }
+            'watch' {
+                $sub = if ($rest.Count -gt 0) { $rest[0] } else { '' }
+                $more = if ($rest.Count -gt 1) { $rest[1..($rest.Count - 1)] } else { @() }
+                switch ($sub) {
+                    'head' { Need-Uv; Need-Cw; Invoke-Elevated @args; $host.UI.RawUI.WindowTitle = 'kit rs watch head  (Ctrl+C to stop)'; Py python\cluster.py fwrun --role vi-head --tcp 7710 -- $CW head @more }
+                    'worker' { Need-Uv; Need-Cw; Invoke-Elevated @args; $host.UI.RawUI.WindowTitle = 'kit rs watch worker  (Ctrl+C to stop)'; Py python\cluster.py fwrun --role vi-worker --udp 7711 -- $CW worker @more }
+                    'fetch' { Need-Cw; & $CW fetch @more; exit $LASTEXITCODE }
+                    default { Show-Usage; exit 1 }
+                }
+            }
             'head' { Need-Uv; Need-Ck; Invoke-Elevated @args; $host.UI.RawUI.WindowTitle = 'kit rs head  (Ctrl+C to stop)'; Py python\cluster.py fwrun --role ck-head --tcp 7700,7702 -- $CK head @rest }
             'worker' { Need-Uv; Need-Ck; Invoke-Elevated @args; $host.UI.RawUI.WindowTitle = 'kit rs worker  (Ctrl+C to stop)'; Py python\cluster.py fwrun --role ck-worker --udp 7701 -- $CK worker @rest }
             { $_ -in 'run', 'ping' } { Need-Ck; & $CK $cmd @rest; exit $LASTEXITCODE }

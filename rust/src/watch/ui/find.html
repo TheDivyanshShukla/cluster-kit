@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch · Find</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="/">Watch</a>
+  <nav>
+    <a href="/">Wall</a>
+    <a href="/find" aria-current="page">Find</a>
+    <a href="/analytics">Analytics</a>
+    <a href="/setup">Setup</a>
+  </nav>
+  <div class="meters">
+    <div class="ops"><b id="f-ops">0</b><span>ops / s</span></div>
+    <div class="lack"><b id="f-lack">0</b><span>lacking / s</span></div>
+    <div><b id="f-pcs">0</b><span>PCs joined</span></div>
+    <div><b id="f-warn">0</b><span>warnings</span></div>
+  </div>
+</header>
+<main>
+  <h1>Find</h1>
+  <p class="quiet">Search the sighting log by words, a template, or a Lua script. A from and to time limits every mode. Open a moment to play that file.</p>
+  <div class="find-grid">
+    <form id="ask" action="/find">
+      <div class="modes" id="find-modes">
+        <button type="button" data-mode="words" aria-pressed="true">Words</button>
+        <button type="button" data-mode="template">Template</button>
+        <button type="button" data-mode="lua">Lua</button>
+      </div>
+      <div class="row">
+        <label>From<input id="from" type="datetime-local"></label>
+        <label>To<input id="to" type="datetime-local"></label>
+      </div>
+      <div id="mode-words">
+        <label for="q">Words</label>
+        <input id="q" type="search" placeholder="blue person, bicycle, Street">
+      </div>
+      <div id="mode-template" class="hide">
+        <label for="t-class">Class</label>
+        <input id="t-class" placeholder="person">
+        <label for="t-color">Colour</label>
+        <input id="t-color" placeholder="blue">
+        <label for="t-cam">Camera</label>
+        <input id="t-cam" placeholder="Street">
+      </div>
+      <div id="mode-lua" class="hide">
+        <label for="lua">Script</label>
+        <textarea id="lua" rows="8">return function(hit)
+  return hit.class == "person" and hit.at >= 5 and hit.at <= 20
+end</textarea>
+        <p class="quiet">Runs once, on this search. hit.class, hit.color, hit.camera, hit.at (seconds into the file), hit.ts (wall clock). No files, no network.</p>
+      </div>
+      <div class="row">
+        <button type="submit" id="run-find">Search</button>
+        <input id="search-name" placeholder="Name this search" style="max-width: 180px">
+        <button type="button" id="save-search">Save</button>
+      </div>
+      <p class="err" id="find-err"></p>
+      <h2>Saved searches</h2>
+      <div id="saved"></div>
+    </form>
+    <section>
+      <p class="quiet" id="hit-count">Search to list moments.</p>
+      <div id="hits"></div>
+    </section>
+  </div>
+</main>
+<script src="/ui/app.js"></script>
+<script src="/ui/find.js"></script>
+</body>
+</html>

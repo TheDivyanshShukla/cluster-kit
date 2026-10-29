@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watch · Analytics</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="/">Watch</a>
+  <nav>
+    <a href="/">Wall</a>
+    <a href="/find">Find</a>
+    <a href="/analytics" aria-current="page">Analytics</a>
+    <a href="/setup">Setup</a>
+  </nav>
+  <div class="meters">
+    <div class="ops"><b id="f-ops">0</b><span>ops / s</span></div>
+    <div class="lack"><b id="f-lack">0</b><span>lacking / s</span></div>
+    <div><b id="f-pcs">0</b><span>PCs joined</span></div>
+    <div><b id="f-warn">0</b><span>warnings</span></div>
+  </div>
+</header>
+<main>
+  <h1>Analytics</h1>
+  <p class="quiet" id="sentence"></p>
+  <div class="charts">
+    <section>
+      <h2>Operations and frames lacking</h2>
+      <canvas class="chart" id="trend" width="900" height="220"></canvas>
+      <p class="quiet">Teal is operations. Ember is frames lacking. About the last minute.</p>
+      <h2>Lacking by camera</h2>
+      <div id="lack-bars"></div>
+    </section>
+    <section>
+      <h2>What was seen</h2>
+      <div id="mix"></div>
+    </section>
+  </div>
+  <h2>Cluster</h2>
+  <div class="scroll"><table id="matrix"></table></div>
+  <p class="footnote" id="foot"></p>
+</main>
+<script src="/ui/app.js"></script>
+<script src="/ui/analytics.js"></script>
+</body>
+</html>
