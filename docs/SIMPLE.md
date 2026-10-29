@@ -12,13 +12,17 @@ python examples/simple_sha256.py --n 5e7         # bigger job
 
 ## Network cluster
 
+Works with either engine. `--cluster` uses whichever head is running on this PC.
+
 1. Head PC:
    ```
-   ./kit py head
+   ./kit py head        # Dask engine
+   ./kit rs head        # or: Rust engine
    ```
-2. Every other PC (same network):
+2. Every other PC (same network), same engine as the head:
    ```
    ./kit py worker
+   ./kit rs worker
    ```
 3. Head PC, run the job:
    ```
@@ -27,7 +31,7 @@ python examples/simple_sha256.py --n 5e7         # bigger job
 
 The last output line `Ran on: cluster (N workers)` shows how many PCs joined. Use a big `--n`; a small job finishes before the network pays off.
 
-The job runs from the head PC only. Workers just need the kit folder set up (see the README).
+The job runs from the head PC only. Workers just need the kit folder set up (see the README). With the Rust engine, each worker runs `uv run --project python examples/simple_sha256.py START END` from its kit folder, so the file must be there on every PC. That Python start-up per chunk makes the Rust path slower than Dask for this Python job.
 
 ## Compare
 
