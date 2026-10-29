@@ -11,22 +11,24 @@ cd cluster-kit
 CW_AUTH=off rust/target-c2/release/cw head
 ```
 
-Open http://127.0.0.1:7710. `CW_AUTH=off` means no sign-in and only this Mac can reach it. For a shared demo with sign-in, start without `CW_AUTH=off`; the admin account is `admin` (password changed on `/login`).
+Open http://127.0.0.1:7710. `CW_AUTH=off` means no sign-in and only this Mac can reach it. For a shared demo with sign-in, start without it (admin account `admin`; change the password on `/login`). For other PCs to join, start with `CW_BIND=0.0.0.0` (see docs/CLUSTER_DEMO.md).
+
+All nine cameras are replays of recorded footage that behave like live cameras: red LIVE dot, an honest "replayed from recording" label, real-time playback on a loop. They are set to `analyze: false` in `vision/watch.json`: the detections were computed earlier and the wall draws them on the playing video, so the Mac stays nearly idle. The four school cameras start at about minute 51 of their hour (the busiest part) every time the server starts, and stay in step with each other.
 
 Before going on stage:
-1. Wait until indexing is finished: Sources page shows every job as "completed". Indexing of the four MEVA hours needs the Mac mostly to itself (about 3 hours when everything runs at once).
-2. Close other heavy apps. The wall plays nine cameras and the detector runs on the Neural Engine.
-3. Do one full click-through the evening before (script: `scratchpad/demo.cjs`, or follow the path below).
+1. Start Watch about a minute before presenting, so the cameras open on the busy stretch and the first video seeks are cached.
+2. Close other heavy apps and check the wall plays (nine tiles, boxes on people).
+3. Do one full click-through the evening before (`scratchpad/demo.cjs` runs the same path and saves screenshots to `docs/evidence/demo/`).
 
 ## Click path (about 6 minutes)
 
-1. **Live** (`/`): the CCTV wall, nine cameras. Press `2` for 2×2, `A` for auto. Click a tile to solo it, `Esc` to return. Toggle "Trails". Say: boxes are drawn on the exact frame the detector analysed, so they always line up.
-2. **Sources**: nine sources, each with indexing progress. Say: each source keeps its own timeline.
-3. **Search** (`/find`): tick the four MEVA cameras, SQL tab, run
+1. **Live** (`/`): the CCTV wall, nine cameras. Press `2` for 2x2, `A` for auto, `V` cycles Video + boxes / Analyzed frames / Live preview. Click a tile to solo it, `Esc` to return. Toggle "Trails". Say: boxes glide between stored detections and sit on the exact video frame.
+2. **Sources**: nine sources with indexing coverage.
+3. **Search** (`/find`): tick the four MEVA cameras, SQL tab. Start typing to show autocomplete (`SEL`, `FROM d`, `WHERE c`, `class = '`). Run
    `SELECT * FROM detections WHERE class = 'person' AND confidence >= 0.6`
-   (about 5–8 s; it stops at 100,000 rows and says so). Click **Open in review**.
-4. **Review**: four camera lanes in parallel, filmstrips under each match. Click a strip, press Space to play, `]` for next match, `+`/`-` zoom, "Matched only" to skip the gaps, `A` to add a clip, Save, then export the manifest.
-5. **Search, Lua tab**: show a loop over frames with two or more people:
+   (about 5 s; it stops at 100,000 rows and says so). Click **Open in review**.
+4. **Review**: four camera lanes in parallel, filmstrips under each match. Click a strip, press Space to play, `]` for next match, `+`/`-` zoom, "Matched only", `A` to add a clip, Save, export the manifest.
+5. **Search, Lua tab**: type `for f in db.` to show suggestions, then run a loop over frames with two or more people:
    ```lua
    for f in db.frames{} do
      local n = f.counts.person
@@ -34,8 +36,9 @@ Before going on stage:
    end
    ```
    Pick the four MEVA cameras in the scope first. Open it in review.
-6. **Rules & models** (`/setup`): the "Measured on your cameras" panel: quiet cameras skip most detector work (for example 96% on the empty hall camera), moving drone cameras save nothing. Show a preset change but do not save.
-7. **Activity**: every action above is in the audit log.
+6. **Rules & models** (`/setup`): the "Measured on your cameras" panel (quiet cameras skip most detector work; moving drone cameras save nothing). Show a preset change but do not save.
+7. **Cluster** (`/analytics`): joined computers, the Realtime panel (camera to computer map, lag, capacity) and the Benchmark panel. **Join a PC** (`/join`) shows the one-line command and pairing code. Follow docs/CLUSTER_DEMO.md for the multi-PC part.
+8. **Activity**: every action above is in the audit log.
 
 ## What to say, and not to say
 
@@ -44,14 +47,14 @@ Before going on stage:
 - Accuracy so far is a small check: 24 sampled MEVA frames, one annotator, 19 usable: 13 of 17 people found, no false detections. Misses were partly visible people and tiny figures far down a hallway. Models are marked "unvalidated".
 - Capture clocks of the MEVA clips are unknown to Watch, so lanes align by media time (the cameras were recording the same hour), and "align UTC" is not available.
 - Confidence is the detector's score, not a probability of being correct.
-- Fight and Weapon rules are off: there is no model behind them.
+- Fight and Weapon rules are off: there is no model behind them.\n- The cameras are recorded footage replayed as live cameras; say so if asked. Because the footage was analysed in advance, replays do not raise new alerts.
 
 ## If something goes wrong
 
 | Symptom | What to do |
 | --- | --- |
-| Wall tiles show "Waiting for first frame" | Wait 10–20 s after start; the worker is starting. Refresh once. |
-| Search says "Running…" for a long time | The Mac is busy indexing. Scope the search to one or two cameras. |
+| Wall tiles are black for a moment | The first video seek into a big file takes a few seconds; the analysed still shows meanwhile. Refresh once. |
+| Search says "Running…" for a long time | Scope the search to one or two cameras (searches over everything stop at 100,000 rows). |
 | A page looks stale | Hard refresh (Cmd+Shift+R). |
 | Server not responding | Start it again with the command above; nothing is lost, data is in `vision/data`. |
 | Need to show something offline | Screenshots from the last full rehearsal are in `docs/evidence/demo/`. |

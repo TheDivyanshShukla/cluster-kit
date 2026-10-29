@@ -8,5 +8,5 @@
 .wn-chip.down::before { background: #f85149; }
 .wn-chip small { opacity: .7; }
 .wn-banner { flex-basis: 100%; padding: 6px 10px; border-radius: 6px; background: #3a2a10; border: 1px solid #8a6414; color: #f2d58a; }
-table.wn-table { border-collapse: collapse; width: 100%; font: 13px system-ui, sans-serif; }
+table.wn-table { border-collapse: collapse; width: 100%; font: 13px system-ui, sans-serif; display: block; overflow-x: auto; max-width: 100%; }
 .wn-table th, .wn-table td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #2a303b; }

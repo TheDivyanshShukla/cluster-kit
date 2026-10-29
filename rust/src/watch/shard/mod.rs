@@ -417,10 +417,14 @@ pub fn wrap_store(store: Arc<dyn Store>, data: &Path) -> Arc<dyn Store> {
 
 /// api.rs `handle()`, first line: head-side shard routes and the media proxy.
 pub fn route(api: &Arc<Api>, method: &str, url: &str, body: &[u8], range: Option<&str>) -> Option<Reply> {
+    let path = url.split('?').next().unwrap_or(url);
     if !enabled() {
+        // The Computers page asks even when sharding is off: answer plainly instead of a 404.
+        if method == "GET" && path == "/api/v1/nodes" {
+            return Some(Reply::json(&serde_json::json!({ "nodes": [], "shards": false })));
+        }
         return None;
     }
-    let path = url.split('?').next().unwrap_or(url);
     let rest = path.strip_prefix("/api/v1/")?;
     let parts: Vec<&str> = rest.split('/').collect();
     let r = match (method, parts.as_slice()) {
