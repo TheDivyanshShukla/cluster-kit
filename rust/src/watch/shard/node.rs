@@ -219,17 +219,18 @@ impl NodeClient for LocalShard {
 pub struct HttpClient {
     base: String,
     secret: String,
+    /// One pooled agent per node: keeps connections alive instead of opening a socket per call.
+    agent: ureq::Agent,
 }
 
 impl HttpClient {
     pub fn new(base: &str, secret: &str) -> Self {
-        HttpClient { base: base.trim_end_matches('/').into(), secret: secret.into() }
+        HttpClient { base: base.trim_end_matches('/').into(), secret: secret.into(), agent: ureq::AgentBuilder::new().max_idle_connections_per_host(16).timeout_connect(Duration::from_secs(2)).build() }
     }
 
     fn call<T: DeserializeOwned>(&self, path: &str, body: Option<serde_json::Value>, d: Duration) -> StoreResult<T> {
-        let agent = ureq::AgentBuilder::new().timeout(d.max(Duration::from_millis(1))).build();
         let url = format!("{}/api/v1/shard/{path}", self.base);
-        let req = if body.is_some() { agent.post(&url) } else { agent.get(&url) }.set("Authorization", &format!("Bearer {}", self.secret));
+        let req = if body.is_some() { self.agent.post(&url) } else { self.agent.get(&url) }.timeout(d.max(Duration::from_millis(1))).set("Authorization", &format!("Bearer {}", self.secret));
         let resp = match body {
             Some(b) => req.send_json(b),
             None => req.call(),

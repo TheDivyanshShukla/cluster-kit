@@ -122,16 +122,23 @@ impl FederatedStore {
             Some(a) => Cursor::decode(a)?,
             None => Cursor { v: with_ctx(|c| c.vector.clone()), ..Default::default() },
         };
-        // Give up on nodes that already failed in this run; they stay flagged.
+        // Give up on nodes that already failed in this run (or cannot be reached); they stay flagged if this read needs them.
+        let plan = self.plan(f);
         let failed_before = with_ctx(|c| c.failed.clone());
-        for id in cur.x.iter().chain(failed_before.iter()) {
-            with_ctx(|c| {
-                c.failed.insert(id.clone());
-                c.stats.entry(id.clone()).or_default();
-            });
+        for id in &plan {
+            if failed_before.contains(id) || cur.x.contains(id) {
+                with_ctx(|c| {
+                    c.failed.insert(id.clone());
+                    let err = c.early.get(id).cloned();
+                    let s = c.stats.entry(id.clone()).or_default();
+                    if s.error.is_none() {
+                        s.error = err;
+                    }
+                });
+                cur.x.insert(id.clone());
+            }
         }
-        cur.x.extend(failed_before);
-        let ids: Vec<String> = self.plan(f).into_iter().filter(|id| !cur.d.contains(id) && !cur.x.contains(id)).collect();
+        let ids: Vec<String> = plan.into_iter().filter(|id| !cur.d.contains(id) && !cur.x.contains(id)).collect();
         let reqs: HashMap<String, ShardReq> = ids
             .iter()
             .map(|id| (id.clone(), ShardReq { filter: f.clone(), page: Page { after: cur.p.get(id).cloned(), limit: limit as u32 }, snapshot: cur.v.get(id).copied(), predicate }))
@@ -336,23 +343,37 @@ impl Store for FederatedStore {
         let _ = take_run();
         let ids = self.reg.ids();
         let live: Vec<String> = ids.iter().filter(|id| self.reg.state(id) != State::Down).cloned().collect();
-        let res = self.scatter(&live, false, |_, c, _| c.status(Duration::from_millis(800)));
+        let res = self.scatter(&live, false, |_, c, _| c.status(Duration::from_millis(1000)));
         let mut vector: BTreeMap<String, u64> = BTreeMap::new();
         for id in &ids {
             if let Some(n) = self.reg.get(id) {
                 vector.insert(id.clone(), n.snapshot);
             }
         }
+        let mut early = BTreeMap::new();
         for (id, r, _) in res {
-            if let Ok(s) = r {
-                if id != "head" {
-                    self.reg.update_status(&id, &s);
+            match r {
+                Ok(s) => {
+                    if id != "head" {
+                        self.reg.update_status(&id, &s);
+                    }
+                    vector.insert(id, s.snapshot);
                 }
-                vector.insert(id, s.snapshot);
+                Err(e) => {
+                    early.insert(id, e.message);
+                }
             }
         }
+        for id in ids.iter().filter(|id| !live.contains(id)) {
+            early.insert(id.clone(), format!("computer {id} is not answering"));
+        }
         let total = vector.values().sum();
-        with_ctx(|c| c.vector = vector);
+        with_ctx(|c| {
+            c.vector = vector;
+            // A node that cannot even report its sequence is skipped for the whole run: one wait, not one per scan.
+            c.failed.extend(early.keys().cloned());
+            c.early = early;
+        });
         Ok(total)
     }
 }

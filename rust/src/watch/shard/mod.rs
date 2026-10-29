@@ -325,6 +325,8 @@ pub struct RunCtx {
     pub vector: BTreeMap<String, u64>,
     pub stats: BTreeMap<String, NodeStat>,
     pub failed: BTreeSet<String>,
+    /// Why a node was given up before any read (its commit-sequence poll timed out or was refused).
+    pub early: BTreeMap<String, String>,
 }
 
 thread_local! {
