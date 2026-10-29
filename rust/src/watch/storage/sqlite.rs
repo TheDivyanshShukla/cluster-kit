@@ -71,10 +71,20 @@ CREATE TABLE commits(seq INTEGER PRIMARY KEY AUTOINCREMENT, observation_id TEXT 
 "#;
 
 /// Numbered, append-only list. Never edit an applied entry; add a new one.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2];
+
+/// Pages of a filtered detection query are read in (media, time, id) order. These indexes hold the rows in that
+/// order behind the equality filter, so SQLite walks them instead of sorting every match for every page.
+const SCHEMA_V2: &str = "
+CREATE INDEX IF NOT EXISTS det_class_order ON detections(class, media_id, media_time_us, detection_id);
+CREATE INDEX IF NOT EXISTS det_source_class_order ON detections(source_id, class, media_id, media_time_us, detection_id);
+";
 
 pub struct Sqlite {
     conn: Mutex<Connection>,
+    /// Second connection for reads. In WAL mode readers do not block on writers, so a query over a large
+    /// index is not stalled by the cameras committing batches. `None` for `:memory:` (one shared database).
+    read: Option<Mutex<Connection>>,
 }
 
 fn now_us() -> i64 {
@@ -144,7 +154,12 @@ impl Sqlite {
         if let Some(p) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(p).map_err(ie)?;
         }
-        Self::init(Connection::open(path).map_err(db)?)
+        let mut me = Self::init(Connection::open(path).map_err(db)?)?;
+        let r = Connection::open(path).map_err(db)?;
+        r.busy_timeout(Duration::from_secs(5)).map_err(db)?;
+        r.pragma_update(None, "query_only", true).map_err(db)?;
+        me.read = Some(Mutex::new(r));
+        Ok(me)
     }
 
     pub fn memory() -> StoreResult<Self> {
@@ -157,11 +172,16 @@ impl Sqlite {
         c.pragma_update(None, "synchronous", "NORMAL").map_err(db)?;
         c.pragma_update(None, "foreign_keys", true).map_err(db)?;
         migrate(&mut c)?;
-        Ok(Sqlite { conn: Mutex::new(c) })
+        Ok(Sqlite { conn: Mutex::new(c), read: None })
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Connection for read-only methods (see `read`).
+    fn rlock(&self) -> MutexGuard<'_, Connection> {
+        self.read.as_ref().unwrap_or(&self.conn).lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -218,7 +238,9 @@ fn build_filter(f: &DetectionFilter, c: &Cols) -> (String, Vec<Value>) {
         in_list(col, &f.classes, &mut w, &mut p);
     }
     if let (Some(col), Some(m)) = (c.conf, f.min_confidence) {
-        w.push(format!("{col} >= ?"));
+        // Unary plus: keep SQLite from choosing the (class, confidence) index for this range. That plan forces a
+        // sort of every match for the first page; the (class, media, time, id) index returns rows already in order.
+        w.push(format!("+{col} >= ?"));
         p.push(Value::Real(m as f64));
     }
     if let Some(col) = c.model {
@@ -289,7 +311,7 @@ impl Store for Sqlite {
     }
 
     fn sources(&self) -> StoreResult<Vec<Source>> {
-        get_all(&self.lock(), "SELECT body FROM sources ORDER BY id", &[])
+        get_all(&self.rlock(), "SELECT body FROM sources ORDER BY id", &[])
     }
 
     fn upsert_media(&self, m: &MediaAsset) -> StoreResult<()> {
@@ -304,11 +326,11 @@ impl Store for Sqlite {
     }
 
     fn media(&self, id: &str) -> StoreResult<Option<MediaAsset>> {
-        get_one(&self.lock(), "SELECT body FROM media WHERE id=?1", id)
+        get_one(&self.rlock(), "SELECT body FROM media WHERE id=?1", id)
     }
 
     fn media_for_source(&self, source_id: &str) -> StoreResult<Vec<MediaAsset>> {
-        get_all(&self.lock(), "SELECT body FROM media WHERE source_id=?1 ORDER BY id", &[&source_id])
+        get_all(&self.rlock(), "SELECT body FROM media WHERE source_id=?1 ORDER BY id", &[&source_id])
     }
 
     fn upsert_model(&self, m: &ModelVersion) -> StoreResult<()> {
@@ -319,7 +341,7 @@ impl Store for Sqlite {
     }
 
     fn models(&self) -> StoreResult<Vec<ModelVersion>> {
-        get_all(&self.lock(), "SELECT body FROM model_versions ORDER BY id", &[])
+        get_all(&self.rlock(), "SELECT body FROM model_versions ORDER BY id", &[])
     }
 
     fn upsert_job(&self, j: &IndexJob) -> StoreResult<()> {
@@ -327,11 +349,11 @@ impl Store for Sqlite {
     }
 
     fn job(&self, id: &str) -> StoreResult<Option<IndexJob>> {
-        get_one(&self.lock(), "SELECT body FROM jobs WHERE id=?1", id)
+        get_one(&self.rlock(), "SELECT body FROM jobs WHERE id=?1", id)
     }
 
     fn jobs(&self) -> StoreResult<Vec<IndexJob>> {
-        get_all(&self.lock(), "SELECT body FROM jobs ORDER BY created_utc_us DESC, id", &[])
+        get_all(&self.rlock(), "SELECT body FROM jobs ORDER BY created_utc_us DESC, id", &[])
     }
 
     fn commit_batch(&self, b: &IndexBatch) -> StoreResult<BatchOutcome> {
@@ -429,7 +451,7 @@ impl Store for Sqlite {
     fn detections(&self, f: &DetectionFilter, page: &Page) -> StoreResult<(Vec<(FrameObservation, Detection)>, Option<String>)> {
         let cols = Cols { source: "d.source_id", media: "d.media_id", class: Some("d.class"), conf: Some("d.confidence"), model: Some("d.model_version"), track: Some("d.track_id"), mtime: "d.media_time_us", utc: "d.capture_time_utc_us" };
         keyset(
-            &self.lock(),
+            &self.rlock(),
             "SELECT o.body, d.body, d.media_id, d.media_time_us, d.detection_id FROM detections d JOIN observations o ON o.observation_id=d.observation_id",
             build_filter(f, &cols),
             ["d.media_id", "d.media_time_us", "d.detection_id"],
@@ -441,12 +463,12 @@ impl Store for Sqlite {
     fn count_detections(&self, f: &DetectionFilter) -> StoreResult<u64> {
         let cols = Cols { source: "source_id", media: "media_id", class: Some("class"), conf: Some("confidence"), model: Some("model_version"), track: Some("track_id"), mtime: "media_time_us", utc: "capture_time_utc_us" };
         let (w, p) = build_filter(f, &cols);
-        let n: i64 = self.lock().query_row(&format!("SELECT COUNT(*) FROM detections WHERE {w}"), params_from_iter(p.iter()), |r| r.get(0)).map_err(db)?;
+        let n: i64 = self.rlock().query_row(&format!("SELECT COUNT(*) FROM detections WHERE {w}"), params_from_iter(p.iter()), |r| r.get(0)).map_err(db)?;
         Ok(n as u64)
     }
 
     fn observations(&self, media_id: &str, from_us: Us, to_us: Us) -> StoreResult<Vec<(FrameObservation, Vec<Detection>, Vec<Relation>)>> {
-        let c = self.lock();
+        let c = self.rlock();
         let obs: Vec<FrameObservation> = get_all(&c, "SELECT body FROM observations WHERE media_id=?1 AND media_time_us BETWEEN ?2 AND ?3 ORDER BY media_time_us, observation_id", &[&media_id, &from_us, &to_us])?;
         let mut out = Vec::with_capacity(obs.len());
         for o in obs {
@@ -465,7 +487,7 @@ impl Store for Sqlite {
             w.push_str(&format!(" AND EXISTS(SELECT 1 FROM json_each(json_extract(body,'$.class_counts')) WHERE key IN ({}))", vec!["?"; f.classes.len()].join(",")));
             p.extend(f.classes.iter().map(|c| Value::Text(c.clone())));
         }
-        keyset(&self.lock(), "SELECT body, media_id, media_time_us, observation_id FROM frame_summaries", (w, p), ["media_id", "media_time_us", "observation_id"], page, |r| de(&r.get::<_, String>(0).map_err(db)?))
+        keyset(&self.rlock(), "SELECT body, media_id, media_time_us, observation_id FROM frame_summaries", (w, p), ["media_id", "media_time_us", "observation_id"], page, |r| de(&r.get::<_, String>(0).map_err(db)?))
     }
 
     /// `classes` filters the object class; `model_versions` the relation module; `track_ids` the subject track.
@@ -476,7 +498,7 @@ impl Store for Sqlite {
             w.push_str(" AND predicate = ?");
             p.push(Value::Text(tag(&pr)));
         }
-        keyset(&self.lock(), "SELECT body, media_id, media_time_us, relation_id FROM relations", (w, p), ["media_id", "media_time_us", "relation_id"], page, |r| de(&r.get::<_, String>(0).map_err(db)?))
+        keyset(&self.rlock(), "SELECT body, media_id, media_time_us, relation_id FROM relations", (w, p), ["media_id", "media_time_us", "relation_id"], page, |r| de(&r.get::<_, String>(0).map_err(db)?))
     }
 
     fn save_query_run(&self, q: &QueryRun, matches: &[ReviewMatch]) -> StoreResult<()> {
@@ -495,13 +517,13 @@ impl Store for Sqlite {
     }
 
     fn query_run(&self, id: &str) -> StoreResult<Option<QueryRun>> {
-        get_one(&self.lock(), "SELECT body FROM query_runs WHERE id=?1", id)
+        get_one(&self.rlock(), "SELECT body FROM query_runs WHERE id=?1", id)
     }
 
     fn matches(&self, query_run_id: &str, page: &Page) -> StoreResult<(Vec<ReviewMatch>, Option<String>)> {
         let after = seq_cursor(page)?.unwrap_or(0);
         let limit = page.limit.clamp(1, 10_000) as i64;
-        let c = self.lock();
+        let c = self.rlock();
         let mut st = c.prepare_cached("SELECT seq, body FROM review_matches WHERE query_run_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3").map_err(db)?;
         let mut rows = st.query(params![query_run_id, after, limit + 1]).map_err(db)?;
         let (mut out, mut last, mut more) = (Vec::new(), None, false);
@@ -518,7 +540,7 @@ impl Store for Sqlite {
 
     /// Match IDs are unique per query run; if several runs reuse one ID the newest wins.
     fn review_match(&self, id: &str) -> StoreResult<Option<ReviewMatch>> {
-        get_one(&self.lock(), "SELECT body FROM review_matches WHERE id=?1 ORDER BY seq DESC LIMIT 1", id)
+        get_one(&self.rlock(), "SELECT body FROM review_matches WHERE id=?1 ORDER BY seq DESC LIMIT 1", id)
     }
 
     fn save_review(&self, r: &ReviewSelection, expected_version: Option<u64>) -> StoreResult<ReviewSelection> {
@@ -550,11 +572,11 @@ impl Store for Sqlite {
     }
 
     fn review(&self, id: &str) -> StoreResult<Option<ReviewSelection>> {
-        get_one(&self.lock(), "SELECT body FROM reviews WHERE id=?1", id)
+        get_one(&self.rlock(), "SELECT body FROM reviews WHERE id=?1", id)
     }
 
     fn reviews(&self) -> StoreResult<Vec<ReviewSelection>> {
-        get_all(&self.lock(), "SELECT body FROM reviews ORDER BY updated_utc_us DESC, id", &[])
+        get_all(&self.rlock(), "SELECT body FROM reviews ORDER BY updated_utc_us DESC, id", &[])
     }
 
     fn upsert_alert(&self, a: &Alert) -> StoreResult<()> {
@@ -570,7 +592,7 @@ impl Store for Sqlite {
 
     /// Newest first; cursor is the last returned sequence.
     fn alerts(&self, page: &Page) -> StoreResult<(Vec<Alert>, Option<String>)> {
-        seq_desc(&self.lock(), "SELECT seq, body FROM alerts WHERE seq<?1 ORDER BY seq DESC LIMIT ?2", page, &[])
+        seq_desc(&self.rlock(), "SELECT seq, body FROM alerts WHERE seq<?1 ORDER BY seq DESC LIMIT ?2", page, &[])
     }
 
     /// Append-only (triggers reject UPDATE/DELETE). A repeated `id` is ignored, which makes legacy replays safe.
@@ -587,9 +609,9 @@ impl Store for Sqlite {
     /// Newest first. `text` is a case-insensitive substring over actor/action/targets/result/detail.
     fn audit_log(&self, text: Option<&str>, page: &Page) -> StoreResult<(Vec<AuditRecord>, Option<String>)> {
         match text.filter(|t| !t.is_empty()) {
-            None => seq_desc(&self.lock(), "SELECT seq, body FROM audit WHERE seq<?1 ORDER BY seq DESC LIMIT ?2", page, &[]),
+            None => seq_desc(&self.rlock(), "SELECT seq, body FROM audit WHERE seq<?1 ORDER BY seq DESC LIMIT ?2", page, &[]),
             Some(t) => seq_desc(
-                &self.lock(),
+                &self.rlock(),
                 "SELECT seq, body FROM audit WHERE seq<?1 AND instr(lower(actor||' '||action||' '||targets||' '||result||' '||detail), lower(?3))>0 ORDER BY seq DESC LIMIT ?2",
                 page,
                 &[&t],
@@ -598,7 +620,7 @@ impl Store for Sqlite {
     }
 
     fn snapshot(&self) -> StoreResult<u64> {
-        snapshot_of(&self.lock())
+        snapshot_of(&self.rlock())
     }
 }
 

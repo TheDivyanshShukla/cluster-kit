@@ -142,6 +142,8 @@ pub struct Api {
     /// Last analyzed frame per source with its own detections, for an in-sync live overlay.
     latest: Mutex<HashMap<String, serde_json::Value>>,
     /// Rule diagnostics already written to the audit log: (rule, version, source, code). Each is logged once.
+    /// Result of validating the configured models, valid while the module list and model files are unchanged.
+    model_cache: Mutex<Option<(String, Vec<(String, Result<ModelVersion, ApiError>)>)>>,
     diag_seen: Mutex<std::collections::HashSet<(String, String, String, String)>>,
     pub auth: crate::watch::auth::Auth,
 }
@@ -168,6 +170,7 @@ impl Api {
             held: Mutex::new(HashMap::new()),
             catalog: Mutex::new(HashMap::new()),
             latest: Mutex::new(HashMap::new()),
+            model_cache: Mutex::new(None),
             diag_seen: Mutex::new(Default::default()),
             auth,
         }
@@ -250,7 +253,8 @@ pub fn handle(api: &Arc<Api>, method: &str, url: &str, body: &[u8], range: Optio
             q::timeline(&*api.store, id, start, end, res).map(|v| Reply::json(&tidy_timeline(api, v)))
         })(),
         ("GET", ["models"]) => models(api),
-        ("GET", ["live", id, "latest"]) => api.latest.lock().unwrap().get(*id).cloned().map(|v| Reply::json(&v)).ok_or_else(|| missing("analyzed frame")),
+        // No analyzed frame yet is a normal state for a camera that just started: 204, not an error.
+        ("GET", ["live", id, "latest"]) => Ok(api.latest.lock().unwrap().get(*id).cloned().map(|v| Reply::json(&v)).unwrap_or(Reply { status: 204, ctype: "application/json", body: Vec::new(), headers: Vec::new() })),
         ("GET", ["observations", id, "thumbnail"]) => {
             std::fs::read(api.data_dir.join("thumbs").join(format!("{}.jpg", sanitize(id)))).map(|b| Reply::bytes(b, "image/jpeg")).map_err(|_| missing("thumbnail"))
         }
@@ -448,7 +452,13 @@ fn secs(us: Us) -> String {
 
 /// One JPEG at a media time. Input-side seek with re-encode is frame-accurate in FFmpeg >= 2.1.
 fn frame(api: &Api, id: &str, url: &str) -> Result<Reply, ApiError> {
-    let (m, path) = media_file(api, id)?;
+    // Thumbnails of media with no original on this head (legacy imports, deleted files) are simply absent:
+    // 204 lets the page show its placeholder without a failing request.
+    let (m, path) = match media_file(api, id) {
+        Ok(v) => v,
+        Err(e) if e.code == "unavailable" => return Ok(Reply { status: 204, ctype: "image/jpeg", body: Vec::new(), headers: Vec::new() }),
+        Err(e) => return Err(e),
+    };
     let t = us_param(url, "t_us")?.unwrap_or(0).max(0);
     let width: u32 = param(url, "w").and_then(|s| s.parse().ok()).unwrap_or(320).clamp(32, 1920);
     let mut args = Vec::new();
@@ -1005,12 +1015,28 @@ fn run_query(api: &Api, body: &[u8]) -> Result<Reply, ApiError> {
 
 /// Validate every configured module against its artifact and record the version.
 pub fn register_models(api: &Api) -> Vec<(String, Result<ModelVersion, ApiError>)> {
-    let out: Vec<_> = crate::watch::config::load_modules().into_iter().filter(|m| m.kind != "fight").map(|m| (m.id.clone(), crate::watch::models::validate(&m))).collect();
+    let modules: Vec<_> = crate::watch::config::load_modules().into_iter().filter(|m| m.kind != "fight").collect();
+    // Validation hashes the artifact and loads it once; redo it only when a module or its file changed.
+    let key: String = modules
+        .iter()
+        .map(|m| {
+            let meta = std::fs::metadata(crate::watch::config::resolve_url(&m.model)).ok();
+            let stamp = meta.map(|x| (x.len(), x.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)));
+            format!("{}|{}|{}|{:?};", m.id, m.model, m.enabled, stamp)
+        })
+        .collect();
+    if let Some((k, v)) = api.model_cache.lock().unwrap().as_ref() {
+        if *k == key {
+            return v.clone();
+        }
+    }
+    let out: Vec<_> = modules.into_iter().map(|m| (m.id.clone(), crate::watch::models::validate(&m))).collect();
     for (_, r) in &out {
         if let Ok(mv) = r {
             let _ = api.store.upsert_model(mv);
         }
     }
+    *api.model_cache.lock().unwrap() = Some((key, out.clone()));
     out
 }
 

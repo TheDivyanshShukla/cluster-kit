@@ -246,7 +246,7 @@ async function pollFrames() {
       let v;
       try {
         const r = await fetch("/api/v1/live/" + encodeURIComponent(id) + "/latest", { cache: "no-store", credentials: "same-origin" });
-        if (!r.ok) { if (!frames[id]) { el.dataset.sig = ""; } return; }
+        if (r.status === 204 || !r.ok) { if (!frames[id]) { el.dataset.sig = ""; } return; }
         v = await r.json();
       } catch (_) { return; }
       const cur = frames[id];

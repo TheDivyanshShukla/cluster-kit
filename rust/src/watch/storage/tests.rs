@@ -135,8 +135,19 @@ fn crash_restart_keeps_data_and_snapshot() {
     assert_eq!(s.job("j").unwrap().unwrap().checkpoint["m"], 19_000);
     assert!(s.commit_batch(&batch(3, "m", "j")).unwrap().duplicate);
     assert_eq!(s.commit_batch(&batch(100, "m", "j")).unwrap().snapshot, snap + 1);
-    let n: i64 = rusqlite::Connection::open(&path).unwrap().query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0)).unwrap();
-    assert_eq!(n, 1);
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let n: i64 = c.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 2, "schema v2 adds the ordered detection indexes");
+    // A filtered, ordered page must walk the ordered index, not sort every match.
+    let plan: String = c
+        .prepare("EXPLAIN QUERY PLAN SELECT d.body FROM detections d WHERE d.class IN ('person') AND +d.confidence >= 0.6 ORDER BY d.media_id, d.media_time_us, d.detection_id LIMIT 10")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(3))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(plan.contains("det_class_order") && !plan.contains("TEMP B-TREE"), "plan: {plan}");
 }
 
 #[test]

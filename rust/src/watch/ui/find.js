@@ -86,6 +86,7 @@ const SNIPS = {
 };
 const edSql = makeEditor($("ed-sql"), () => runFind());
 const edLua = makeEditor($("ed-lua"), () => runFind());
+if (!edSql.get().trim()) edSql.set("SELECT * FROM detections WHERE class = 'person' AND confidence >= 0.5");
 edLua.set("-- v1 Lua query: iterate db.detections / db.frames / db.tracks / db.relations, emit(row) for evidence\nlocal n = 0\nfor d in db.detections{class = 'person', min_confidence = 0.5} do\n  n = n + 1\n  emit(d)\nend\nreturn {person_detections = n}");
 $("ed-sql").addEventListener("ed-input", () => { if (mode === "builder") { sqlDirty = true; paintSqlState(); } });
 
