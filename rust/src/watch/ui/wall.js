@@ -128,7 +128,8 @@ function paint(s) {
   $("foot").textContent = s.footnote || "";
   $("mode-one").setAttribute("aria-pressed", String(!!s.solo)); $("mode-all").setAttribute("aria-pressed", String(!s.solo));
   $("proc-live").textContent = s.process_line || "";
-  $("warnings").innerHTML = (s.warnings || []).map((w) => `<div class="warn">${esc(w)}</div>`).join("");
+  // Warnings are listed behind the header "warnings" counter (app.js), not above the wall.
+  $("warnings").innerHTML = "";
   cams = s.cameras || [];
   const empty = $("wall-empty");
   if (!s.ffmpeg) { empty.classList.remove("hide"); empty.textContent = "ffmpeg is not on PATH. Install it, then start Watch again."; }

@@ -55,6 +55,33 @@ const Watch = (() => {
     if (!$("f-ops") || !s.figures) return;
     Watch.count($("f-ops"), s.figures.ops); Watch.count($("f-lack"), s.figures.lacking);
     Watch.count($("f-pcs"), s.figures.pcs); Watch.count($("f-warn"), s.figures.warnings);
+    warnPanel(s.warnings || []);
+  }
+  // Warnings live behind the header counter: a button that opens a small list, so they never push the page down.
+  let warnItems = [];
+  function warnPanel(list) {
+    warnItems = list;
+    const meter = $("f-warn") && $("f-warn").parentElement;
+    if (!meter) return;
+    if (!meter.dataset.wired) {
+      meter.dataset.wired = "1";
+      meter.setAttribute("role", "button"); meter.setAttribute("tabindex", "0"); meter.setAttribute("aria-haspopup", "true"); meter.setAttribute("aria-expanded", "false");
+      meter.style.cursor = "pointer"; meter.title = "Show warnings";
+      const toggle = (open) => {
+        let pop = document.getElementById("warn-pop");
+        if (open === undefined) open = !pop;
+        if (!open) { if (pop) pop.remove(); meter.setAttribute("aria-expanded", "false"); return; }
+        if (!pop) { pop = document.createElement("div"); pop.id = "warn-pop"; pop.setAttribute("role", "dialog"); pop.setAttribute("aria-label", "Warnings"); document.body.appendChild(pop); }
+        meter.setAttribute("aria-expanded", "true"); fillWarn();
+      };
+      const fillWarn = () => { const pop = document.getElementById("warn-pop"); if (!pop) return; pop.innerHTML = '<div class="wp-h">Warnings</div>' + (warnItems.length ? warnItems.map((w) => `<div class="wp-i">${esc(w)}</div>`).join("") : '<div class="wp-i quiet">No warnings.</div>'); };
+      Watch._fillWarn = fillWarn;
+      meter.addEventListener("click", (e) => { e.stopPropagation(); toggle(); });
+      meter.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
+      document.addEventListener("click", (e) => { const pop = document.getElementById("warn-pop"); if (pop && !pop.contains(e.target)) toggle(false); });
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape" && document.getElementById("warn-pop")) toggle(false); });
+    }
+    if (Watch._fillWarn) Watch._fillWarn();
   }
   function start(paint, ms) {
     async function tick() {

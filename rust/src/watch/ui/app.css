@@ -247,3 +247,12 @@ details > summary { cursor: pointer; }
   @view-transition { navigation: none; }
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+
+/* Warnings panel opened from the header counter. */
+#warn-pop { position: fixed; z-index: 60; top: calc(var(--hdr) + 4px); right: 8px; width: min(440px, calc(100vw - 16px)); max-height: 60vh; overflow: auto; background: var(--surface); border: 1px solid var(--line2); box-shadow: 0 10px 30px rgba(0,0,0,.5); animation: warn-in var(--dur-2) var(--ease-out); }
+#warn-pop .wp-h { padding: .35rem .6rem; border-bottom: 1px solid var(--line); color: var(--quiet); font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; position: sticky; top: 0; background: var(--surface); }
+#warn-pop .wp-i { padding: .4rem .6rem; border-bottom: 1px solid var(--line); color: var(--warn); font-size: .95rem; }
+#warn-pop .wp-i.quiet { color: var(--quiet); }
+@keyframes warn-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { #warn-pop { animation: none; } }
+header .meters > div[role=button]:hover, header .meters > div[role=button]:focus-visible { background: var(--surface2); outline: none; }
