@@ -118,7 +118,7 @@ rust/target/release/cw worker --head <head-ip>                       # older way
 cw deploy user@host --head <head-ip>                                 # push to a machine you can ssh into (add --dry-run to preview)
 ```
 
-The `/join` page on the head shows the command and a pairing code. Ports: 7710 TCP (panel and API), 7711 UDP (discovery). Full multi-PC steps: docs/CLUSTER_DEMO.md. Sharded search (each PC keeps its own database) is off by default: `CW_SHARDS=1` on the head and every worker (docs/DISTRIBUTED.md).
+The `/join` page on the head shows the command and a pairing code. Ports: 7710 TCP (panel and API), 7711 UDP (discovery). Full multi-PC steps: docs/CLUSTER_DEMO.md. Ubuntu PCs (what to copy, packages, firewall, build): docs/UBUNTU.md. Sharded search (each PC keeps its own database) is off by default: `CW_SHARDS=1` on the head and every worker (docs/DISTRIBUTED.md).
 
 ## 7. Tests and checks
 
