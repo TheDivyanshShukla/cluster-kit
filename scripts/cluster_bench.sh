@@ -3,6 +3,7 @@
 #
 #   scripts/cluster_bench.sh [-k K] [-p PORT] [-s SEGMENT_SECS] [-t TIMEOUT_SECS] media...
 #   CW=path/to/cw scripts/cluster_bench.sh -k 2 vision/footage/people-detection.mp4 vision/footage/person-bicycle-car-detection.mp4
+#   NO_SHARED_FOLDER=1 ...   workers get no footage; the head serves every recording to them (no shared folder needed)
 #
 # Everything runs on THIS machine, so the workers share its CPU. The numbers measure this machine; they are
 # not a cluster result. Real speed-up needs workers on separate PCs (docs/CLUSTER_DEMO.md).
@@ -24,9 +25,10 @@ PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; sleep 0.5; for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done; rm -rf "$TMP"; }
 trap cleanup EXIT INT TERM
 
-mkroot() { # dir with models and footage linked, config copied
+mkroot() { # dir with models and footage linked, config copied. 2nd arg "nofootage": a worker with no recordings at all
   local d="$1"; mkdir -p "$d/vision/data"
-  ln -s "$REPO/vision/models" "$d/vision/models"; ln -s "$REPO/vision/footage" "$d/vision/footage"
+  ln -s "$REPO/vision/models" "$d/vision/models"
+  [ "${2:-}" = nofootage ] || ln -s "$REPO/vision/footage" "$d/vision/footage"
   cp "$REPO/vision/modules.json" "$REPO/vision/rules.json" "$d/vision/"
 }
 mkroot "$TMP/head"
@@ -48,8 +50,9 @@ api "$H/api/health" >/dev/null || { echo "head did not start:"; tail -5 "$TMP/he
 nodes() { api "$H/api/v1/cluster" | python3 -c 'import json,sys; print(len([n for n in json.load(sys.stdin)["nodes"] if n["state"]!="lost"]))' 2>/dev/null || echo 0; }
 MEDIA=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@")
 for n in $(seq 1 "$K"); do
-  mkroot "$TMP/w$n"
-  CW_ROOT="$TMP/w$n" CW_WORKER_ID="w$n" CW_NODE_NAME="w$n" perl -e 'alarm 7200; exec @ARGV' "$CW" worker --head 127.0.0.1 --port "$PORT" >"$TMP/w$n.log" 2>&1 &
+  # NO_SHARED_FOLDER=1: workers have no footage folder; the head serves every recording to them over HTTP.
+  mkroot "$TMP/w$n" ${NO_SHARED_FOLDER:+nofootage}
+  CW_ROOT="$TMP/w$n" CW_MEDIA="${NO_SHARED_FOLDER:+remote}" CW_WORKER_ID="w$n" CW_NODE_NAME="w$n" perl -e 'alarm 7200; exec @ARGV' "$CW" worker --head 127.0.0.1 --port "$PORT" >"$TMP/w$n.log" 2>&1 &
   PIDS+=($!)
   for i in $(seq 1 60); do [ "$(nodes)" -ge "$n" ] && break; sleep 0.5; done
   [ "$(nodes)" -ge "$n" ] || { echo "worker $n did not register"; tail -5 "$TMP/w$n.log"; exit 1; }

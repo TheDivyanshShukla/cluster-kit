@@ -33,6 +33,20 @@ The last output line `Ran on: cluster (N workers)` shows how many PCs joined. Us
 
 The job runs from the head PC only. Workers just need the kit folder set up (see the README). With the Rust engine, each worker runs `uv run --project python examples/simple_sha256.py START END` from its kit folder, so the file must be there on every PC. That Python start-up per chunk makes the Rust path slower than Dask for this Python job.
 
+## No shared files: the head sends the script
+
+With the Rust engine, `simple_sha256.py` runs on each worker from the worker's own kit folder, because it imports the kit's `python/` code. If workers do not have the kit folder (and you have no shared folder), let the head send the program itself. `examples/sha256_chunk.py` is a stand-alone version (standard library only); `--push` sends it to every worker, which saves it once in its temp folder and runs it:
+
+```
+./kit rs head                                    # head PC
+./kit rs worker                                  # other PCs (only the ck program is needed)
+rust/target/release/ck run --n 5e7 --from 1 --chunk 1e6 --push examples/sha256_chunk.py | awk '/^[0-9]+$/ {s+=$1} END {print s}'
+```
+
+- `--push FILE` works for any script under 64 KB. It picks `python3` for `.py`, `node` for `.js` and `sh` for `.sh`; use `--with "interpreter"` for anything else. The worker PC must have that interpreter installed.
+- The built-in search `ck run --n 1e9 --sha 00000` needs no files on workers at all.
+- Checked on one Mac with a worker started from an empty folder: the 2,000,000 numbers gave 36 hits, the same as the single-computer run.
+
 ## Compare
 
 Run the same `--n` three times and compare `Time taken`:

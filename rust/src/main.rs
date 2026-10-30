@@ -2,7 +2,7 @@
 //!
 //!   ck head   [--name lab] [--threads N] [--no-local-worker] [--spin] [--gpu]
 //!   ck worker [--name lab] [--threads N] [--head IP] [--spin] [--gpu]
-//!   ck run    [--head IP] --n 1e9 [--from 1] [--chunk 1e7] [--only IP,IP] (--sha PREFIX | --cmd "prog")
+//!   ck run    [--head IP] --n 1e9 [--from 1] [--chunk 1e7] [--only IP,IP] (--sha PREFIX | --cmd "prog" | --push FILE [--with "interpreter"])
 //!   ck ping   [--head IP] [--count 10000] [--size 8] [--spin]   (round-trip latency / throughput)
 //!
 //! Workers pull chunks over one persistent TCP connection and keep PIPELINE chunks in
@@ -25,7 +25,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{mpsc, Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
-use std::{env, thread};
+use std::{env, fs, thread};
 
 const PORT: u16 = 7700; // TCP: workers + clients
 const DISC_PORT: u16 = 7701; // UDP: discovery beacon
@@ -214,8 +214,35 @@ fn run_cmd_par(cmd: &[u8], a: u64, b: u64) -> Vec<u8> {
         .concat()
 }
 
+// `--push FILE`: the head ships the script itself, so a worker needs no copy of it. The argument is
+// "\x01PUSH\n<interpreter>\n<file name>\n<script bytes>". The worker saves the script once under its temp folder
+// (named by a hash of the contents) and runs `<interpreter> <saved path> START END`.
+const PUSH_MARK: &[u8] = b"\x01PUSH\n";
+const PUSH_MAX: usize = 64 * 1024;
+
+fn command_base(cmd: &[u8]) -> String {
+    let Some(rest) = cmd.strip_prefix(PUSH_MARK) else { return String::from_utf8_lossy(cmd).into_owned() };
+    let mut lines = rest.splitn(3, |b| *b == b'\n');
+    let interp = String::from_utf8_lossy(lines.next().unwrap_or(b"")).into_owned();
+    let name: String = String::from_utf8_lossy(lines.next().unwrap_or(b"script"))
+        .chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).collect();
+    let body = lines.next().unwrap_or(b"");
+    let name = if name.is_empty() { "script".to_string() } else { name };
+    let hash = body.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
+    let dir = env::temp_dir().join(format!("ck-push-{hash:016x}"));
+    let path = dir.join(&name);
+    if !path.exists() {
+        let _ = fs::create_dir_all(&dir);
+        let tmp = dir.join(format!("{name}.{}", std::process::id()));
+        if fs::write(&tmp, body).is_ok() {
+            let _ = fs::rename(&tmp, &path);
+        }
+    }
+    format!("{interp} \"{}\"", path.display())
+}
+
 fn run_cmd(cmd: &[u8], a: u64, b: u64) -> Vec<u8> {
-    let line = format!("{} {a} {b}", String::from_utf8_lossy(cmd));
+    let line = format!("{} {a} {b}", command_base(cmd));
     let out = if cfg!(windows) {
         Command::new("cmd").args(["/C", &line]).output()
     } else {
@@ -644,16 +671,36 @@ fn connect_client(o: &Opts) -> (BufReader<Sock>, Sock) {
 }
 
 fn run(o: &Opts) {
-    let (kind, arg) = match (&o.sha, &o.cmd) {
-        (Some(p), None) => {
+    let (kind, arg) = match (&o.sha, &o.cmd, &o.push) {
+        (None, None, Some(file)) => {
+            let body = fs::read(file).unwrap_or_else(|e| die(&format!("cannot read {file}: {e}")));
+            if body.len() > PUSH_MAX {
+                die(&format!("{file} is {} bytes; --push sends the script with every chunk, keep it under {PUSH_MAX} bytes", body.len()));
+            }
+            let name = std::path::Path::new(file).file_name().map_or("script".into(), |n| n.to_string_lossy().into_owned());
+            let interp = o.with.clone().unwrap_or_else(|| match std::path::Path::new(file).extension().and_then(|e| e.to_str()) {
+                Some("py") => if cfg!(windows) { "python".into() } else { "python3".into() },
+                Some("js") => "node".into(),
+                Some("sh") => "sh".into(),
+                _ => die("cannot tell how to run this file; add --with \"interpreter\" (for example --with python3)"),
+            });
+            let mut arg = PUSH_MARK.to_vec();
+            arg.extend_from_slice(interp.as_bytes());
+            arg.push(b'\n');
+            arg.extend_from_slice(name.as_bytes());
+            arg.push(b'\n');
+            arg.extend_from_slice(&body);
+            (KIND_CMD, arg)
+        }
+        (Some(p), None, None) => {
             let nib: Option<Vec<u8>> = p.chars().map(|c| c.to_digit(16).map(|d| d as u8)).collect();
             match nib.filter(|n| n.len() <= 64) {
                 Some(n) => (KIND_SHA, n),
                 None => die("--sha must be up to 64 hex digits"),
             }
         }
-        (None, Some(c)) => (KIND_CMD, c.as_bytes().to_vec()),
-        _ => die("give exactly one of --sha PREFIX or --cmd \"program\""),
+        (None, Some(c), None) => (KIND_CMD, c.as_bytes().to_vec()),
+        _ => die("give exactly one of --sha PREFIX, --cmd \"program\" or --push FILE"),
     };
     let end = o.from.checked_add(o.n).unwrap_or_else(|| die("--from + --n overflows"));
     let (mut r, mut s) = connect_client(o);
@@ -771,6 +818,8 @@ struct Opts {
     chunk: u64,
     sha: Option<String>,
     cmd: Option<String>,
+    push: Option<String>,
+    with: Option<String>,
     only: Option<String>,
     count: usize,
     size: usize,
@@ -801,6 +850,8 @@ fn main() {
         chunk: 0,
         sha: None,
         cmd: None,
+        push: None,
+        with: None,
         only: None,
         count: 10_000,
         size: 8,
@@ -820,6 +871,8 @@ fn main() {
             "--chunk" => o.chunk = num(args.next()),
             "--sha" => o.sha = args.next(),
             "--cmd" => o.cmd = args.next(),
+            "--push" => o.push = args.next(),
+            "--with" => o.with = args.next(),
             "--only" => o.only = args.next(),
             "--size" => o.size = num(args.next()).min(MAX_FRAME as u64) as usize,
             "--count" => o.count = num(args.next()).max(1) as usize,
