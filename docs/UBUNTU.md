@@ -57,6 +57,51 @@ If you only need the SHA engine and want to skip the video system and GPU librar
 cargo build --release --manifest-path rust/Cargo.toml --bin ck --no-default-features
 ```
 
+## Option 3: SSD, Ubuntu with no internet
+
+Tested on the Mac with `cargo build --offline`: the SHA engine builds from a vendored copy in 7 seconds and a pushed job gives the right answer. The Ubuntu PC still needs a Rust compiler (`rustc`, `cargo`, `build-essential`) and `python3` installed; put the `.deb` files or the rustup offline installer on the SSD if it has no internet at all.
+
+On the Mac, make a trimmed SHA-engine-only crate with its dependencies inside it (about 290 MB, 21 MB compressed):
+
+```
+D=$(mktemp -d) && mkdir -p $D/src $D/.cargo
+cat > $D/Cargo.toml <<'EOF'
+[package]
+name = "ck"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+rayon = "1"
+sha2 = { version = "0.10", features = ["compress"] }
+sysinfo = "0.30"
+[[bin]]
+name = "ck"
+path = "src/main.rs"
+EOF
+cp rust/src/main.rs rust/src/dash.html rust/src/sha.wgsl $D/src/ && cp rust/Cargo.lock $D/
+cp examples/sha256_chunk.py $D/
+(cd $D && cargo vendor vendor && printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "vendor"\n' > .cargo/config.toml)
+tar czf /Volumes/SSD/ck-offline.tgz -C $D .
+```
+
+(Match the dependency versions to `rust/Cargo.toml`; if a feature or file is missing the build says which.) On Ubuntu:
+
+```
+mkdir ck && tar xzf /media/$USER/SSD/ck-offline.tgz -C ck && cd ck
+cargo build --release --offline
+```
+
+For the whole repository instead, copy the clone from option 1 to the SSD with `git bundle create /Volumes/SSD/cluster-kit.bundle --all` and `git clone cluster-kit.bundle` on Ubuntu; building it still needs internet (or `cargo vendor` run on the Mac first).
+
+## Mac and Ubuntu on different networks
+
+An SSD moves files only. Running as one cluster needs both PCs on the same network. Without a router both can share:
+
+- Ethernet cable between them, static addresses. Mac: System Settings, Network, Ethernet, Manual, `192.168.50.1`, mask `255.255.255.0`. Ubuntu: `sudo ip addr add 192.168.50.2/24 dev <eth-name>` (find it with `ip link`). Then use `192.168.50.1` as `<mac-ip>` below.
+- Or the same phone hotspot on both. Some hotspots isolate clients; if `ping` fails, use the cable.
+
+Until then each PC runs on its own: the Mac head with its own local worker, and Ubuntu as a separate head (`ck head`, `cw head`). Results are not combined.
+
 ## Open the ports
 
 Only needed if Ubuntu's firewall is on (`sudo ufw status`). Replace the subnet with yours.
