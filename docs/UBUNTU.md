@@ -1,5 +1,7 @@
 # Adding an Ubuntu PC
 
+Running the whole demo on Ubuntu PCs (no Mac on the day): see docs/UBUNTU_DEMO.md.
+
 A program built on the Mac will not run on Ubuntu (different operating system, often a different CPU), so Ubuntu builds its own copy from the source files. You do not copy any built files.
 
 ## What to transfer
