@@ -6,6 +6,8 @@ DRIVE=$(cd "$(dirname "$0")" && pwd)
 HOME_DIR=~/cluster-kit
 if [ ! -d "$HOME_DIR" ]; then cp -r "$DRIVE/cluster-kit" "$HOME_DIR"; fi
 cd "$HOME_DIR"
+# Search thumbnails travel as one archive (many small files copy slowly to a drive).
+if [ -f "$DRIVE/thumbs.tar" ] && [ ! -d vision/data/thumbs ]; then tar xf "$DRIVE/thumbs.tar" -C vision/data; fi
 if [ ! -x rust/target/release/cw ]; then
   sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev ffmpeg python3 curl
   command -v cargo >/dev/null || { curl https://sh.rustup.rs -sSf | sh -s -- -y; }
