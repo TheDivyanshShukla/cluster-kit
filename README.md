@@ -60,6 +60,11 @@ kit rs watch head      this PC opens the panel and works too
 kit rs watch worker    every other PC
 ```
 
+Full instructions (build, models, sources, joining PCs, tests, environment variables, troubleshooting): [docs/RUNNING.md](docs/RUNNING.md). Demo walkthroughs: [docs/DEMO.md](docs/DEMO.md), [docs/CLUSTER_DEMO.md](docs/CLUSTER_DEMO.md).
+
+```text
+```
+
 ffmpeg must be on PATH (`winget install Gyan.FFmpeg`, or `brew install ffmpeg`). Open `http://HEAD_IP:7710`. One PC assigns every camera to the head. All PCs spreads them by core count. Any number of PCs on the network can join. Processing is set on the panel: Speed, Balanced, or Accuracy, and each filter on its own (blur, blank, an unchanged picture, how often a sharp frame is looked at, and the picture size).
 
 A rule is one line, saved from Setup:
