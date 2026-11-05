@@ -1,12 +1,12 @@
 """Cluster Kit Python SDK: run ordinary Python work on the lab cluster. Standard library only. See docs/SDK.md."""
 from __future__ import annotations
-import base64, functools, itertools, json, logging, math, os, resource, sys, threading, time, urllib.error, urllib.request, zlib
+import ast, base64, functools, itertools, json, logging, math, os, pickle, resource, sys, threading, time, urllib.error, urllib.request, zlib
 import tracemalloc
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generic, Literal, TypedDict, TypeVar, overload
 from collections.abc import Iterable, Sequence
-from . import _runner, _hist, _bulk
+from . import _runner, _hist, _bulk, _benchfn
 from ._bulk import Handle
 from ._advise import Advice, Suggestion
 
@@ -24,7 +24,7 @@ if sys.version_info >= (3, 10):
 else:  # Python 3.9 has no ParamSpec (and typing_extensions is not allowed): Remote keeps the result type, not the arguments
     P = TypeVar("P")
 
-__all__ = ["connect", "config", "map", "remote", "sweep", "train", "put", "shard", "plan", "Handle", "Suggestion", "Advice", "SweepRow", "Remote", "advise", "mean_params", "RemoteError", "ClusterError", "Plan"]
+__all__ = ["connect", "config", "map", "remote", "sweep", "train", "put", "shard", "plan", "Handle", "Suggestion", "Advice", "SweepRow", "Remote", "advise", "mean_params", "pc_python", "RemoteError", "ClusterError", "Plan"]
 log = logging.getLogger("clusterkit")
 
 _cfg: Opts = {"head": os.environ.get("CK_HEAD", "http://127.0.0.1:7702"), "token": os.environ.get("CK_TOKEN"), "pcs": None,
@@ -34,7 +34,7 @@ _cfg: Opts = {"head": os.environ.get("CK_HEAD", "http://127.0.0.1:7702"), "token
         "batch": True, "batch_s": 0.5, "push": True, "adaptive": True, "replan_min_s": 2.0, "history": True,
         "learn_last": 20, "fixed_s": 0.1, "item_c": 1e-5, "start_s": 0.03,
         # bulk distribution (docs/BULK.md): blob_auto_kb mirrors the head knob of the same name; result_head is how the PCs reach the head
-        "bulk": True, "blob_per_chunk": False, "blob_auto_kb": 64, "code_blob_kb": 8, "bulk_results": True, "result_head": None}
+        "pc_python": None, "bulk": True, "blob_per_chunk": False, "blob_auto_kb": 64, "code_blob_kb": 8, "bulk_results": True, "result_head": None}
 _OPTS = ("pcs", "placement", "priority", "selector", "local", "mem_mb", "timeout_s", "retries", "name", "batch", "adaptive", "history", "blob_per_chunk", "bulk")
 
 
@@ -62,7 +62,27 @@ def config(*, placement: Placement | None = None, priority: Priority | None = No
     bad = set(kw) - set(_cfg)
     if bad:
         raise TypeError("unknown option(s): " + ", ".join(sorted(bad)))
+    if kw.get("pc_python") is not None:
+        _ver(kw["pc_python"])  # fail now on a typo, not at the first job
     _cfg.update(kw)
+    _runner.PROTO = _proto()
+
+
+def _ver(v: str | tuple[int, ...]) -> tuple[int, int]:
+    """'3.9' / '3.9.6' / (3, 9) -> (3, 9)."""
+    try:
+        t = tuple(int(x) for x in (v.split(".") if isinstance(v, str) else v))[:2]
+        if len(t) == 2 and t[0] == 3:
+            return t[0], t[1]
+    except (ValueError, TypeError):
+        pass
+    raise TypeError(f"pc_python must look like '3.9' (the oldest Python 3 on any PC), not {v!r}")
+
+
+def _proto() -> int:
+    """Pickle protocol both sides read: the lower HIGHEST_PROTOCOL of this machine and the oldest PC (3.8+ -> 5, 3.4-3.7 -> 4), capped at 5."""
+    pc = _cfg["pc_python"]
+    return min(pickle.HIGHEST_PROTOCOL, 5, 5 if pc is None or _ver(pc) >= (3, 8) else 4)
 
 
 def _lit(kw: dict[str, Any], placement: str | None, priority: str | None, local: str | None) -> dict[str, Any]:
@@ -124,7 +144,14 @@ def _payload(fn: Callable[..., Any], mode: str, batch: bool = False, gl: dict[st
         with open(p, encoding="utf-8") as f:
             mods.append([os.path.splitext(os.path.basename(p))[0], f.read()])
     mods.append([name, src])
-    raw = json.dumps({"mods": mods, "main": name, "attr": q, "mode": mode, "batch": batch, **({"gl": gl} if gl else {}), **({"rb": rb} if rb else {})}).encode()
+    if _cfg["pc_python"] is not None:
+        for n, code in mods:  # newer syntax than the PCs' Python fails here with a clear message, not on every PC
+            try:
+                ast.parse(code, n + ".py", feature_version=_ver(_cfg["pc_python"]))
+            except SyntaxError as e:
+                raise ClusterError(f"{n}.py line {e.lineno}: {e.msg}: not valid for pc_python={_cfg['pc_python']} (the oldest Python on the PCs); "
+                                   "avoid the newer syntax or upgrade the PCs and ck.config(pc_python=...)") from None
+    raw = json.dumps({"mods": mods, "main": name, "attr": q, "mode": mode, "batch": batch, "proto": _proto(), **({"gl": gl} if gl else {}), **({"rb": rb} if rb else {})}).encode()
     return base64.b64encode(zlib.compress(raw, 9)).decode()
 
 
@@ -178,7 +205,7 @@ def _cmd_for(fn: Callable[..., Any], mode: str, batch: bool) -> tuple[str, float
     except (OSError, TypeError):
         stamp = None
     key = (p, stamp, fn.__qualname__, mode, tuple(_cfg["ship"]), _cfg["push_max_kb"], _cfg["head"],
-           _cfg["bulk"], _cfg["blob_auto_kb"], _cfg["code_blob_kb"], _cfg["bulk_results"], _cfg["result_head"], _cfg["token"])
+           _cfg["pc_python"], _cfg["bulk"], _cfg["blob_auto_kb"], _cfg["code_blob_kb"], _cfg["bulk_results"], _cfg["result_head"], _cfg["token"])
     if stamp and key in _cmds:
         return _cmd(*_cmds[key][:2], batch), 0.0, _cmds[key][2]
     gl: dict[str, str] | None = None
@@ -188,10 +215,13 @@ def _cmd_for(fn: Callable[..., Any], mode: str, batch: bool) -> tuple[str, float
     if _cfg["bulk"] and _bulk.supported(_self):
         big = _big_globals(fn, _cfg["blob_auto_kb"] * 1024)
         gl, hs = {n: h.sha for n, h in big.items()}, list(big.values())
-        # Never embed a user API token in a job (job args are visible to viewers, stored and logged): bulk results
-        # are only used on an open head until the head issues job-scoped upload capabilities (docs/BULK.md).
-        if _cfg["bulk_results"] and not _cfg["token"]:
-            rb = {"url": (_cfg["result_head"] or _cfg["head"]).rstrip("/"), "token": _cfg["token"], "kb": _cfg["blob_auto_kb"]}
+        # Never embed a user API token in a job (job args are visible to viewers, stored and logged). On a head that gives each
+        # job its own upload capability (CK_BLOB_PUT_URL / CK_BLOB_PUT_TOKEN in the PC's environment) that is what the runner
+        # uses, so bulk results work on secured heads too; an older head gets the plain url, and only when no user token exists.
+        if _cfg["bulk_results"]:
+            rb = {"kb": _cfg["blob_auto_kb"]}
+            if _cfg["result_head"] or not _cfg["token"]:
+                rb["url"] = (_cfg["result_head"] or _cfg["head"]).rstrip("/")
     payload = _payload(fn, mode, False, gl, rb)  # batching is a header line of the script, so one payload (and one code blob) serves both
     if _cfg["bulk"] and _bulk._ok.get(_cfg["head"]) and len(payload) > _cfg["code_blob_kb"] * 1024:
         hs.append(_bulk.from_bytes(payload.encode()))
@@ -239,23 +269,41 @@ def shard(src: Any, parts: int) -> list[Handle[Any]]:
 
 
 # ---------------------------------------------------------------- local execution
-_G: Any = None
+def _lw(a: tuple[str, Callable[..., Any], Any]) -> Any:
+    return _runner.apply(*a)
 
 
-def _lw(x: Any) -> Any:
-    return _runner.apply(_G[0], _G[1], x)
+def _mp_context() -> Any:
+    """A multiprocessing context that works on this Python, or None (run serially). 3.14 made forkserver the default on Linux and
+    macOS was already spawn: fn and the items then travel by pickle and the child re-imports your script, so a script without an
+    `if __name__ == "__main__":` guard would run its top level again in every child (an endless pool) and is kept serial."""
+    import multiprocessing as mp
+    methods = mp.get_all_start_methods()
+    if "fork" in methods and threading.active_count() == 1:  # fork copies only this thread; with a live stream thread (3.12+ warns) use spawn
+        return mp.get_context("fork")
+    main = sys.modules.get("__main__")
+    path = getattr(main, "__file__", None)
+    if path and getattr(getattr(main, "__spec__", None), "name", None) is None:  # a plain script (not python -m): look for the guard
+        try:
+            with open(path, encoding="utf-8") as f:
+                if "__main__" not in f.read():
+                    return None
+        except OSError:
+            return None
+    return mp.get_context("forkserver" if "forkserver" in methods else "spawn")
 
 
 def _local(fn: Callable[..., Any], mode: str, items: list[Any], procs: int = 1) -> list[Any]:
-    global _G
     fn = getattr(fn, "_ck_fn", fn)
     if procs > 1 and len(items) > 1:
         try:
-            import multiprocessing as mp
-            _G = (mode, fn)
-            with mp.get_context("fork").Pool(procs) as p:
-                return p.map(_lw, items, chunksize=max(1, len(items) // (procs * 4)))
-        except Exception as e:  # no fork (Windows) or unpicklable result: serial is always right
+            ctx = _mp_context()
+            if ctx is None:
+                log.info("local parallel run skipped: guard your script's top level with `if __name__ == '__main__':` to use all cores; running serially")
+            else:
+                with ctx.Pool(procs) as p:
+                    return p.map(_lw, [(mode, fn, x) for x in items], chunksize=max(1, len(items) // (procs * 4)))
+        except Exception as e:  # unpicklable fn/item/result or no working start method: serial is always right
             log.info("local parallel run failed (%s); running serially", e)
     return [_runner.apply(mode, fn, x) for x in items]
 
@@ -888,13 +936,41 @@ def sweep(fn: Callable[..., R], grid: dict[str, Iterable[Any]], key: Callable[[R
 
 
 def mean_params(ps: Sequence[Any]) -> Any:
-    """Average a list of params: dicts of floats, lists of floats, or plain floats (recursive)."""
+    """Average a list of params: dicts (also a torch state_dict), lists, tuples, plain floats, numpy arrays and torch tensors (recursive).
+    Neither numpy nor torch is imported: their objects are averaged with the operators they define. Integer arrays keep their dtype."""
     p0 = ps[0]
     if isinstance(p0, dict):
-        return {k: mean_params([p[k] for p in ps]) for k in p0}
-    if isinstance(p0, (list, tuple)):
+        pairs = [(k, mean_params([p[k] for p in ps])) for k in p0]
+        try:
+            return type(p0)(pairs)  # OrderedDict stays an OrderedDict (load_state_dict accepts either)
+        except TypeError:
+            return dict(pairs)
+    if isinstance(p0, (list, tuple)) and not hasattr(p0, "_fields"):
         return type(p0)(mean_params(list(c)) for c in zip(*ps))
+    if hasattr(p0, "dtype"):  # numpy array / scalar, torch tensor
+        tot = p0
+        for p in ps[1:]:
+            tot = tot + p
+        m = tot / len(ps)
+        if m.dtype != p0.dtype:  # an int array (BatchNorm's num_batches_tracked) must stay an int array
+            m = m.to(p0.dtype) if hasattr(m, "to") else m.astype(p0.dtype)
+        return m
     return sum(ps) / len(ps)
+
+
+_pcpy: dict[str, list[str]] = {}
+
+
+def pc_python(refresh: bool = False) -> list[str]:
+    """Ask the PCs which Python their `python3` is: runs a tiny job, returns the sorted versions (['3.9.6', '3.12.4']; a 't' suffix
+    marks a free-threaded build). Then ck.config(pc_python=<the oldest>) checks your code's syntax before shipping and picks the pickle protocol."""
+    h = _cfg["head"]
+    if refresh or h not in _pcpy:
+        pcs = _cluster_view(_opts({}))[0]
+        n = min(64, max(2, 2 * sum(th for th, _ in pcs)))
+        got = _run(_benchfn.pyver, "call", list(range(n)), _opts(dict(local="never", placement="spread", batch=False, history=False)), learn=False)
+        _pcpy[h] = sorted(set(got), key=lambda v: tuple(int(x) for x in v.rstrip("t").split(".")))
+    return _pcpy[h]
 
 
 def train(step: Callable[[M, S], M], init: M, shards: Iterable[S], rounds: int = 10, average: Callable[[list[M]], M] = mean_params, *,

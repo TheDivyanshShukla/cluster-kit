@@ -6,6 +6,9 @@ from typing import Any, Callable, Optional  # noqa: F401  (annotations are strin
 
 MAGIC = b"CKOBJ1\n"  # first bytes of a blob that holds a pickled object (any other blob is a plain file: you get its path)
 LOCAL = {}  # type: "dict[str, Any]"  # sha -> Handle, for runs on the machine that made the handles
+# Pickle protocol for everything that crosses between the user's machine and the PCs: the lower of both sides' HIGHEST_PROTOCOL
+# (3.8+ is 5, 3.4-3.7 is 4). The SDK lowers it from ck.config(pc_python=...); the PC lowers it from the payload's "proto".
+PROTO = min(pickle.HIGHEST_PROTOCOL, 5)  # capped at 5: 3.9 .. 3.15 all read protocol 5
 
 
 def _read(path: str) -> Any:
@@ -36,7 +39,7 @@ def resolve(x: Any, d: int = 2) -> Any:
 
 
 def enc(obj: Any) -> str:
-    raw = pickle.dumps(obj, 4)
+    raw = pickle.dumps(obj, PROTO)
     z = zlib.compress(raw, 6)
     return ("z" + base64.b64encode(z).decode()) if len(z) < len(raw) else ("p" + base64.b64encode(raw).decode())
 
@@ -62,6 +65,8 @@ def load(payload: dict[str, Any]) -> Callable[..., Any]:
         m.remote = lambda f=None, **k: f if f is not None else (lambda g: g)
         m.connect = m.config = lambda *a, **k: None
         sys.modules["clusterkit"] = m
+    global PROTO
+    PROTO = min(PROTO, payload.get("proto") or PROTO)
     mod = None
     for name, src in payload["mods"]:
         mod = types.ModuleType(name)
@@ -69,7 +74,13 @@ def load(payload: dict[str, Any]) -> Callable[..., Any]:
         sys.modules[name] = mod
         if name == "__ck_user__":
             sys.modules["__main__"] = mod  # pickled instances of the user's own classes load
-        exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+        try:
+            code = compile(src, mod.__file__, "exec")
+        except SyntaxError as e:  # the user's code is newer than this PC's python: say which python, not just "invalid syntax"
+            v = sys.version_info
+            raise SyntaxError(f"this PC runs Python {v[0]}.{v[1]}.{v[2]} and cannot parse {name}.py line {e.lineno}: {e.msg} "
+                              f"(newer syntax; upgrade the PC's python3 or avoid the new syntax; ck.config(pc_python='{v[0]}.{v[1]}') checks this before shipping)") from None
+        exec(code, mod.__dict__)
     obj = sys.modules[payload["main"]]
     for n, sha in (payload.get("gl") or {}).items():  # big module-level data arrives as a blob, not from the source
         obj.__dict__[n] = blob(sha)
@@ -85,13 +96,18 @@ def apply(mode: str, fn: Callable[..., Any], x: Any) -> Any:
 
 def _put(v: Any, rb: dict[str, Any]) -> tuple[str, Any]:
     """A result over rb['kb'] goes to the head as a blob; the line carries only its sha. Any failure: send it inline."""
-    if len(pickle.dumps(v, 4)) <= rb["kb"] * 1024:
+    if len(pickle.dumps(v, PROTO)) <= rb["kb"] * 1024:
         return ("ok", v)
     try:
         import urllib.request
-        rq = urllib.request.Request(rb["url"] + "/api/v1/blobs", data=enc(v).encode(), method="PUT")
-        if rb.get("token"):
-            rq.add_header("Authorization", "Bearer " + rb["token"])
+        # the head gives each job its own upload capability (env CK_BLOB_PUT_URL / CK_BLOB_PUT_TOKEN: PUT /api/v1/blobs only, valid while
+        # the job runs); an explicit rb url (ck.config(result_head=...)) wins for the address; rb token is only ever set on an open head
+        url, tok = rb.get("url") or os.environ.get("CK_BLOB_PUT_URL"), os.environ.get("CK_BLOB_PUT_TOKEN") or rb.get("token")
+        if not url:
+            return ("ok", v)
+        rq = urllib.request.Request(url.rstrip("/") + ("" if url.rstrip("/").endswith("/api/v1/blobs") else "/api/v1/blobs"), data=enc(v).encode(), method="PUT")
+        if tok:
+            rq.add_header("Authorization", "Bearer " + tok)
         with urllib.request.urlopen(rq, timeout=300) as r:
             return ("blob", json.loads(r.read())["sha256"])
     except Exception:

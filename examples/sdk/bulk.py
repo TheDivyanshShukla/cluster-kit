@@ -1,5 +1,8 @@
 """Bulk distribution: shard a big file into blobs and count lines per shard on the PCs: python3 examples/sdk/bulk.py [path] [parts]"""
-import _path  # noqa: F401
+try:
+    import _path  # noqa: F401  (runs from a checkout without pip install; the PCs have no _path, nor need it)
+except ImportError:
+    pass
 import os, sys, tempfile
 import clusterkit as ck
 

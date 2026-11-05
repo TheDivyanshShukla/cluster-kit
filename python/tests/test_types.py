@@ -15,7 +15,7 @@ def callables(mod):
         elif inspect.isclass(o):
             for m, f in vars(o).items():
                 f = getattr(f, "fget", f)
-                if inspect.isfunction(f) and f.__code__.co_filename != "<string>":  # not dataclass-generated
+                if inspect.isfunction(f) and f.__code__.co_filename != "<string>" and m not in ("__replace__", "__annotate_func__", "__annotate__"):  # not generated (3.13 dataclass __replace__, 3.14 deferred annotations)
                     yield f"{mod.__name__}.{n}.{m}", f
 
 

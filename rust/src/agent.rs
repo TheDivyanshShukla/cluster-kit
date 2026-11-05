@@ -355,9 +355,7 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
         #[cfg(not(feature = "gpu"))]
         println!("GPU: this ck was built without the gpu feature, using the CPU");
     }
-    if virt.is_none() {
-        crate::blobs::start_server();
-    }
+    crate::blobs::start_server(); // once per process; virtual agents share it
     static SAMPLER: Once = Once::new();
     SAMPLER.call_once(|| {
         thread::spawn(sampler);
@@ -512,10 +510,8 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
         Some(i) => format!("{}/v{i}", crate::identity::node_id()),
         None => crate::identity::node_id(),
     };
-    if virt.is_none() {
-        if let Ok(a) = s.peer_addr() {
-            *crate::blobs::HEAD_IP.lock().unwrap() = a.ip().to_string();
-        }
+    if let Ok(a) = s.peer_addr() {
+        *crate::blobs::HEAD_IP.lock().unwrap() = a.ip().to_string();
     }
     let secure = !fleet_open();
     let kp = crate::identity::key_path(&node_id);
@@ -544,9 +540,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     for _ in 0..pipeline() {
         send_w(REQ, &[])?;
     }
-    if virt.is_none() {
-        crate::blobs::report_have(&w, serde_json::json!({})); // which blobs this PC caches, and its blob port
-    }
+    crate::blobs::report_have(&w, serde_json::json!({})); // which blobs this PC caches, and its blob port (virtual agents: the shared cache)
     // HA-06: a head with a higher epoch beacons: drop this one and move (un-ACKed results go along).
     if let Some((name, addr, epoch)) = follow {
         let sock = sock.try_clone()?;
@@ -612,10 +606,8 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                 }
                 power_ctrl(&p, &w_r);
                 crate::kernels::note_job_ctrl(&p);
-                if virt.is_none() {
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&p) {
-                        crate::blobs::agent_ctrl(&v, &w_r);
-                    }
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&p) {
+                    crate::blobs::agent_ctrl(&v, &w_r); // virtual agents too (shared cache; fetch() serialises per sha)
                 }
                 if let Some(c) = parse_cap(&p) {
                     cap_r.store(c.unwrap_or(0), Relaxed);

@@ -1,5 +1,8 @@
 """Data-parallel linear regression by model averaging, pure Python: python3 examples/sdk/model_avg.py"""
-import _path  # noqa: F401
+try:
+    import _path  # noqa: F401  (runs from a checkout without pip install; the PCs have no _path, nor need it)
+except ImportError:
+    pass
 import random
 import clusterkit as ck
 

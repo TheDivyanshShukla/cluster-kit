@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(HERE, ".."))
 import clusterkit as ck
 from clusterkit import _runner
 import sdkfns, advfns
-from clusterkit import _hist
+from clusterkit import _hist, _advise
 
 
 class FakeHead:
@@ -270,7 +270,10 @@ class T(unittest.TestCase):
         self.assertTrue(hot)
         self.assertGreater(hot[0].evidence["py_share"], 0.5)
         self.assertIn("numpy", hot[0].hint)
-        self.assertIn("gil_bound", a.ids())
+        if _advise.gil_enabled():
+            self.assertIn("gil_bound", a.ids())
+        else:  # free-threaded: threads do scale, so the GIL must not be blamed (threads_ok shows when the host has the cores)
+            self.assertNotIn("gil_bound", a.ids())
 
     def test_advise_io_bound(self):
         self.assertIn("io_bound", self.ids(advfns.waits, range(30)))

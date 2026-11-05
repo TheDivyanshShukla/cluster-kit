@@ -28,14 +28,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.9", "3.12"]   # 3.9: the oldest python3 a lab PC may have (the SDK runner runs there)
+        # 3.9 is the oldest python3 a lab PC may have (the SDK runner runs there); 3.13t / 3.14t are the free-threaded builds
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.13t", "3.14", "3.14t"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5   # accepts "3.13t" / "3.14t" (setup-python v5.6+); if a future runner drops them, remove those two entries
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m unittest discover -s python/tests
+      - run: python -W error::DeprecationWarning -m unittest discover -s python/tests
+      - name: ML smoke tests (numpy, pandas, scikit-learn; no torch: too big for CI, run examples/sdk/ml_torch.py locally)
+        if: matrix.python == '3.12'
+        run: |
+          python -m pip install numpy pandas scikit-learn
+          for f in numpy pandas sklearn; do python examples/sdk/ml_$f.py; done
       - uses: astral-sh/setup-uv@v6
         if: matrix.python == '3.12'
       - name: "ruff (latest): full type hints"

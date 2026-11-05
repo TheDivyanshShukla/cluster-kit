@@ -91,7 +91,7 @@ def from_obj(obj: Any) -> Handle[Any]:
     hit = _by_id.get(id(obj))
     if hit and hit[0] is obj:
         return hit[1]
-    h = from_bytes(MAGIC + pickle.dumps(obj, 4))
+    h = from_bytes(MAGIC + pickle.dumps(obj, _runner.PROTO))
     if len(_by_id) < 64:
         _by_id[id(obj)] = (obj, h)
     return h
@@ -156,7 +156,7 @@ def find(x: Any, d: int = 2) -> list[Handle[Any]]:
 
 
 def _size(x: Any) -> int:
-    return len(pickle.dumps(x, 4))
+    return len(pickle.dumps(x, _runner.PROTO))
 
 
 def autoblob(x: Any, thr: int, d: int = 1) -> Any:

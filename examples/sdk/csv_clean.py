@@ -1,5 +1,8 @@
 """Clean CSV rows on the cluster: python3 examples/sdk/csv_clean.py  (head from CK_HEAD, default 127.0.0.1:7702)."""
-import _path  # noqa: F401  (lets this run from a checkout without pip install)
+try:
+    import _path  # noqa: F401  (runs from a checkout without pip install; the PCs have no _path, nor need it)
+except ImportError:
+    pass
 import clusterkit as ck
 
 

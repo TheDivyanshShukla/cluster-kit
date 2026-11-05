@@ -271,9 +271,10 @@ pub(crate) fn can_work(w: &Worker) -> bool {
 }
 
 /// Is a blob missing on this node for chunk [a, b) of the job (job-wide blobs plus the shards its items name)?
-/// Virtual nodes never run programs: nothing is missing. A real agent that has not reported its cache yet counts as missing.
+/// Virtual agents run cmd/list/SDK programs too (sharing their process's cache), so they need the blobs like any PC.
+/// An agent that has not reported its cache yet counts as missing.
 pub(crate) fn chunk_missing(w: &Worker, j: &Job, a: u64, b: u64) -> bool {
-    if j.blobs.is_empty() || w.hello.as_ref().is_some_and(|h| h.virtual_node) {
+    if j.blobs.is_empty() {
         return false;
     }
     !w.blob_rep || crate::blobs::chunk_blobs(&j.shared, &j.shards, &j.item_sha, a, b).iter().any(|b| !w.have.contains(b))

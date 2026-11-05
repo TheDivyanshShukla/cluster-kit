@@ -16,7 +16,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, Mutex, Once};
+use std::sync::{Arc, LazyLock, Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -476,6 +476,10 @@ fn pull(f: &mut File, m: &Meta, have: &mut [bool], src: &Source) -> io::Result<u
 /// Fetch a blob into `dir/<sha>`: resumes a broken transfer (pieces already in `<sha>.part` that match their hash are kept),
 /// verifies every piece and then the whole sha256, tries the sources in order. Already cached = 0 bytes.
 pub fn fetch(dir: &Path, m: &Meta, srcs: &[Source]) -> io::Result<Got> {
+    // virtual agents in one process share the cache: one fetch per sha at a time, the others then hit the cache
+    static INFLIGHT: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let lock = INFLIGHT.get_or_init(Default::default).lock().unwrap().entry(m.sha.clone()).or_default().clone();
+    let _one = lock.lock().unwrap();
     let t0 = Instant::now();
     fs::create_dir_all(dir)?;
     let fin = dir.join(&m.sha);
@@ -963,7 +967,7 @@ fn observe_uplink(ctx: &Ctx) {
 
 /// Is this connected PC one the blob logic applies to (a real agent that speaks blobs)?
 fn real(w: &crate::head::Worker) -> bool {
-    w.hello.as_ref().is_some_and(|h| !h.virtual_node) && w.blob_rep
+    w.hello.is_some() && w.blob_rep // virtual agents too: they share their process's cache and blob port
 }
 
 /// PCs for the estimator: matching, able to work, real or virtual. Also the names of inputs that were guesses.
@@ -1130,7 +1134,8 @@ pub fn stage_tick(ctx: &Ctx) {
             let due = w.probed.is_none_or(|t| t.elapsed() > every);
             let idle = w.inflight.is_empty() && w.fetching.is_empty() && w.presence != "busy";
             let forced = std::mem::take(&mut w.probe_now);
-            if !real(w) || w.probing.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) || !(forced || (due && idle && w.calib > 0.0 && running < 2)) {
+            let virt = w.hello.as_ref().is_some_and(|h| h.virtual_node); // a link probe of a virtual agent measures nothing real
+            if !real(w) || virt || w.probing.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) || !(forced || (due && idle && w.calib > 0.0 && running < 2)) {
                 continue;
             }
             let (tid, tkey) = new_ticket();

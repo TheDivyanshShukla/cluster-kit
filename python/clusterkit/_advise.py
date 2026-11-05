@@ -325,10 +325,23 @@ def _hot_loop(F: dict[str, Any]) -> Suggestion | None:
                           {"py_share": p["py_share"], "builtin_share": p["builtin_share"], "hot_function": p["top"]})
 
 
+def gil_enabled() -> bool:
+    """False only on a free-threaded build (3.13t / 3.14t) running with the GIL off; every other Python has one."""
+    return getattr(sys, "_is_gil_enabled", lambda: True)()
+
+
 def _threads(F: dict[str, Any]) -> Suggestion | None:
     r, sp = F["cpu_ratio"], F.get("thread_speedup")
     if not F["ran"] or F["per"] < 0.001:
         return None
+    if not gil_enabled() and r >= 0.5 and sp and sp >= 1.8:  # free-threaded Python: Python threads run in parallel
+        total = F["n"] * F["per"]
+        return Suggestion("threads_ok", f"CPU-bound, and threads scale here (4 threads give {sp:.1f}x on this free-threaded Python)",
+                          "this Python has no GIL, so threads run Python code in parallel and share memory (no pickling, one copy of big data); "
+                          "this only holds on the PCs if their python3 is also a free-threaded build (python3 -c 'import sys; print(sys._is_gil_enabled())')",
+                          "from concurrent.futures import ThreadPoolExecutor   # inside fn, over its own sub-items\n"
+                          "ck.map(fn, items, mem_mb=...)   # or leave it: the cluster runs one process per slot, which also scales",
+                          "info", f"up to {sp:.1f}x per slot on threads (estimate)", total * (1 - 1 / sp), {"cpu_ratio": r, "thread_speedup": sp, "gil": False})
     if r < 0.5 or (sp and sp >= 2.5):
         total = F["n"] * F["per"]
         return Suggestion("io_bound", f"Mostly waiting, not computing (CPU {r:.0%} of wall time" + (f", 4 threads give {sp:.1f}x" if sp else "") + ")",
@@ -337,7 +350,7 @@ def _threads(F: dict[str, Any]) -> Suggestion | None:
                           "ck.map(fn, items, mem_mb=50)   # small mem_mb lets each PC run more copies at once",
                           "gain", f"up to 4x per slot on threads: saves about {_t(total * 0.75)} of {_t(total)} (estimate)", total * 0.75,
                           {"cpu_ratio": r, "thread_speedup": sp})
-    if sp is not None and sp < 1.3 and r > 0.8:
+    if sp is not None and sp < 1.3 and r > 0.8 and gil_enabled():  # with no GIL a flat speed-up is not the GIL's doing
         return Suggestion("gil_bound", f"CPU-bound and GIL-bound (4 threads give only {sp:.1f}x)",
                           "threads share one interpreter lock, so they cannot speed this up; separate processes can, and that is what the cluster uses",
                           "ck.map(fn, items)               # one process per slot on each PC (no threads)\n"
@@ -446,13 +459,33 @@ def _cannot_help(F: dict[str, Any]) -> Suggestion | None:
                       {"total_work_s": work, "need_total_s": need_w, "per_item_s": F["per"], "need_per_item_s": need_t, "local_s": pl.local_s})
 
 
+def _versions(F: dict[str, Any]) -> Suggestion | None:
+    """The PCs' Pythons against this one: pickles, syntax and library wheels must suit the oldest PC. Needs a reachable cluster."""
+    ck = F["ck"]
+    try:
+        vs = ck.pc_python()
+    except Exception:
+        return None
+    mine = "{}.{}".format(*sys.version_info[:2])
+    old = min(vs, key=lambda v: tuple(int(x) for x in v.rstrip("t").split(".")))
+    if not vs or {v.rsplit(".", 1)[0] for v in vs} == {mine}:
+        return None
+    pin = f"ck.config(pc_python={'.'.join(old.rstrip('t').split('.')[:2])!r})"
+    return Suggestion("python_versions", f"The PCs run Python {', '.join(vs)}; this machine runs {mine}",
+                      "code is shipped as source and re-parsed by each PC's python3 (newer syntax fails there), pickles use the lower protocol of both sides, "
+                      "and a library (numpy, torch, ...) pickled here may need the same major version there",
+                      pin + "   # checks the syntax of your code against that version before shipping and picks the pickle protocol\n"
+                      "install the same library versions on the PCs, or return plain Python data (lists, dicts, numbers) from fn",
+                      "warn", "avoids a failed job or an unreadable result", None, {"pcs": vs, "local": mine})
+
+
 def advise(fn: Callable[..., Any], items: list[Any], sample: int, o: dict[str, Any]) -> Advice:
     import clusterkit as ck
     if not items:
         return Advice()
     F = _facts(fn, items, sample, ck, o)
     cc = _cannot_help(F) if F["ran"] else None
-    out = [r for r in (_unpicklable(F), _failing(F), _tiny(F), _hot_loop(F), _threads(F), _memory(F), _side_effects(F), _nondet(F), _imports(F), cc, _transfer(F) if F.get('plan') else None) if r]
+    out = [r for r in (_unpicklable(F), _failing(F), _tiny(F), _hot_loop(F), _threads(F), _memory(F), _side_effects(F), _nondet(F), _imports(F), cc, _transfer(F) if F.get('plan') else None, _versions(F) if F['o']['local'] != 'always' else None) if r]
     out += _big(F)
     out.sort(key=lambda s: (_SEV[s.severity], -(s.gain_s or 0)))
     a = Advice(out)

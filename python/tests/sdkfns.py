@@ -25,3 +25,7 @@ def slow(x):
 
 def ident(x):
     return x
+
+
+def walrus(x, /):
+    return x + 1
