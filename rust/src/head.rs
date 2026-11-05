@@ -107,16 +107,15 @@ pub struct State {
 
 /// Exit status of a head that heard a higher epoch (HA-06). main/kit restarts it as `ck head --standby --head <new head>`.
 pub const FENCED_EXIT: i32 = 75;
-const NOQ_GRACE: Duration = Duration::from_secs(10);
 static ACKS: AtomicU64 = AtomicU64::new(0);
 
 /// HA-05: may the head dispatch? A candidate (just promoted) needs quorum; a primary that has standbys loses the right
-/// after NOQ_GRACE without quorum. Pure.
+/// after noq_grace_s without quorum. Pure.
 fn dispatch_ok(role: &str, quorum: bool, standbys: usize, noq_for: Duration) -> bool {
     if role == "candidate" {
         return quorum;
     }
-    !(standbys > 0 && !quorum && noq_for >= NOQ_GRACE)
+    !(standbys > 0 && !quorum && noq_for >= crate::tune::secs("noq_grace_s"))
 }
 
 /// Frames to write once the State lock is released.
@@ -192,8 +191,6 @@ pub fn recv_any(r: &mut impl Read, mac: &mut Option<FrameMac>) -> io::Result<(u8
     }
 }
 
-const MAX_ATTEMPTS: u8 = 3;
-const MAX_CHUNK: u64 = 50_000_000;
 
 /// EWMA with alpha 0.3; the first sample is taken as is.
 fn ewma(old: f64, x: f64) -> f64 {
@@ -241,11 +238,11 @@ enum Verdict {
     Fail,
 }
 
-/// Count one failed run of a chunk; a retryable failure is requeued until MAX_ATTEMPTS runs have failed.
+/// Count one failed run of a chunk; a retryable failure is requeued until max_attempts runs have failed.
 fn attempt(m: &mut HashMap<(u64, u64, u64), u8>, key: (u64, u64, u64), retry: bool) -> Verdict {
     let n = m.entry(key).or_insert(0);
     *n += 1;
-    if retry && *n < MAX_ATTEMPTS { Verdict::Requeue } else { Verdict::Fail }
+    if retry && (*n as u64) < crate::tune::n("max_attempts") { Verdict::Requeue } else { Verdict::Fail }
 }
 
 /// How long a chunk of `n` numbers may be in flight: 20x what the worker's measured rate predicts, at least 60 s.
@@ -278,7 +275,6 @@ fn join_state(open: bool, stored: Option<&str>) -> (String, bool) {
     }
 }
 
-const MAX_EVENTS: usize = 2000; // finished chunks kept for the dashboard's task stream
 
 static START: OnceLock<Instant> = OnceLock::new();
 pub fn now() -> f64 {
@@ -363,7 +359,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
     let (nodes, fleet_rate) = fleet(st, &j.selector, j.kind);
     let node_rate = node_rate(st, &st.workers[&wid], j.kind);
     let min = if j.kind == KIND_LIST { 1 } else { 1_000 };
-    let len = sched::chunk_len(j.policy, j.chunk, j.total, remaining, node_rate, fleet_rate, nodes, min, MAX_CHUNK).max(1);
+    let len = sched::chunk_len(j.policy, j.chunk, j.total, remaining, node_rate, fleet_rate, nodes, min, crate::tune::n("max_chunk")).max(1);
     let j = st.jobs.get_mut(&id)?;
     let (a, b) = next_chunk(&mut j.requeue, &mut j.next, j.end, len)?;
     Some((j.id, a, b, j.kind, j.arg.clone()))
@@ -1021,7 +1017,7 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     if st.workers.get(&wid).is_some_and(|w| w.inflight.is_empty()) {
         sh.1.notify_all(); // idle node: may switch job
     }
-    if st.events.len() == MAX_EVENTS {
+    while st.events.len() >= crate::tune::n("max_events") as usize {
         st.events.pop_front();
     }
     st.events.push_back((wid, t0, t1));
@@ -1114,7 +1110,7 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     // HA-01: a worker silent for LOST_AFTER (pulled cable, frozen process) errors the reader out, which requeues its chunks.
     // ponytail: with --spin the socket is non-blocking and there is no timeout.
     if !SPIN.load(std::sync::atomic::Ordering::Relaxed) {
-        s.set_read_timeout(Some(LOST_AFTER))?;
+        s.set_read_timeout(Some(lost_after()))?;
     }
     // Admission (FLT-04, SEC-02): a secured fleet needs a node key or a join code; afterwards every frame is sealed.
     let mut key = None;
@@ -1158,6 +1154,7 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     let (mut r, w) = conn(s)?;
     let w = Arc::new(Mutex::new(Out { s: w, mac: out_mac }));
     sh.0.lock().unwrap().workers.get_mut(&wid).unwrap().out = Some(w.clone());
+    ctrl_to(&w, tune_msg());
     refresh_soon(&ctx); // attributes and thread cap: coalesced, so a join storm is not O(W^2)
     let (credit, credits) = mpsc::channel();
     let w2 = w.clone();
@@ -1194,7 +1191,7 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
 
 fn heartbeat(w: Arc<Mutex<Out>>, sh: &Shared, wid: u64) {
     loop {
-        thread::sleep(HEARTBEAT_EVERY);
+        thread::sleep(heartbeat_every());
         if !sh.0.lock().unwrap().workers.contains_key(&wid) || w.lock().unwrap().put(HEARTBEAT, &[]).is_err() {
             return;
         }
@@ -1465,6 +1462,7 @@ pub fn run(o: &Opts) {
     let sh: Shared = Arc::default();
     let store = crate::store::Store::open(&crate::store::default_path()).unwrap_or_else(|e| die(&format!("database: {e}")));
     let ctx = Arc::new(Ctx { sh: sh.clone(), store: Arc::new(store), bus: Default::default(), repl: Default::default() });
+    crate::tune::load(ctx.store.meta("tune").as_deref());
     init_ha(&ctx);
     resume(&ctx);
     if !o.no_local && !fleet_open() {
@@ -1555,10 +1553,6 @@ fn beacon(ctx: &Ctx, name: &str) {
 // ---- wave 7: power modes (NET-06) and dynamic heads (HA-10) ----
 // Lock order: State lock, then PW. Never take the State lock while holding PW.
 
-const WAKING_FOR: Duration = Duration::from_secs(120);
-const RETRY_WAKE: Duration = Duration::from_secs(60);
-const RECRUIT_EVERY: Duration = Duration::from_secs(60);
-const TRIED_FOR: Duration = Duration::from_secs(600);
 
 #[derive(Default)]
 struct Pw {
@@ -1595,13 +1589,14 @@ fn power_cfg(ctx: &Ctx) -> crate::jobs::PowerSettings {
 }
 
 fn ha_cfg(ctx: &Ctx) -> crate::jobs::HaSettings {
-    ctx.store.meta("ha_settings").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    // the stored setting wins; without one the target_standbys tunable is the default
+    ctx.store.meta("ha_settings").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| crate::jobs::HaSettings { target_standbys: crate::tune::n("target_standbys") as u32, ..Default::default() })
 }
 
 /// "awake" | "asleep" | "waking". A PC the head put to sleep stays asleep until it reconnects.
 pub fn power_state(ctx: &Ctx, node_id: &str) -> &'static str {
     let g = pw_ctx(ctx);
-    if g.waking.get(node_id).is_some_and(|t| t.elapsed() < WAKING_FOR) {
+    if g.waking.get(node_id).is_some_and(|t| t.elapsed() < crate::tune::secs("waking_for_s")) {
         "waking"
     } else if g.asleep.contains(node_id) {
         "asleep"
@@ -1777,11 +1772,12 @@ fn choose_wake(asleep: &[(String, Attrs)], demand: &[(Selector, usize)]) -> Vec<
 }
 
 /// Whom to ask for a standby: None when `have` reaches `target`; else a candidate (id, lab) from a lab without one first. Pure.
-fn choose_recruit(have: usize, target: usize, cands: &[(String, String)], taken_labs: &std::collections::HashSet<String>) -> Option<String> {
+fn choose_recruit(have: usize, target: usize, cands: &[(String, String, f64)], taken_labs: &std::collections::HashSet<String>) -> Option<String> {
     if have >= target {
         return None;
     }
-    cands.iter().min_by_key(|(id, lab)| (taken_labs.contains(lab), id.clone())).map(|c| c.0.clone())
+    // a lab without a standby first, then the highest head score, then the id
+    cands.iter().min_by(|a, b| taken_labs.contains(&a.1).cmp(&taken_labs.contains(&b.1)).then(b.2.total_cmp(&a.2)).then(a.0.cmp(&b.0))).map(|c| c.0.clone())
 }
 
 fn idle_update(ctx: &Ctx) {
@@ -1811,11 +1807,11 @@ fn eco_tick(ctx: &Ctx) {
     };
     if cfg.wake_on_demand {
         let free = |s: &Selector| peers.iter().filter(|p| !asleep.contains(&p.id) && !p.busy && takes_tasks(&p.state) && s.matches(&p.attrs)).count();
-        let demand: Vec<(Selector, usize)> = jobs.iter().filter(|(s, _)| free(s) == 0).map(|(s, n)| (s.clone(), (*n).min(64) as usize)).collect();
+        let demand: Vec<(Selector, usize)> = jobs.iter().filter(|(s, _)| free(s) == 0).map(|(s, n)| (s.clone(), (*n).min(crate::tune::n("wake_max")) as usize)).collect();
         if !demand.is_empty() {
             let (rows, labels, pools) = (ctx.store.nodes(), ctx.store.labels(), ctx.store.pools());
             let labs: HashMap<u64, String> = ctx.store.labs().into_iter().map(|l| (l.id, l.name)).collect();
-            let waking: Vec<String> = pw_ctx(ctx).waking.iter().filter(|(_, t)| t.elapsed() < RETRY_WAKE).map(|(k, _)| k.clone()).collect();
+            let waking: Vec<String> = pw_ctx(ctx).waking.iter().filter(|(_, t)| t.elapsed() < crate::tune::secs("wake_retry_s")).map(|(k, _)| k.clone()).collect();
             let cands: Vec<(String, Attrs)> = rows.iter().filter(|r| asleep.contains(&r.node_id) && !waking.contains(&r.node_id)).map(|r| {
                 let lb: Vec<(String, String)> = labels.iter().filter(|l| l.0 == r.node_id).map(|l| (l.1.clone(), l.2.clone())).collect();
                 let pl: Vec<String> = pools.iter().filter(|p| p.members.contains(&r.node_id)).map(|p| p.name.clone()).collect();
@@ -1842,30 +1838,129 @@ fn eco_tick(ctx: &Ctx) {
     }
 }
 
+fn tune_msg() -> serde_json::Value {
+    serde_json::json!({"tune": crate::tune::agent_values()})
+}
+
+/// api.rs after PUT /api/v1/tunables (and a changed value on the head itself): agents get the agent-scope values now,
+/// the standby count is looked at again.
+pub fn tune_changed(ctx: &Ctx) {
+    let outs: Vec<_> = ctx.sh.0.lock().unwrap().workers.values().filter_map(|w| w.out.clone()).collect();
+    let m = tune_msg();
+    for o in &outs {
+        ctrl_to(o, m.clone());
+    }
+    println!("tune: sent to {} agents: {}", outs.len(), m["tune"]);
+    pw().last_recruit = None;
+}
+
+/// One PC as a head candidate (HA-10). `lab` is "" without a seat; `why` is "" when it can be a standby.
+struct Cand {
+    id: String,
+    host: String,
+    lab: String,
+    score: f64,
+    parts: [f64; 4],
+    role: &'static str,
+    why: String,
+}
+
+/// `node.lost` events of the last 24 h per node id. The event detail ends with "(node <id>)".
+fn losses_24h(ctx: &Ctx) -> HashMap<String, u32> {
+    let (since, mut before, mut m) = (now_ms() - 86_400_000, None, HashMap::new());
+    for _ in 0..40 {
+        let page = ctx.store.events(500, before);
+        let Some(last) = page.last() else { break };
+        before = Some(last.id);
+        for e in page.iter().filter(|e| e.kind == "node.lost" && e.ts_ms >= since) {
+            if let Some(id) = e.detail.rsplit("(node ").next().and_then(|t| t.strip_suffix(')')) {
+                *m.entry(id.to_string()).or_insert(0) += 1;
+            }
+        }
+        if last.ts_ms < since {
+            break;
+        }
+    }
+    m
+}
+
+fn weights() -> sched::HeadWeights {
+    let g = crate::tune::get;
+    sched::HeadWeights { speed: g("head_w_speed"), memory: g("head_w_memory"), stability: g("head_w_stability"), free: g("head_w_free") }
+}
+
+/// Every known PC scored as a head. `sel` is the standby selector from the HA settings.
+fn cand_list(ctx: &Ctx, sel: &Selector) -> Vec<Cand> {
+    let rows = ctx.store.nodes();
+    let labs: HashMap<u64, String> = ctx.store.labs().into_iter().map(|l| (l.id, l.name)).collect();
+    let (peers, _) = snap(ctx);
+    let live: HashMap<String, (f64, bool)> = {
+        let st = ctx.sh.0.lock().unwrap();
+        st.workers.values().filter_map(|w| Some((w.hello.as_ref()?.node_id.clone(), (w.calib, w.presence == "busy")))).collect()
+    };
+    let (head, standbys) = (crate::identity::node_id(), crate::repl::standby_nodes(ctx));
+    let asleep = pw_ctx(ctx).asleep.clone();
+    let lost = losses_24h(ctx);
+    let inputs: Vec<sched::HeadInputs> = rows.iter().map(|r| {
+        let inv: Inventory = serde_json::from_str(&r.inventory).unwrap_or_default();
+        let (calib, busy) = live.get(&r.node_id).copied().unwrap_or((0.0, false));
+        sched::HeadInputs {
+            calib_mhs: r.calib_mhs.unwrap_or(0.0).max(calib), cores: inv.cores_logical, ram_gb: inv.ram_bytes as f64 / (1u64 << 30) as f64,
+            losses_24h: lost.get(&r.node_id).copied().unwrap_or(0), in_use: busy,
+        }
+    }).collect();
+    let best = sched::HeadInputs {
+        calib_mhs: inputs.iter().map(|x| x.calib_mhs).fold(0.0, f64::max), cores: inputs.iter().map(|x| x.cores).max().unwrap_or(0),
+        ram_gb: inputs.iter().map(|x| x.ram_gb).fold(0.0, f64::max), ..Default::default()
+    };
+    rows.iter().zip(&inputs).map(|(r, x)| {
+        let p = peers.iter().find(|p| p.id == r.node_id);
+        let role = if r.node_id == head { "head" } else if standbys.contains(&r.node_id) { "standby" } else { "candidate" };
+        let why = match p {
+            None => "not connected",
+            Some(p) if p.virt => "virtual PC",
+            Some(p) if p.out.is_none() => "not connected",
+            Some(p) if !takes_tasks(&p.state) => "not active",
+            Some(_) if asleep.contains(&r.node_id) => "asleep",
+            Some(p) if !sel.matches(&p.attrs) => "does not match the standby selector",
+            _ => "",
+        };
+        let (score, parts) = sched::head_score(x, &best, weights());
+        Cand {
+            id: r.node_id.clone(), host: r.host.clone(), lab: r.lab_id.and_then(|i| labs.get(&i).cloned()).unwrap_or_default(),
+            score, parts, role, why: why.into(),
+        }
+    }).collect()
+}
+
+/// GET /api/v1/ha/candidates: every PC scored as a head, best first.
+pub fn candidates(ctx: &Ctx) -> Vec<serde_json::Value> {
+    let sel = parse_sel(&ha_cfg(ctx).selector).unwrap_or_default();
+    let mut v = cand_list(ctx, &sel);
+    v.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    v.into_iter().map(|c| serde_json::json!({
+        "node_id": c.id, "host": c.host, "lab": (!c.lab.is_empty()).then_some(c.lab), "score": c.score,
+        "parts": {"speed": c.parts[0], "memory": c.parts[1], "stability": c.parts[2], "free": c.parts[3]},
+        "role": c.role, "eligible": c.why.is_empty(), "why": c.why,
+    })).collect()
+}
+
 fn recruit_tick(ctx: &Ctx) {
     let ha = ha_cfg(ctx);
     let target = ha.target_standbys as usize;
     let have = crate::repl::standby_count(ctx);
-    if have >= target || !primary(ctx) || pw().last_recruit.is_some_and(|t| t.elapsed() < RECRUIT_EVERY) {
+    if have >= target || !primary(ctx) || pw().last_recruit.is_some_and(|t| t.elapsed() < crate::tune::secs("recruit_every_s")) {
         return;
     }
     let Ok(sel) = parse_sel(&ha.selector) else { return };
     let Some(ip) = local_ip() else { return };
-    let (peers, _) = snap(ctx);
-    let head = crate::identity::node_id();
-    let standbys: std::collections::HashSet<String> = crate::repl::standby_nodes(ctx).into_iter().collect();
-    let (asleep, tried) = {
-        let g = pw_ctx(ctx);
-        (g.asleep.clone(), g.tried.iter().filter(|(_, t)| t.elapsed() < TRIED_FOR).map(|(k, _)| k.clone()).collect::<std::collections::HashSet<_>>())
-    };
-    let lab = |p: &Peer| p.attrs.get("lab").cloned().unwrap_or_default();
-    let taken: std::collections::HashSet<String> = peers.iter().filter(|p| standbys.contains(&p.id)).map(lab).collect();
-    let cands: Vec<(String, String)> = peers.iter()
-        .filter(|p| !p.virt && p.id != head && takes_tasks(&p.state) && p.out.is_some() && !asleep.contains(&p.id) && !standbys.contains(&p.id) && !tried.contains(&p.id) && sel.matches(&p.attrs))
-        .map(|p| (p.id.clone(), lab(p))).collect();
+    let tried: std::collections::HashSet<String> = pw().tried.iter().filter(|(_, t)| t.elapsed() < crate::tune::secs("recruit_retry_s")).map(|(k, _)| k.clone()).collect();
+    let all = cand_list(ctx, &sel);
+    let taken: std::collections::HashSet<String> = all.iter().filter(|c| c.role == "standby").map(|c| c.lab.clone()).collect();
+    let cands: Vec<(String, String, f64)> = all.iter().filter(|c| c.role == "candidate" && c.why.is_empty() && !tried.contains(&c.id)).map(|c| (c.id.clone(), c.lab.clone(), c.score)).collect();
     let Some(id) = choose_recruit(have, target, &cands, &taken) else { return };
-    let p = peers.iter().find(|p| p.id == id).unwrap();
-    ctrl_to(p.out.as_ref().unwrap(), serde_json::json!({"standby_of": format!("{ip}:{}", port())}));
+    let Some(o) = snap(ctx).0.into_iter().find(|p| p.id == id).and_then(|p| p.out) else { return };
+    ctrl_to(&o, serde_json::json!({"standby_of": format!("{ip}:{}", port())}));
     {
         let mut g = pw();
         g.last_recruit = Some(Instant::now());
@@ -1874,17 +1969,21 @@ fn recruit_tick(ctx: &Ctx) {
     event(ctx, "ha.recruit", "head", &format!("asked node {id} to start a standby head (have {have}, want {target})"));
 }
 
-/// Eco and recruit ticks. idle tracking every 5 s, eco every 30 s, recruit every 10 s.
+/// Eco and recruit ticks at the eco_tick_s / recruit_tick_s tunables; idle tracking every 5 s.
 fn power_loop(ctx: Arc<Ctx>) {
-    let mut n = 0u64;
+    let (mut idle, mut eco, mut rec) = (Instant::now(), Instant::now(), Instant::now());
     loop {
-        thread::sleep(Duration::from_secs(5));
-        n += 1;
-        idle_update(&ctx);
-        if n % 6 == 0 {
+        thread::sleep(Duration::from_secs(1));
+        if idle.elapsed() >= Duration::from_secs(5) {
+            idle = Instant::now();
+            idle_update(&ctx);
+        }
+        if eco.elapsed() >= crate::tune::secs("eco_tick_s") {
+            eco = Instant::now();
             eco_tick(&ctx);
         }
-        if n % 2 == 0 {
+        if rec.elapsed() >= crate::tune::secs("recruit_tick_s") {
+            rec = Instant::now();
             recruit_tick(&ctx);
         }
     }
@@ -1923,14 +2022,39 @@ mod power_tests {
 
     #[test]
     fn recruit_chooser() {
-        let c = vec![("n1".to_string(), "A".to_string()), ("n2".to_string(), "B".to_string()), ("n3".to_string(), "B".to_string())];
+        let c = vec![("n1".to_string(), "A".to_string(), 50.0), ("n2".to_string(), "B".to_string(), 50.0), ("n3".to_string(), "B".to_string(), 90.0)];
         let none = std::collections::HashSet::new();
-        assert_eq!(choose_recruit(0, 2, &c, &none).as_deref(), Some("n1"));
+        assert_eq!(choose_recruit(0, 2, &c, &none).as_deref(), Some("n3"), "best score first");
         assert_eq!(choose_recruit(2, 2, &c, &none), None);
         let taken: std::collections::HashSet<String> = ["A".to_string()].into();
-        assert_eq!(choose_recruit(1, 2, &c, &taken).as_deref(), Some("n2"), "a lab without a standby first");
+        assert_eq!(choose_recruit(1, 2, &c, &taken).as_deref(), Some("n3"), "a lab without a standby first, best score in it");
         let all: std::collections::HashSet<String> = ["A".to_string(), "B".to_string()].into();
-        assert_eq!(choose_recruit(1, 2, &c, &all).as_deref(), Some("n1"), "all labs taken: any");
+        assert_eq!(choose_recruit(1, 2, &c, &all).as_deref(), Some("n3"), "all labs taken: any");
+    }
+
+    #[test]
+    fn candidates_rank_faster_stabler_first() {
+        let c = Ctx { sh: Arc::default(), store: Arc::new(crate::store::Store::memory()), bus: Default::default(), repl: Default::default() };
+        let inv = |cores: u32, gb: u64| serde_json::to_string(&Inventory { cores_logical: cores, ram_bytes: gb << 30, ..Default::default() }).unwrap();
+        for (id, cores, gb, mhs) in [("slow", 4, 8, 5.0), ("fast", 12, 32, 20.0), ("flaky", 12, 32, 20.0)] {
+            c.store.upsert_node(id, id, "10.0.0.1", &inv(cores, gb), now_ms()).unwrap();
+            c.store.set_node_calib(id, mhs).unwrap();
+        }
+        for _ in 0..3 {
+            event(&c, "node.lost", "head", "flaky at 10.0.0.1 (node flaky)");
+        }
+        let v = candidates(&c);
+        let ids: Vec<&str> = v.iter().map(|x| x["node_id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["fast", "slow", "flaky"], "three losses outweigh the speed gap");
+        assert_eq!(v[0]["why"], "not connected");
+        assert_eq!(v[2]["parts"]["stability"], 0.25);
+    }
+
+    #[test]
+    fn tune_reaches_a_connected_agent() {
+        let c = Ctx { sh: Arc::default(), store: Arc::new(crate::store::Store::memory()), bus: Default::default(), repl: Default::default() };
+        tune_changed(&c); // nobody connected: must not panic
+        assert!(tune_msg()["tune"].is_object());
     }
 }
 

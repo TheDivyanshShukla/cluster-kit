@@ -216,7 +216,9 @@ fn command_base(cmd: &[u8]) -> String {
     format!("{interp} \"{}\"", path.display())
 }
 
-pub const OUT_MAX: usize = 64 << 20; // stdout per piece
+fn out_max() -> usize {
+    (crate::tune::get("out_max_mb") * 1048576.0) as usize // stdout per piece
+}
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One piece of a `--cmd` job (JOB-04): env CK_*, exit 0 = ok, 75 = retry, anything else = failed.
@@ -248,7 +250,7 @@ fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, stdin: Option<&
     let _ = fs::remove_dir_all(&scratch);
     let o = out.map_err(|e| (false, format!("could not start the program: {e}")))?;
     match o.status.code() {
-        Some(0) if o.stdout.len() > OUT_MAX => Err((false, format!("output over the {} MiB limit", OUT_MAX >> 20))),
+        Some(0) if o.stdout.len() > out_max() => Err((false, format!("output over the {} MiB limit", out_max() >> 20))),
         Some(0) => Ok(o.stdout),
         code => {
             let err = String::from_utf8_lossy(&o.stderr);

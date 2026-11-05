@@ -179,13 +179,22 @@ pub fn set(changes: &[(String, Option<f64>)]) -> Result<String, String> {
     Ok(serde_json::to_string(&s.db).unwrap_or_default())
 }
 
+/// The head's own value: env, then database, then default. Never what a head sent (a head process that also runs a
+/// local agent receives its own CTRL tune; reading that back would keep a reset value alive).
+fn own_value(k: &Knob) -> f64 {
+    if let Some(v) = env_value(k.key) {
+        return v.clamp(k.min, k.max);
+    }
+    state().read().unwrap().db.get(k.key).copied().unwrap_or(k.default)
+}
+
 /// Head: the agent-scope values to send in CTRL {"tune": ...} (only ones that differ from the default).
 pub fn agent_values() -> serde_json::Map<String, serde_json::Value> {
     KNOBS
         .iter()
         .filter(|k| k.scope != Head)
         .filter_map(|k| {
-            let v = get(k.key);
+            let v = own_value(k);
             (v != k.default).then(|| (k.key.to_string(), v.into()))
         })
         .collect()
@@ -237,7 +246,12 @@ mod tests {
         assert_eq!((get("pipeline"), n("pipeline"), source("pipeline")), (4.0, 4, "db"));
         let a = agent_values();
         assert!(a.contains_key("calib_s") && !a.contains_key("pipeline"), "only agent-scope values go to agents");
+        // a head that also runs an agent gets its own values back; a reset must still win
+        apply_remote(&serde_json::json!({"calib_s": 5.0}));
         set(&[("pipeline".into(), None), ("calib_s".into(), None)]).unwrap();
+        assert!(!agent_values().contains_key("calib_s"), "reset value is not re-sent");
+        apply_remote(&serde_json::Value::Object(agent_values()));
+        assert_eq!(get("calib_s"), 3.0);
         assert_eq!((get("pipeline"), source("pipeline")), (2.0, "default"));
         assert_eq!(secs("heartbeat_s"), Duration::from_secs(1));
     }

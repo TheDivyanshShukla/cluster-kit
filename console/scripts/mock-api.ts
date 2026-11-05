@@ -220,7 +220,7 @@ const haT0 = now();
 let haSeq = 1200;
 let powerCfg = { mode: 'eco', idle_min: 15, keep_awake: 4, wake_on_demand: true };
 let haCfg = { target_standbys: 2, selector: '!virtual' };
-const ha = { role: 'primary' as 'primary' | 'standby' | 'candidate', epoch: 3, standbys: [{ node_id: 'n018', lag: 0 }, { node_id: 'n022', lag: 0 }] };
+const ha = { head: 'n001', role: 'primary' as 'primary' | 'standby' | 'candidate', epoch: 3, standbys: [{ node_id: 'n018', lag: 0 }, { node_id: 'n022', lag: 0 }] };
 const hostOf = (id: string) => nodes.get(id)?.host ?? id;
 const pushHa = () => sendAll('ha', haState());
 const haState = () => {
@@ -234,7 +234,7 @@ const haState = () => {
 };
 function recruit() {
 	const taken = new Set(ha.standbys.map((s) => s.node_id));
-	const id = matchIds(haCfg.selector).find((i) => nodes.get(i)!.online && nodes.get(i)!.power === 'awake' && !taken.has(i));
+	const id = matchIds(haCfg.selector).find((i) => nodes.get(i)!.online && nodes.get(i)!.power === 'awake' && !taken.has(i) && i !== ha.head);
 	if (!id || ha.standbys.length >= haCfg.target_standbys) return;
 	ha.standbys.push({ node_id: id, lag: 5 });
 	logEvent('ha.recruit', '', `${hostOf(id)} became a standby`);
@@ -250,6 +250,7 @@ function failover(after: number, first?: string) {
 		pushHa();
 		setTimeout(() => {
 			const head = ha.standbys.shift();
+			if (head) ha.head = head.node_id;
 			ha.role = 'primary';
 			ha.epoch++;
 			logEvent('ha.promote', '', `${head ? hostOf(head.node_id) : 'a standby'} is the head, term ${ha.epoch}`);
@@ -273,6 +274,71 @@ Object.assign(nodes.get('n010')!, { online: false, power: 'waking' });
 const hm = () => hhmm(new Date());
 setTimeout(() => { for (const id of ['n016', 'n017', 'n019']) setNode(id, { online: false, power: 'asleep' }); logEvent('power.sleep', '', `3 PCs went to sleep, ${hm()}`); }, 15_000);
 setTimeout(() => { setNode('n006', { power: 'waking' }); setTimeout(() => { setNode('n006', { online: true, power: 'awake' }); logEvent('power.wake', '', `pc-06 woke up, ${hm()}`); }, 6_000); }, 22_000);
+
+// ---- tunables: copy of rust/src/tune.rs KNOBS [key, group, default, min, max, unit, scope, help]
+const KNOBS: [string, string, number, number, number, string, 'head' | 'agent' | 'both', string][] = [
+	["heartbeat_s", "Liveness", 1.0, 0.2, 10.0, "s", "both", "How often head and agents send a heartbeat."],
+	["lost_after_s", "Liveness", 5.0, 1.0, 120.0, "s", "both", "Silence after which a PC (or the head) counts as lost and its work moves elsewhere."],
+	["pipeline", "Dispatch", 2.0, 1.0, 16.0, "chunks", "head", "Chunks each PC holds at once: one computing, the rest queued."],
+	["target_chunk_s", "Dispatch", 1.0, 0.05, 60.0, "s", "head", "Adaptive chunks aim to take this long on the PC that gets them."],
+	["max_chunk", "Dispatch", 50000000.0, 1000.0, 1000000000000.0, "numbers", "head", "Largest chunk the head ever hands out."],
+	["max_attempts", "Dispatch", 3.0, 1.0, 20.0, "tries", "head", "Tries per range before a job fails (failed program runs)."],
+	["max_events", "Dispatch", 2000.0, 100.0, 100000.0, "chunks", "head", "Finished chunks kept for the live task stream."],
+	["member_window_s", "Head failover", 60.0, 5.0, 3600.0, "s", "head", "PCs seen within this window count toward the majority a new head waits for; ones that never return drop out this long after a takeover."],
+	["noq_grace_s", "Head failover", 10.0, 2.0, 600.0, "s", "head", "A head with standbys that has no majority for this long stops handing out work (split-brain guard)."],
+	["standby_step_s", "Head failover", 2.0, 0.5, 60.0, "s", "head", "Extra wait per place in the standby order, so standbys take over one at a time."],
+	["ring_max", "Head failover", 100000.0, 1000.0, 10000000.0, "changes", "head", "Changes kept in memory for standbys that fall behind; older gaps need a full copy."],
+	["switchover_wait_s", "Head failover", 5.0, 1.0, 120.0, "s", "head", "Planned switchover: how long to wait for the standby to confirm."],
+	["client_failover_s", "Head failover", 60.0, 5.0, 3600.0, "s", "agent", "How long `ck run` keeps looking for a new head after losing one."],
+	["target_standbys", "Dynamic heads", 2.0, 0.0, 5.0, "standbys", "head", "Standby heads to keep; a missing one is recruited automatically (also in Standby heads)."],
+	["recruit_tick_s", "Dynamic heads", 10.0, 1.0, 600.0, "s", "head", "How often the head checks whether a standby is missing."],
+	["recruit_every_s", "Dynamic heads", 60.0, 5.0, 3600.0, "s", "head", "At most one new standby request per this interval."],
+	["recruit_retry_s", "Dynamic heads", 600.0, 30.0, 86400.0, "s", "head", "A PC that was asked (or failed) is not asked again for this long."],
+	["head_w_speed", "Dynamic heads", 1.0, 0.0, 10.0, "weight", "head", "Head choice: weight of the PC's measured speed (calibration)."],
+	["head_w_memory", "Dynamic heads", 1.0, 0.0, 10.0, "weight", "head", "Head choice: weight of RAM and cores."],
+	["head_w_stability", "Dynamic heads", 2.0, 0.0, 10.0, "weight", "head", "Head choice: weight of staying connected (few losses in the last day)."],
+	["head_w_free", "Dynamic heads", 1.0, 0.0, 10.0, "weight", "head", "Head choice: weight of not being used by a person right now."],
+	["eco_tick_s", "Power", 30.0, 5.0, 3600.0, "s", "head", "How often eco mode looks for PCs to sleep or wake."],
+	["waking_for_s", "Power", 120.0, 10.0, 3600.0, "s", "head", "A PC that does not reconnect this long after a wake packet shows 'did not wake'."],
+	["wake_retry_s", "Power", 60.0, 5.0, 3600.0, "s", "head", "Wait before sending another wake packet to the same PC."],
+	["wake_max", "Power", 64.0, 1.0, 10000.0, "PCs", "head", "Most PCs woken at once for waiting work."],
+	["energy_every_s", "Power", 10.0, 1.0, 600.0, "s", "agent", "How often agents report CPU energy (RAPL)."],
+	["presence_idle_s", "Presence", 300.0, 10.0, 86400.0, "s", "agent", "A PC counts as free again after nobody touched it for this long."],
+	["presence_probe_s", "Presence", 2.0, 0.5, 60.0, "s", "agent", "How often agents check keyboard and mouse activity."],
+	["calib_s", "Presence", 3.0, 0.5, 60.0, "s", "agent", "Length of the speed test an agent runs when it joins."],
+	["unacked_max", "Agent limits", 10000.0, 100.0, 10000000.0, "results", "agent", "Results an agent keeps until the head confirms them."],
+	["unacked_max_mb", "Agent limits", 256.0, 1.0, 65536.0, "MB", "agent", "Memory for unconfirmed results; the oldest go first."],
+	["out_max_mb", "Agent limits", 64.0, 1.0, 4096.0, "MB", "agent", "Program output kept per chunk."],
+	["push_max_kb", "Agent limits", 64.0, 1.0, 65536.0, "KB", "head", "Largest script `ck run --push` may send."],
+	["max_body_mb", "API", 1.0, 0.01, 1024.0, "MB", "head", "Largest API request body."],
+	["max_list_body_mb", "API", 64.0, 1.0, 4096.0, "MB", "head", "Largest list-job upload (signed-in operators only)."],
+	["max_items", "API", 1000000.0, 1.0, 100000000.0, "items", "head", "Most items in one list job."],
+	["max_item_bytes", "API", 4096.0, 16.0, 1048576.0, "bytes", "head", "Longest single item in a list job."],
+	["session_idle_h", "Security", 12.0, 0.1, 720.0, "h", "head", "Sign-out after this long without activity."],
+	["session_max_d", "Security", 7.0, 0.1, 365.0, "days", "head", "Sign-out after this long in any case."],
+	["login_fail_max", "Security", 5.0, 1.0, 100.0, "tries", "head", "Wrong passwords allowed per window before login is blocked."],
+	["login_fail_window_min", "Security", 5.0, 1.0, 1440.0, "min", "head", "Window for counting wrong passwords."],
+];
+const tuneDb = new Map<string, number>();
+const TUNE_ENV = new Set(['ring_max']); // pretend CK_TUNE_RING_MAX is set: shown read-only
+const tuneVal = (k: string) => tuneDb.get(k) ?? KNOBS.find((x) => x[0] === k)![2];
+const tunables = () => KNOBS.map(([key, group, def, min, max, unit, scope, help]) => ({ key, group, value: tuneVal(key), default: def, min, max, unit, scope, help, source: TUNE_ENV.has(key) ? 'env' : tuneDb.has(key) ? 'db' : 'default' }));
+/** Head choice (GET /ha/candidates): speed, memory, stability and freedom, weighted by head_w_*; best first. */
+function candidates() {
+	const w = { speed: tuneVal('head_w_speed'), memory: tuneVal('head_w_memory'), stability: tuneVal('head_w_stability'), free: tuneVal('head_w_free') };
+	const sum = w.speed + w.memory + w.stability + w.free || 1;
+	const lostLast = (id: string) => events.filter((e) => e.kind === 'node.lost' && e.detail.includes(nodes.get(id)!.host)).length;
+	const standbyIds = new Set(ha.standbys.map((s) => s.node_id));
+	return [...nodes.values()].map((n, i) => {
+		const inv = (n.inventory ?? {}) as any;
+		const parts = { speed: Math.min(1, (n.calib_mhs ?? 0) / 70), memory: Math.min(1, (inv.ram_bytes / 2 ** 30) / 32 * 0.6 + (inv.cores_logical / 16) * 0.4), stability: Math.max(0, 1 - lostLast(n.node_id) * 0.2 - (i % 7 === 0 ? 0.25 : 0)), free: n.presence === 'busy' ? 0 : 1 };
+		const score = Math.round(100 * (parts.speed * w.speed + parts.memory * w.memory + parts.stability * w.stability + parts.free * w.free) / sum * 10) / 10;
+		const why = n.node_id === ha.head || standbyIds.has(n.node_id) ? '' : i >= 28 ? 'virtual PC' : !n.online ? (n.power === 'asleep' ? 'asleep' : 'not connected') : n.state !== 'active' ? `not active (${n.state})` : !matchIds(haCfg.selector).includes(n.node_id) ? 'does not match the standby selector' : '';
+		const role = n.node_id === ha.head ? 'head' : standbyIds.has(n.node_id) ? 'standby' : 'candidate';
+		const lab = labs.find((l) => l.id === n.lab_id)?.name ?? null;
+		return { node_id: n.node_id, host: n.host, lab, score, parts, role, eligible: why === '', why };
+	}).sort((a, b) => b.score - a.score);
+}
 
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
 	new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
@@ -366,6 +432,28 @@ async function handle(req: Request): Promise<Response> {
 	}
 	if (p === '/api/v1/cluster') return json(cluster());
 	if (p === '/api/v1/ha') return json(haState());
+	if (p === '/api/v1/tunables') {
+		if (m === 'PUT') {
+			if ((d = need('admin'))) return d;
+			const b = await body();
+			const next = new Map(tuneDb);
+			for (const [k, v] of Object.entries(b)) {
+				const kn = KNOBS.find((x) => x[0] === k);
+				if (!kn) return err(400, 'invalid_request', `Unknown setting ${k}.`);
+				if (TUNE_ENV.has(k)) return err(409, 'conflict', `${k} is set by the environment (CK_TUNE_${k.toUpperCase()}) and cannot be changed here.`);
+				if (v === null) next.delete(k);
+				else if (typeof v !== 'number' || !(v >= kn[3] && v <= kn[4])) return err(400, 'invalid_request', `${k} must be between ${kn[3]} and ${kn[4]} ${kn[5]}.`);
+				else next.set(k, v);
+			}
+			const before = tunables();
+			tuneDb.clear();
+			next.forEach((v, k) => tuneDb.set(k, v));
+			const ch = tunables().flatMap((t, i) => (t.value !== before[i].value ? [`${t.key} ${before[i].value} -> ${t.value}`] : []));
+			logEvent('tune.changed', me.name, ch.join(', ') || 'no change');
+		}
+		return json({ tunables: tunables() });
+	}
+	if (p === '/api/v1/ha/candidates') return json({ candidates: candidates() });
 	if (p === '/api/v1/ha/switchover' && m === 'POST') {
 			if ((d = need('admin'))) return d;
 			const b = await body();

@@ -171,3 +171,15 @@ GET `/stats` (and `/stats?detail=1`) stays unchanged for the old dashboard (`/le
 | PUT `/api/v1/ha/settings` | admin | HaSettings | same as GET. target_standbys 0-5; selector parses (ORG-04) |
 
 PowerSettings `{"mode": "off"|"eco", "idle_min": 15, "keep_awake": 4, "wake_on_demand": true}`; HaSettings `{"target_standbys": 2, "selector": "!virtual"}` (rust/src/jobs.rs). NodeRow gains `power`: `awake` | `asleep` | `waking`. Events: `power.sleep`, `power.wake`, `ha.recruit`. Eco mode never sleeps the head PC, a standby, a PC with work in flight, or below keep_awake awake PCs; with wake_on_demand, queued work that has no free PC wakes asleep PCs that match its selector. Dynamic heads: every 10 s the primary checks its standby count and, if short, sends one matching agent (not virtual, not already a standby, a lab without a standby first) CTRL `{"standby_of": "<head ip:port>"}`; that agent starts `ck head --standby` beside itself.
+
+## Every value adjustable, and head choice (wave 9)
+
+| Method and path | Role | Body | Reply |
+| --- | --- | --- | --- |
+| GET `/api/v1/tunables` | viewer | | `{"tunables": [Tunable]}` in registry order (rust/src/tune.rs `KNOBS`) |
+| PUT `/api/v1/tunables` | admin | `{"key": number or null, ...}` (null = back to default) | same as GET. All or nothing: 400 names the first bad key or range. Stored in meta "tune" (replicated); agent-scope values go to every agent at once (CTRL `{"tune": {...}}`). Event `tune.changed` with the old and new values |
+| GET `/api/v1/ha/candidates` | viewer | | `{"candidates": [Candidate]}`, best first |
+
+Tunable = `{"key", "group", "value", "default", "min", "max", "unit", "scope": "head"|"agent"|"both", "help", "source": "default"|"db"|"env"|"head"}`. A value set by env `CK_TUNE_<KEY>` wins over the database and shows `source: "env"` (the console shows it read-only).
+
+Candidate = `{"node_id", "host", "lab": name or null, "score": 0-100, "parts": {"speed", "memory", "stability", "free"} (each 0-1), "role": "head"|"standby"|"candidate", "eligible": bool, "why": "" or the reason it cannot be a standby (virtual, not connected, not active, no selector match)}`. Score = `sched::head_score` with the weights head_w_*; inputs: calibration MH/s, cores, RAM, `node.lost` events in the last 24 h, presence. HA-10 recruiting takes the best eligible candidate in a lab without a standby (any lab if all have one); the planned switchover target in the console defaults to the best standby.

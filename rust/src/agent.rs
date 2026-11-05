@@ -169,21 +169,21 @@ fn connect(addr: &str) -> io::Result<TcpStream> {
 /// Chunks (job, start) being computed in this process, with how many agents run each (virtual agents share one process).
 static RUNNING: std::sync::LazyLock<Mutex<HashMap<(u64, u64), u32>>> = std::sync::LazyLock::new(Default::default);
 
-const UNACKED_MAX_N: usize = 10_000;
-const UNACKED_MAX_BYTES: usize = 256 << 20;
-
 /// RESULT frames sent but not yet ACKed by a head (HA-04), oldest first. Bounded: past the limits the oldest are dropped.
 struct Unacked {
     next: u64,
     by_seq: BTreeMap<u64, ((u64, u64, u64), Vec<u8>)>,
     idx: HashMap<(u64, u64, u64), u64>,
     bytes: usize,
-    max: (usize, usize),
+    max: (usize, usize), // (0, 0) = read the tunables on every add
 }
 
 impl Unacked {
     fn new(max_n: usize, max_bytes: usize) -> Self {
         Unacked { next: 0, by_seq: BTreeMap::new(), idx: HashMap::new(), bytes: 0, max: (max_n, max_bytes) }
+    }
+    fn limits(&self) -> (usize, usize) {
+        if self.max == (0, 0) { (crate::tune::n("unacked_max") as usize, (crate::tune::get("unacked_max_mb") * 1048576.0) as usize) } else { self.max }
     }
     fn add(&mut self, key: (u64, u64, u64), payload: Vec<u8>) {
         self.ack(key);
@@ -191,7 +191,8 @@ impl Unacked {
         self.by_seq.insert(self.next, (key, payload));
         self.idx.insert(key, self.next);
         self.next += 1;
-        while self.by_seq.len() > self.max.0 || self.bytes > self.max.1 {
+        let (max_n, max_bytes) = self.limits();
+        while self.by_seq.len() > max_n || self.bytes > max_bytes {
             let Some((_, (k, p))) = self.by_seq.pop_first() else { break };
             self.idx.remove(&k);
             self.bytes -= p.len();
@@ -359,7 +360,7 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
         thread::spawn(sampler);
     });
     let mut first = true;
-    let unacked = Arc::new(Mutex::new(Unacked::new(UNACKED_MAX_N, UNACKED_MAX_BYTES))); // survives reconnects, even to another head
+    let unacked = Arc::new(Mutex::new(Unacked::new(0, 0))); // survives reconnects, even to another head
     loop {
         // after a restart try the head we knew before waiting for a beacon
         let remembered = if first { std::fs::read_to_string(last_head_path()).ok().and_then(|t| parse_last_head(&t)) } else { None };
@@ -435,7 +436,6 @@ fn ack(s: &mut TcpStream, key: &[u8]) -> io::Result<(FrameMac, FrameMac)> {
 fn extras(w: Arc<Mutex<Out>>) {
     let ctrl = |body: String| w.lock().unwrap().put(CTRL, body.as_bytes()).is_ok();
     let on = crate::presence::enabled();
-    let idle_after: u64 = std::env::var("CK_PRESENCE_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
     let mut h = crate::presence::Hysteresis::default();
     let t0 = Instant::now();
     // ponytail: calibration shares the CPUs with chunks already running, so a join under load reads low; once per process
@@ -446,8 +446,8 @@ fn extras(w: Arc<Mutex<Out>>) {
     let mut next_energy = Instant::now();
     loop {
         if on && Instant::now() >= next_probe {
-            next_probe = Instant::now() + Duration::from_secs(2);
-            if let Some(b) = h.step(crate::presence::busy(), t0.elapsed().as_secs(), idle_after) {
+            next_probe = Instant::now() + crate::tune::secs("presence_probe_s");
+            if let Some(b) = h.step(crate::presence::busy(), t0.elapsed().as_secs(), crate::presence::get_or_env("presence_idle_s", "CK_PRESENCE_IDLE_SECS") as u64) {
                 println!("presence: {}", if b { "busy" } else { "idle" });
                 if !ctrl(format!(r#"{{"presence":"{}"}}"#, if b { "busy" } else { "idle" })) {
                     return;
@@ -456,7 +456,7 @@ fn extras(w: Arc<Mutex<Out>>) {
         }
         if !calib_sent {
             calib_sent = true;
-            let f = *CALIB.get_or_init(|| crate::kernels::calibrate_mhs(3.0));
+            let f = *CALIB.get_or_init(|| crate::kernels::calibrate_mhs(crate::tune::get("calib_s")));
             println!("calibration: {f:.1} MH/s");
             if !ctrl(format!(r#"{{"calib_mhs":{f}}}"#)) {
                 return;
@@ -465,7 +465,7 @@ fn extras(w: Arc<Mutex<Out>>) {
         // OBS-03: package energy every 10 s, when this PC exposes RAPL (one reader per process: virtual agents share it)
         if let Some(r) = RAPL.get_or_init(|| crate::presence::Rapl::open().map(Mutex::new)) {
             if Instant::now() >= next_energy {
-                next_energy = Instant::now() + Duration::from_secs(10);
+                next_energy = Instant::now() + crate::tune::secs("energy_every_s");
                 let j = r.lock().unwrap().joules();
                 if !ctrl(format!(r#"{{"energy_j":{j:.1}}}"#)) {
                     return;
@@ -503,7 +503,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     // HA-01: a head silent for LOST_AFTER (frozen, cable pulled) errors the reader out.
     // ponytail: with --spin the socket is non-blocking and there is no timeout.
     if !SPIN.load(Relaxed) {
-        s.set_read_timeout(Some(LOST_AFTER))?;
+        s.set_read_timeout(Some(lost_after()))?;
     }
     let node_id = match virt {
         Some(i) => format!("{}/v{i}", crate::identity::node_id()),
@@ -532,7 +532,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
             send_w(RESULT, p)?;
         }
     }
-    for _ in 0..PIPELINE {
+    for _ in 0..pipeline() {
         send_w(REQ, &[])?;
     }
     // HA-06: a head with a higher epoch beacons: drop this one and move (un-ACKed results go along).
@@ -558,7 +558,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     thread::spawn(move || {
         // ends when work() shuts the socket down and the send fails
         while {
-            thread::sleep(HEARTBEAT_EVERY);
+            thread::sleep(heartbeat_every());
             w2.lock().unwrap().put(HEARTBEAT, &[]).is_ok()
         } {}
     });
@@ -595,6 +595,9 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                 }
             }
             Ok((CTRL, p)) => {
+                if let Some(t) = serde_json::from_slice::<serde_json::Value>(&p).ok().and_then(|v| v.get("tune").cloned()) {
+                    crate::tune::apply_remote(&t);
+                }
                 power_ctrl(&p, &w_r);
                 if let Some(c) = parse_cap(&p) {
                     cap_r.store(c.unwrap_or(0), Relaxed);
@@ -687,6 +690,19 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_tune_skips_head_keys_and_unacked_reads_it_live() {
+        crate::tune::apply_remote(&serde_json::json!({"unacked_max": 100.0, "pipeline": 9.0, "calib_s": 0.1}));
+        assert_eq!(crate::tune::get("pipeline"), 2.0, "head-scope key ignored");
+        assert_eq!(crate::tune::get("calib_s"), 3.0, "out of range ignored");
+        let mut u = Unacked::new(0, 0);
+        for i in 0..150 {
+            u.add((1, i, i + 1), vec![0; 4]);
+        }
+        assert_eq!(u.by_seq.len(), 100, "changed knob read at use");
+        crate::tune::apply_remote(&serde_json::json!({}));
+    }
 
     #[test]
     fn power_ctrl_dry_run_wol_and_standby_failure_report() {

@@ -98,7 +98,7 @@
 	</div>
 {/snippet}
 
-<div class="min-w-0 {text}" role="group" aria-label="Head and standbys">
+<div class="min-w-0 {text} {size === 'full' ? 'max-w-3xl' : ''}" role="group" aria-label="Head and standbys">
 	{#if !h}
 		{#if live.link === 'reconnecting'}
 			<p class="text-muted-foreground">Cannot reach the head right now. This diagram returns when it does.</p>
@@ -128,8 +128,8 @@
 					{#if stage !== 'steady' && s.n === 1}<LoaderCircle class="text-warn size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />{:else}<Eye class="text-muted-foreground size-4 shrink-0" aria-hidden="true" />{/if}
 					<span class="min-w-0 flex-1">
 						<span class="block truncate font-medium" title={s.host}>{s.host}</span>
-						<span class="num block truncate {stage !== 'steady' ? 'text-warn' : s.lag > 0 ? 'text-warn' : 'text-ok'}" title="{s.lab ?? ''} {standbyStatus(s, stage, !!joined[s.id])}">
-							{#if !compact && s.lab}{s.lab} · {/if}{standbyStatus(s, stage, !!joined[s.id])}
+						<span class="num block leading-tight {stage !== 'steady' ? 'text-warn' : s.lag > 0 ? 'text-warn' : 'text-ok'}" title="{s.lab ?? ''} {standbyStatus(s, stage, !!joined[s.id])}">
+							{!compact && s.lab ? `${s.lab} · ` : ''}{standbyStatus(s, stage, !!joined[s.id])}
 						</span>
 					</span>
 					{#if canSwitch}

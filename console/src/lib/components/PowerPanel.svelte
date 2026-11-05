@@ -53,10 +53,10 @@
 				<Segmented legend="Power mode" bind:value={mode} options={[{ value: 'off', label: 'Off' }, { value: 'eco', label: 'Eco' }]} />
 				<p class="text-muted-foreground text-[13px]">{why[mode]}</p>
 				<label class="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]">Sleep a PC after it is idle for
-					<input type="number" min="1" max="1440" bind:value={idle} class="{field} num w-20" aria-label="Idle minutes before sleep" /> min
+					<input type="number" min="1" max="1440" bind:value={idle} class="{field} num w-20!" aria-label="Idle minutes before sleep" /> min
 				</label>
 				<label class="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]">Keep at least
-					<input type="number" min="0" max="10000" bind:value={keep} class="{field} num w-24" aria-label="PCs to keep awake" /> PCs awake
+					<input type="number" min="0" max="10000" bind:value={keep} class="{field} num w-24!" aria-label="PCs to keep awake" /> PCs awake
 				</label>
 				<label class="flex min-h-9 items-center gap-2 text-[13px]"><input type="checkbox" role="switch" bind:checked={demand} class="size-4" />Wake PCs when work arrives</label>
 			</fieldset>

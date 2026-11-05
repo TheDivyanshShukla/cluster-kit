@@ -202,3 +202,11 @@ mod rapl_tests {
         assert_eq!(super::wrap_delta(90, 5, 100), 15);
     }
 }
+
+/// A tunable, with an old env var as fallback while the value is still the default.
+pub fn get_or_env(key: &str, env: &str) -> f64 {
+    match (crate::tune::source(key), std::env::var(env).ok().and_then(|v| v.parse::<f64>().ok())) {
+        ("default", Some(v)) => v,
+        _ => crate::tune::get(key),
+    }
+}

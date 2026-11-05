@@ -1,0 +1,15 @@
+# pip install ./python/clusterkit   (standard library only; the folder is the package)
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clusterkit"
+version = "0.1.0"
+description = "Run ordinary Python work on a Cluster Kit lab cluster"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.setuptools]
+packages = ["clusterkit"]
+package-dir = {clusterkit = "."}

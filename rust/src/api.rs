@@ -17,8 +17,9 @@ use crate::proto::{dash_port, KIND_CMD, KIND_LIST, KIND_SHA, KIND_SYNTH};
 use crate::users::{valid_name, Auth, LoginErr, Role, Who};
 use crate::{dash, head, reduce, sched, select, users};
 
-const MAX_BODY: usize = 1 << 20;
-const MAX_LIST_BODY: usize = 64 << 20;
+fn mb(key: &str) -> usize {
+    (crate::tune::get(key) * 1048576.0) as usize
+}
 const POOL: usize = 32; // ponytail: one thread per open SSE stream; a pool this size caps viewers, switch to async if it matters
 
 pub struct Req {
@@ -263,6 +264,9 @@ pub fn route(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
         ("POST", ["nodes", "power"]) => node_power(ctx, r, me),
         ("GET", ["power"]) => json_out(200, power_json(ctx)),
         ("PUT", ["power"]) => put_power(ctx, r, me),
+        ("GET", ["tunables"]) => json_out(200, json!({"tunables": crate::tune::listing()})),
+        ("PUT", ["tunables"]) => put_tunables(ctx, r, me),
+        ("GET", ["ha", "candidates"]) => json_out(200, json!({"candidates": crate::head::candidates(ctx)})),
         ("GET", ["ha", "settings"]) => json_out(200, json!({"settings": ha_settings(ctx)})),
         ("PUT", ["ha", "settings"]) => put_ha_settings(ctx, r, me),
         ("POST", ["bootstrap"]) => bootstrap(ctx, auth, r),
@@ -570,6 +574,26 @@ fn put_power(ctx: &Ctx, r: &Req, actor: &str) -> Out {
     audit(ctx, "power.settings", actor, &format!("{} idle {} min, keep {}, on-demand {}", p.mode, p.idle_min, p.keep_awake, p.wake_on_demand));
     crate::head::power_settings_changed(ctx);
     json_out(200, power_json(ctx))
+}
+
+fn put_tunables(ctx: &Ctx, r: &Req, actor: &str) -> Out {
+    let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
+    let mut changes = vec![];
+    for (k, x) in v.as_object().into_iter().flatten() {
+        match x {
+            Value::Null => changes.push((k.clone(), None)),
+            _ => match x.as_f64() { Some(n) => changes.push((k.clone(), Some(n))), None => return bad(&format!("{k} must be a number or null")) },
+        }
+    }
+    let before: Vec<f64> = changes.iter().map(|(k, _)| crate::tune::get(k)).collect();
+    let json = match crate::tune::set(&changes) { Ok(j) => j, Err(e) => return bad(&e) };
+    if let Err(e) = ctx.store.set_meta("tune", &json) {
+        return fail(503, "unavailable", &e);
+    }
+    let diff: Vec<String> = changes.iter().zip(before).map(|((k, _), old)| format!("{k} {old} -> {}", crate::tune::get(k))).collect();
+    audit(ctx, "tune.changed", actor, &diff.join(", "));
+    crate::head::tune_changed(ctx);
+    json_out(200, json!({"tunables": crate::tune::listing()}))
 }
 
 fn put_ha_settings(ctx: &Ctx, r: &Req, actor: &str) -> Out {
@@ -1317,11 +1341,11 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
     if matches!(rq.method().as_str(), "POST" | "PUT" | "PATCH") {
         // only a signed-in operator may send a big list-job body; everyone else is held to 1 MiB before anything is read
         let operator = || auth.who(&ctx.store, cookie.as_deref(), bearer.as_deref()).is_some_and(|w| w.role >= Role::Operator);
-        let max = if path == "/api/v1/jobs" && operator() { MAX_LIST_BODY } else { MAX_BODY };
+        let max = if path == "/api/v1/jobs" && operator() { mb("max_list_body_mb") } else { mb("max_body_mb") };
         let _ = rq.as_reader().take(max as u64 + 1).read_to_end(&mut body);
     }
     let req = Req { method: rq.method().as_str().to_string(), path: path.to_string(), query, cookie, bearer, body, ip };
-    let out = if req.body.len() > MAX_BODY && !(req.method == "POST" && req.path == "/api/v1/jobs") { bad("body is over 1 MiB") } else { route(ctx, auth, &req) };
+    let out = if req.body.len() > mb("max_body_mb") && !(req.method == "POST" && req.path == "/api/v1/jobs") { bad(&format!("body is over {} MB", crate::tune::get("max_body_mb"))) } else { route(ctx, auth, &req) };
     let _ = match out {
         Out::Plain { status, ctype, headers, body } => {
             let mut r = Response::from_data(body).with_status_code(status).with_header(header("Content-Type", ctype));
@@ -1559,6 +1583,27 @@ mod tests {
         assert_eq!((s, v["settings"]["target_standbys"].as_u64()), (200, Some(1)));
         assert_eq!(call(&c, &a, &op, "POST", "/api/v1/nodes/power", r#"{"node_ids":["x"],"action":"nap"}"#).0, 400);
         assert_eq!(call(&c, &a, &op, "POST", "/api/v1/nodes/power", r#"{"node_ids":["ghost"],"action":"wake"}"#).0, 404);
+    }
+
+    #[test]
+    fn tunables_routes() {
+        let (c, a) = (ctx(), Auth::new(false));
+        let (ad, op, vw) = (tok(&c, &a, "ad", "admin"), tok(&c, &a, "op", "operator"), tok(&c, &a, "vw", "viewer"));
+        assert_eq!(call(&c, &a, &vw, "PUT", "/api/v1/tunables", "{}").0, 403);
+        assert_eq!(call(&c, &a, &op, "PUT", "/api/v1/tunables", "{}").0, 403);
+        let (s, v) = call(&c, &a, &vw, "GET", "/api/v1/tunables", "");
+        assert_eq!((s, v["tunables"][0]["key"].as_str()), (200, Some("heartbeat_s")));
+        for bad in [r#"{"nope":1}"#, r#"{"ring_max":1}"#, r#"{"ring_max":"x"}"#, r#"{"ring_max":5000,"nope":1}"#] {
+            assert_eq!(call(&c, &a, &ad, "PUT", "/api/v1/tunables", bad).0, 400, "{bad}");
+        }
+        let val = |v: &Value| v["tunables"].as_array().unwrap().iter().find(|t| t["key"] == "ring_max").map(|t| (t["value"].as_f64().unwrap(), t["source"].as_str().unwrap().to_string())).unwrap();
+        assert_eq!(val(&call(&c, &a, &vw, "GET", "/api/v1/tunables", "").1).0, 100_000.0, "all or nothing");
+        let (s, v) = call(&c, &a, &ad, "PUT", "/api/v1/tunables", r#"{"ring_max":5000}"#);
+        assert_eq!((s, val(&v)), (200, (5000.0, "db".to_string())));
+        assert!(c.store.meta("tune").unwrap().contains("ring_max"));
+        let (s, v) = call(&c, &a, &ad, "PUT", "/api/v1/tunables", r#"{"ring_max":null}"#);
+        assert_eq!((s, val(&v)), (200, (100_000.0, "default".to_string())));
+        assert!(c.store.events(10, None).iter().any(|e| e.kind == "tune.changed"));
     }
 
     #[test]

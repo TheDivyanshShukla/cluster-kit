@@ -60,8 +60,6 @@ use crate::jobs::{now_ms, Ctx, JobSpec, JobState, NodeRow};
 use crate::proto::{self, recv, send, u64_at, Hello};
 use crate::store::Store;
 
-const RING_MAX: usize = 100_000;
-const MEMBER_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
@@ -173,7 +171,7 @@ pub fn record(ctx: &Ctx, kind: &str, data: serde_json::Value) -> u64 {
     let mut g = init(ctx);
     g.last += 1;
     let e = Entry { seq: g.last, epoch: g.epoch, kind: kind.into(), data };
-    if g.ring.len() >= RING_MAX {
+    if g.ring.len() >= crate::tune::n("ring_max") as usize {
         g.ring.pop_front();
     }
     g.ring.push_back(e.clone());
@@ -228,7 +226,7 @@ pub fn refresh(ctx: &Ctx) {
     g.connected = ids.len();
     // A candidate's replicated members carry the promotion time, so ones that never come back expire one window after
     // the takeover. Safe: a cut-off old primary with standbys stops dispatching after 10 s without quorum, well inside it.
-    g.members.retain(|_, t| now.duration_since(*t) < MEMBER_WINDOW);
+    g.members.retain(|_, t| now.duration_since(*t) < crate::tune::secs("member_window_s"));
     let mut cleared = false;
     if g.candidate && has_quorum(g.connected, g.members.len()) {
         g.candidate = false;
@@ -386,7 +384,7 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
     let (h, seq, ep) = parse_hello_s(hello).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad HELLO_S"))?;
     let peer = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     s.set_nodelay(true)?;
-    s.set_read_timeout(Some(proto::LOST_AFTER))?;
+    s.set_read_timeout(Some(proto::lost_after()))?;
     let (tx, rx) = mpsc::channel();
     // register the link and pick the plan in one critical section: nothing recorded after this point is missed
     let (lid, snapshot, replay, snap_seq, epoch, first) = {
@@ -615,7 +613,7 @@ fn invalid(m: &str) -> io::Error {
 /// One connection to a primary: HELLO_S, then snapshot / entries until the link ends. Returns on any error.
 fn session(store: &mut Store, path: &Path, mut s: TcpStream, sb: &mut Sb) -> io::Result<()> {
     s.set_nodelay(true)?;
-    s.set_read_timeout(Some(proto::LOST_AFTER + Duration::from_secs(2 * sb.priority as u64)))?;
+    s.set_read_timeout(Some(proto::lost_after() + crate::tune::secs("standby_step_s").mul_f64(sb.priority as f64)))?;
     let node = crate::identity::node_id();
     let hello = Hello { node_id: node.clone(), host: crate::identity::host(), virtual_node: false, inv: crate::identity::inventory(), join_code: std::env::var("CK_JOIN_CODE").ok() };
     let mut applied = num(store.meta("last_seq"));
@@ -677,7 +675,7 @@ fn session(store: &mut Store, path: &Path, mut s: TcpStream, sb: &mut Sb) -> io:
                     if e.data.get("mode").and_then(|x| x.as_str()) == Some("replay") {
                         let _ = store.set_meta("synced", "1");
                     }
-                    s.set_read_timeout(Some(proto::LOST_AFTER + Duration::from_secs(2 * sb.priority as u64)))?;
+                    s.set_read_timeout(Some(proto::lost_after() + crate::tune::secs("standby_step_s").mul_f64(sb.priority as f64)))?;
                 } else if e.seq > applied {
                     if e.kind == "promote" && e.data["node"].as_str() == Some(node.as_str()) {
                         sb.handover = true;
@@ -789,7 +787,7 @@ pub fn run_standby(o: &crate::Opts) {
 pub fn hand_over(ctx: &Ctx, node: &str) -> Result<String, String> {
     let peer = init(ctx).links.iter().find(|l| l.node == node).map(|l| l.peer.clone()).ok_or_else(|| format!("{node} is not a connected standby"))?;
     let seq = record(ctx, "promote", json!({ "node": node }));
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + crate::tune::secs("switchover_wait_s");
     while Instant::now() < until {
         if init(ctx).links.iter().any(|l| l.node == node && l.acked >= seq) {
             return Ok(peer);
@@ -801,7 +799,7 @@ pub fn hand_over(ctx: &Ctx, node: &str) -> Result<String, String> {
 
 /// Pure: should a standby with this priority promote after the primary has been silent this long?
 pub fn should_promote(priority: u32, silent_secs: f64) -> bool {
-    silent_secs >= crate::proto::LOST_AFTER.as_secs_f64() + 2.0 * priority as f64
+    silent_secs >= crate::proto::lost_after().as_secs_f64() + crate::tune::get("standby_step_s") * priority as f64
 }
 
 /// Pure: may a head dispatch with `connected` agents out of `membership` known nodes?

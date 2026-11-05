@@ -196,8 +196,8 @@ fn head_candidates(o: &Opts) -> Vec<String> {
 
 /// The head is gone: find a head that takes ATTACH for `id`, for up to CK_FAILOVER_SECS (default 60).
 fn reattach(o: &Opts, id: u64) -> (BufReader<Sock>, Sock) {
-    let secs = std::env::var("CK_FAILOVER_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    let secs = crate::presence::get_or_env("client_failover_s", "CK_FAILOVER_SECS");
+    let deadline = Instant::now() + Duration::from_secs_f64(secs);
     while Instant::now() < deadline {
         for addr in head_candidates(o) {
             let Some(a) = addr.to_socket_addrs().ok().and_then(|mut a| a.next()) else { continue };

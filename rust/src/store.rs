@@ -951,8 +951,13 @@ fn window_row(r: &Row) -> rusqlite::Result<WindowRow> {
     })
 }
 
-const MAX_ITEMS: usize = 1_000_000;
-const MAX_ITEM_BYTES: usize = 4096;
+fn max_items() -> usize {
+    crate::tune::n("max_items") as usize
+}
+
+fn max_item_bytes() -> usize {
+    crate::tune::n("max_item_bytes") as usize
+}
 
 impl Store {
     /// days like "mon-fri" / "sat,sun"; start/end "HH:MM" (end may be < start: overnight); action "block" or "cap".
@@ -1012,11 +1017,11 @@ impl Store {
     }
     /// List job items (JOB-01), index 0.. in order. Replaces any stored items of the job.
     pub fn put_items(&self, job: u64, items: &[String]) -> Result<(), String> {
-        if items.len() > MAX_ITEMS {
-            return Err(format!("at most {MAX_ITEMS} items"));
+        if items.len() > max_items() {
+            return Err(format!("at most {} items", max_items()));
         }
-        if let Some(i) = items.iter().position(|s| s.len() > MAX_ITEM_BYTES) {
-            return Err(format!("item {i} is over {MAX_ITEM_BYTES} bytes"));
+        if let Some(i) = items.iter().position(|s| s.len() > max_item_bytes()) {
+            return Err(format!("item {i} is over {} bytes", max_item_bytes()));
         }
         let mut c = self.db();
         let tx = c.transaction().map_err(e)?;
@@ -1122,7 +1127,7 @@ mod tests5 {
         s.put_items(j.id, &["a".into()]).unwrap();
         s.db().execute("DELETE FROM jobs WHERE id=?", [j.id as i64]).unwrap();
         assert!(s.items(j.id, 0, 5).is_empty());
-        assert!(s.put_items(1, &vec![String::new(); MAX_ITEMS + 1]).is_err());
+        assert!(s.put_items(1, &vec![String::new(); max_items() + 1]).is_err());
     }
 
     #[test]

@@ -242,3 +242,32 @@ export const HaSettings = z.object({ target_standbys: z.number().int(), selector
 export const HaSettingsReply = z.object({ settings: HaSettings });
 export type PowerSettings = z.infer<typeof PowerSettings>;
 export type HaSettings = z.infer<typeof HaSettings>;
+
+/** GET/PUT /api/v1/tunables (wave 9: every value adjustable) */
+export const Tunable = z.object({
+	key: z.string(),
+	group: z.string(),
+	value: z.number(),
+	default: z.number(),
+	min: z.number(),
+	max: z.number(),
+	unit: z.string(),
+	scope: z.enum(['head', 'agent', 'both']).catch('head'),
+	help: z.string(),
+	source: z.enum(['default', 'db', 'env', 'head']).catch('default')
+});
+export const TunableList = z.object({ tunables: z.array(Tunable) });
+export type Tunable = z.infer<typeof Tunable>;
+/** GET /api/v1/ha/candidates (HA-10 head choice) */
+export const Candidate = z.object({
+	node_id: z.string(),
+	host: z.string(),
+	lab: z.string().nullable().default(null),
+	score: z.number(),
+	parts: z.object({ speed: z.number(), memory: z.number(), stability: z.number(), free: z.number() }),
+	role: z.enum(['head', 'standby', 'candidate']).catch('candidate'),
+	eligible: z.boolean(),
+	why: z.string().default('')
+});
+export const CandidateList = z.object({ candidates: z.array(Candidate) });
+export type Candidate = z.infer<typeof Candidate>;

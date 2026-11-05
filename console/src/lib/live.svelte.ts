@@ -98,7 +98,7 @@ function setCluster(c: Cluster) {
 	}
 	const run = runningJobs(c);
 	if (!run.length) for (const k of Object.keys(live.lost)) delete live.lost[k];
-	else for (const id of prevChunks.keys()) if (!seen.has(id) && !live.lost[id]) live.lost[id] = { host: live.nodes[id]?.host ?? id, at: t };
+	else for (const id of prevChunks.keys()) if (!seen.has(id) && !live.lost[id] && (live.nodes[id]?.power ?? 'awake') === 'awake') live.lost[id] = { host: live.nodes[id]?.host ?? id, at: t };
 	prevChunks = seen;
 	live.cluster = c;
 	for (const j of run) live.jobs[j.id] = j;

@@ -1,1 +1,0 @@
-import{n as e,r as t}from"./C1nzjmcE.js";import{V as n}from"./CNC5QfXJ.js";var r={name:`chevron-down`,size:24,node:[[`path`,{d:`m6 9 6 6 6-6`}]]};r.node;var i=new Set([`$$slots`,`$$events`,`$$legacy`]);function a(a,o){let s=e(o,i);n(a,t(()=>s,{get icon(){return r}}))}export{a as t};

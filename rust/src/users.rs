@@ -12,10 +12,18 @@ use crate::jobs::now_ms;
 use crate::store::Store;
 
 pub const ITERS: u32 = 210_000;
-const IDLE_MS: i64 = 12 * 3600 * 1000;
-const MAX_MS: i64 = 7 * 24 * 3600 * 1000;
-const FAIL_WINDOW_MS: i64 = 5 * 60 * 1000;
-const FAIL_MAX: usize = 5;
+fn idle_ms() -> i64 {
+    (crate::tune::get("session_idle_h") * 3_600_000.0) as i64
+}
+fn max_ms() -> i64 {
+    (crate::tune::get("session_max_d") * 86_400_000.0) as i64
+}
+fn fail_window_ms() -> i64 {
+    (crate::tune::get("login_fail_window_min") * 60_000.0) as i64
+}
+fn fail_max() -> usize {
+    crate::tune::n("login_fail_max") as usize
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
@@ -134,7 +142,7 @@ impl Auth {
         }
         let name = if let Some(sid) = cookie {
             let mut s = self.sessions.lock().unwrap();
-            let live = s.get_mut(sid).filter(|x| now - x.last <= IDLE_MS && now - x.created <= MAX_MS).map(|x| {
+            let live = s.get_mut(sid).filter(|x| now - x.last <= idle_ms() && now - x.created <= max_ms()).map(|x| {
                 x.last = now;
                 x.user.clone()
             });
@@ -170,10 +178,10 @@ impl Auth {
         {
             let mut f = self.fails.lock().unwrap();
             f.retain(|_, v| {
-                v.retain(|t| now - t < FAIL_WINDOW_MS);
+                v.retain(|t| now - t < fail_window_ms());
                 !v.is_empty()
             });
-            if f.get(&key).is_some_and(|v| v.len() >= FAIL_MAX) {
+            if f.get(&key).is_some_and(|v| v.len() >= fail_max()) {
                 return Err(LoginErr::Throttled);
             }
         }
@@ -211,7 +219,7 @@ pub fn min_role(method: &str, path: &str) -> Option<Role> {
         (_, "/api/v1/me" | "/api/v1/bootstrap" | "/api/v1/login" | "/api/v1/logout") => return None,
         (_, "/api/v1/users" | "/api/v1/config") => Role::Admin,
         ("POST", "/api/v1/jobs") => Role::Researcher,
-        ("POST", "/api/v1/ha/switchover") | ("PUT", "/api/v1/ha/settings") => Role::Admin,
+        ("POST", "/api/v1/ha/switchover") | ("PUT", "/api/v1/ha/settings" | "/api/v1/tunables") => Role::Admin,
         ("POST", "/api/v1/nodes/power") | ("PUT", "/api/v1/power") => Role::Operator,
         ("POST", "/api/v1/nodes/state" | "/api/v1/labs" | "/api/v1/join-codes") => Role::Operator,
         ("PUT", _) if p.starts_with("/api/v1/nodes/") && p.ends_with("/place") => Role::Operator,
@@ -240,6 +248,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/windows"), ("POST", "/windows"), ("DELETE", "/windows/{id}"),
     ("GET", "/reservations"), ("POST", "/reservations"), ("DELETE", "/reservations/{id}"), ("GET", "/estimate"),
     ("POST", "/nodes/power"), ("GET", "/power"), ("PUT", "/power"), ("GET", "/ha/settings"), ("PUT", "/ha/settings"),
+    ("GET", "/tunables"), ("PUT", "/tunables"), ("GET", "/ha/candidates"),
 ];
 
 #[cfg(test)]
@@ -294,6 +303,9 @@ mod tests {
             ("DELETE", "/api/v1/reserves/2", Some(Role::Operator)),
             ("GET", "/api/v1/config", Some(Role::Admin)),
             ("POST", "/api/v1/config", Some(Role::Admin)),
+            ("GET", "/api/v1/tunables", Some(Role::Viewer)),
+            ("PUT", "/api/v1/tunables", Some(Role::Admin)),
+            ("GET", "/api/v1/ha/candidates", Some(Role::Viewer)),
             ("GET", "/api/v1/users", Some(Role::Admin)),
             ("POST", "/api/v1/users", Some(Role::Admin)),
         ];
@@ -313,10 +325,10 @@ mod tests {
         }
         assert!(matches!(a.login_at(&st, "ann", "longenoughpw1", "1.1.1.1", 2000), Err(LoginErr::Throttled)));
         assert!(matches!(a.login_at(&st, "ann", "longenoughpw1", "2.2.2.2", 2000), Ok(_)), "other ip unaffected");
-        let (w, sid) = a.login_at(&st, "ann", "longenoughpw1", "1.1.1.1", 1000 + FAIL_WINDOW_MS + 10).ok().unwrap();
+        let (w, sid) = a.login_at(&st, "ann", "longenoughpw1", "1.1.1.1", 1000 + fail_window_ms() + 10).ok().unwrap();
         assert_eq!(w.role, Role::Viewer);
         assert_eq!(a.who(&st, Some(&sid), None).map(|w| w.name), Some("ann".into()));
-        assert!(a.who_at(&st, Some(&sid), None, now_ms() + IDLE_MS + 1000).is_none(), "idle expiry");
+        assert!(a.who_at(&st, Some(&sid), None, now_ms() + idle_ms() + 1000).is_none(), "idle expiry");
         let t = a.new_token(&st, "ann").unwrap();
         assert!(t.starts_with("ckt_"));
         assert_eq!(a.who(&st, None, Some(&t)).map(|w| w.name), Some("ann".into()));

@@ -100,7 +100,10 @@ pub enum ChunkPolicy {
     Adaptive,
 }
 
-pub const TARGET_SECS: f64 = 1.0;
+/// Tunable "target_chunk_s" (default 1 s).
+pub fn target_secs() -> f64 {
+    crate::tune::get("target_chunk_s")
+}
 
 /// "" or "adaptive" -> Adaptive, "fixed", "guided"; anything else None.
 pub fn parse_policy(s: &str) -> Option<ChunkPolicy> {
@@ -127,7 +130,7 @@ pub fn chunk_len(p: ChunkPolicy, fixed_chunk: u64, total: u64, remaining: u64, n
         ChunkPolicy::Fixed => fixed(),
         ChunkPolicy::Guided => guided(),
         ChunkPolicy::Adaptive if node_rate > 0.0 && fleet_rate > 0.0 => {
-            if (remaining as f64) < 2.0 * fleet_rate * TARGET_SECS { guided() } else { (node_rate * TARGET_SECS) as u64 }
+            if (remaining as f64) < 2.0 * fleet_rate * target_secs() { guided() } else { (node_rate * target_secs()) as u64 }
         }
         ChunkPolicy::Adaptive => fixed(),
     };

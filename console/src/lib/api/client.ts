@@ -6,6 +6,7 @@ import {
 	CapList,
 	CapRow,
 	Cluster,
+	CandidateList,
 	ConfigChanges,
 	Estimate,
 	EventList,
@@ -23,6 +24,7 @@ import {
 	NodeList,
 	NodeOne,
 	NodesChanged,
+	TunableList,
 	PoolList,
 	PoolRow,
 	ReserveList,
@@ -131,6 +133,10 @@ export const api = {
 	powerNodes: (node_ids: string[], action: 'sleep' | 'wake') => call('POST', '/api/v1/nodes/power', NodesChanged, { node_ids, action }),
 	power: () => call('GET', '/api/v1/power', PowerReply),
 	setPower: (p: PowerSettings) => call('PUT', '/api/v1/power', PowerReply, p),
+	candidates: () => call('GET', '/api/v1/ha/candidates', CandidateList),
+	tunables: () => call('GET', '/api/v1/tunables', TunableList),
+	/** key -> number, or null to go back to the default. All or nothing. */
+	setTunables: (patch: Record<string, number | null>) => call('PUT', '/api/v1/tunables', TunableList, patch),
 	haSettings: () => call('GET', '/api/v1/ha/settings', HaSettingsReply),
 	setHaSettings: (s: HaSettings) => call('PUT', '/api/v1/ha/settings', HaSettingsReply, s),
 	setNodeState: (node_ids: string[], state: NodeState, reason = '') =>

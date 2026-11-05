@@ -143,7 +143,7 @@ pub fn token(o: &Opts) {
 /// API-02: every route (users::ROUTES) maps to a CLI command or says why not. Checked in api::tests.
 pub const CLI_MAP: &[(&str, &str, &str)] = &[
     ("GET", "/me", "no CLI needed: session"), ("GET", "/ha", "ck admin ha"), ("POST", "/ha/switchover", "ck admin switchover NODE"),
-    ("POST", "/nodes/power", "ck admin sleep|wake"), ("GET", "/power", "ck admin power"), ("PUT", "/power", "ck admin power"), ("GET", "/ha/settings", "ck admin standbys"), ("PUT", "/ha/settings", "ck admin standbys"), ("POST", "/bootstrap", "no CLI needed: first-run setup in the browser"),
+    ("POST", "/nodes/power", "ck admin sleep|wake"), ("GET", "/power", "ck admin power"), ("PUT", "/power", "ck admin power"), ("GET", "/ha/settings", "ck admin standbys"), ("PUT", "/ha/settings", "ck admin standbys"), ("GET", "/tunables", "ck admin tune"), ("PUT", "/tunables", "ck admin tune KEY VALUE|default"), ("GET", "/ha/candidates", "ck admin heads"), ("POST", "/bootstrap", "no CLI needed: first-run setup in the browser"),
     ("POST", "/login", "ck token"), ("POST", "/logout", "no CLI needed: session"), ("POST", "/tokens", "ck token"),
     ("GET", "/users", "no CLI needed: console user admin"), ("POST", "/users", "no CLI needed: console user admin"),
     ("GET", "/cluster", "no CLI needed: stream (see ck status)"),
@@ -209,7 +209,7 @@ fn fmt_local(ms: i64, offset_min: i64) -> String {
 }
 
 fn usage_admin() -> ! {
-    die("usage: ck admin nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
+    die("usage: ck admin nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | heads | tune [KEY VALUE|default] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
 }
 
 fn send(o: &Opts, method: &str, path: &str, body: Value) -> Value {
@@ -403,6 +403,33 @@ pub fn admin(o: &Opts) {
             if rest.len() > 2 { body.insert("selector".into(), rest[2..].join(" ").into()); }
             let v = if body.is_empty() { call(o, "GET", "/api/v1/ha/settings") } else { send(o, "PUT", "/api/v1/ha/settings", Value::Object(body)) };
             println!("keep {} standby(s)  selector {}", dash(&v["settings"]["target_standbys"]), dash(&v["settings"]["selector"]));
+        }
+        Some("heads") => {
+            let v = call(o, "GET", "/api/v1/ha/candidates");
+            println!("{:>5}  {:<14} {:<12} {:<10} {:<9} why not", "score", "host", "lab", "role", "eligible");
+            for c in v["candidates"].as_array().cloned().unwrap_or_default() {
+                println!("{:>5}  {:<14} {:<12} {:<10} {:<9} {}", dash(&c["score"]), dash(&c["host"]), dash(&c["lab"]), dash(&c["role"]), dash(&c["eligible"]), c["why"].as_str().unwrap_or(""));
+            }
+        }
+        Some("tune") => {
+            let v = if rest.len() > 1 {
+                let val = match rest.get(2).map(|s| s.as_str()) {
+                    Some("default") => Value::Null,
+                    Some(x) => x.parse::<f64>().map_or_else(|_| die("VALUE must be a number or default"), Value::from),
+                    None => usage_admin(),
+                };
+                send(o, "PUT", "/api/v1/tunables", serde_json::json!({ rest[1].as_str(): val }))
+            } else {
+                call(o, "GET", "/api/v1/tunables")
+            };
+            let mut group = String::new();
+            for t in v["tunables"].as_array().cloned().unwrap_or_default() {
+                if rest.len() > 1 && t["key"].as_str() != Some(rest[1].as_str()) { continue }
+                let g = dash(&t["group"]);
+                if g != group { println!("{g}"); group = g; }
+                let mark = if t["source"] == "default" { "" } else { "*" };
+                println!("  {:<24} {:>12} {:<8} {:<8} {}{}", dash(&t["key"]), dash(&t["value"]), dash(&t["unit"]), dash(&t["scope"]), dash(&t["source"]), mark);
+            }
         }
         Some("ha") => {
             let v = call(o, "GET", "/api/v1/ha");

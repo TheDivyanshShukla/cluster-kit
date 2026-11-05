@@ -42,7 +42,7 @@
 	viewBox="0 0 {lab.w * CELL} {lab.h * CELL}"
 	role="group"
 	aria-label="{lab.name}, {lab.w} by {lab.h} seats"
-	class="block h-auto w-full select-none {editing ? 'touch-none' : ''}"
+	class="block {wall ? 'h-full' : 'h-auto'} w-full select-none {editing ? 'touch-none' : ''}"
 	style={wall ? undefined : `max-width:${lab.w * CELL * 1.6}px`}
 	onpointerdown={(e) => ondown?.(e, lab.id, idOf(e))}
 >
@@ -74,12 +74,12 @@
 		>
 			<title>{it.node.host}: {it.node.state}{it.node.online ? '' : ' (offline)'}, {l.label}</title>
 			<rect x="2" y="2" width={CELL - 4} height={CELL - 4} rx="6" class="{l.fill} {l.stroke}" stroke-width="1.5" stroke-dasharray={l.dash ? '4 2' : undefined} />
-			<text x={l.power ? 5 : CELL / 2} y="14" text-anchor={l.power ? 'start' : 'middle'} font-size="9" class="fill-muted-foreground pointer-events-none">{tileLabel(it.node)}</text>
+			<text x={l.power ? 4 : CELL / 2} y="14" text-anchor={l.power ? 'start' : 'middle'} font-size={l.power ? 8.5 : 9} class="fill-muted-foreground pointer-events-none">{tileLabel(it.node)}</text>
 			<text x={CELL / 2} y="31" text-anchor="middle" font-size="15" font-weight="600" class="{l.text} pointer-events-none">{l.glyph}</text>
 				{#if l.power === 'waking'}<rect x="2" y="2" width={CELL - 4} height={CELL - 4} rx="6" fill="none" class="ck-pulse stroke-warn pointer-events-none" stroke-width="1.5" />{/if}
-			{#if l.power === 'asleep'}<Moon x={CELL - 16} y="3" width="12" height="12" class="stroke-muted-foreground pointer-events-none" />
-			{:else if l.power === 'waking'}<Sunrise x={CELL - 16} y="3" width="12" height="12" class="stroke-warn pointer-events-none" />
-			{:else if l.power === 'failed'}<TriangleAlert x={CELL - 16} y="3" width="12" height="12" class="stroke-bad pointer-events-none" />{/if}
+			{#if l.power === 'asleep'}<Moon x={CELL - 14} y="3" width="11" height="11" class="stroke-muted-foreground pointer-events-none" />
+			{:else if l.power === 'waking'}<Sunrise x={CELL - 14} y="3" width="11" height="11" class="stroke-warn pointer-events-none" />
+			{:else if l.power === 'failed'}<TriangleAlert x={CELL - 14} y="3" width="11" height="11" class="stroke-bad pointer-events-none" />{/if}
 			{#if l.power}
 				<text x={CELL / 2} y="40" text-anchor="middle" font-size="7.5" font-weight="700" class="fill-foreground pointer-events-none">{l.power === 'asleep' ? 'ASLEEP' : l.power === 'waking' ? 'WAKING' : 'NO WAKE'}</text>
 				{#if l.power !== 'asleep'}<text x={CELL / 2} y="29" text-anchor="middle" font-size="9" class="num fill-muted-foreground pointer-events-none">{clock(wakeSecs(it.node.node_id))}</text>{/if}

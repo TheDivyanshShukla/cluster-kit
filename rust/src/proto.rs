@@ -20,10 +20,20 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
 pub const MAX_FRAME: usize = 1 << 28;
-pub const PIPELINE: usize = 2; // chunks a worker holds: one computing, one queued
+/// Chunks a worker holds: one computing, the rest queued (tunable "pipeline").
+pub fn pipeline() -> usize {
+    crate::tune::n("pipeline") as usize
+}
 pub const PROTO_VERSION: u32 = 3;
-pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(1);
-pub const LOST_AFTER: Duration = Duration::from_secs(5);
+/// Tunable "heartbeat_s" (default 1 s).
+pub fn heartbeat_every() -> Duration {
+    crate::tune::secs("heartbeat_s")
+}
+
+/// Tunable "lost_after_s" (default 5 s).
+pub fn lost_after() -> Duration {
+    crate::tune::secs("lost_after_s")
+}
 
 pub const HELLO_W: u8 = 1; // worker -> head: threads u32, version u32, Hello JSON
 pub const HELLO_C: u8 = 2; // client -> head

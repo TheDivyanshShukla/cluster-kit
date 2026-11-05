@@ -25,7 +25,7 @@
 			{ href: '/policies', label: 'Policies', icon: SlidersHorizontal, show: true },
 			{ href: '/events', label: 'Events', icon: CalendarClock, show: true },
 			{ href: '/wall', label: 'Wall mode', icon: MonitorPlay, show: true },
-			{ href: '/settings', label: 'Settings', icon: Settings, show: atLeast(roleNow(), 'operator') },
+			{ href: '/settings', label: 'System', icon: Settings, show: atLeast(roleNow(), 'operator') },
 			{ href: '/users', label: 'Users', icon: Users, show: atLeast(roleNow(), 'admin') }
 		].filter((n) => n.show)
 	);
