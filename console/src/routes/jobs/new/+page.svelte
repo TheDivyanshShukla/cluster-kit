@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { ArrowLeft, ChevronRight, CircleAlert, Gauge, Hash, List, Lock, Send, Terminal, Timer, Upload } from '@lucide/svelte';
+	import { ArrowLeft, ChevronRight, CircleAlert, Gauge, Hash, List, Lock, Play, Save, Send, Terminal, Timer, Trash2, Upload } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import SelectorBar from '#lib/components/SelectorBar.svelte';
 	import Listbox from '#lib/components/Listbox.svelte';
@@ -8,15 +8,70 @@
 	import EmptyState from '#lib/components/EmptyState.svelte';
 	import { atLeast, emptyForm, validateJob } from '#lib/jobs.ts';
 	import { PRIORITIES } from '#lib/api/schema.ts';
-	import type { Estimate } from '#lib/api/schema.ts';
+	import type { Estimate, Template } from '#lib/api/schema.ts';
 	import { debounce, PRIORITY_LABEL } from '#lib/org.ts';
 	import { estimateText, parseItems, PLACEMENTS, POLICIES, REDUCER_OPTIONS } from '#lib/sched.ts';
-	import { roleNow } from '#lib/session.svelte.ts';
+	import { live } from '#lib/live.svelte.ts';
+	import { roleNow, userNow } from '#lib/session.svelte.ts';
 	import Page from '#lib/components/Page.svelte';
 	import Panel from '#lib/components/Panel.svelte';
 	import { btnGhost, btnPrimary, card, field } from '#lib/ui.ts';
 
 	const form = $state(emptyForm());
+	const canSubmit = $derived(atLeast(roleNow(), 'researcher'));
+
+	// templates (JOB-12): a saved job spec anyone can run again
+	let templates = $state<Template[]>([]);
+	let tplError = $state('');
+	let tplName = $state('');
+	let tplNote = $state('');
+	let tplBusy = $state('');
+	const loadTemplates = () => api.templates().then((r) => ((templates = r.templates), (tplError = ''))).catch((e) => (tplError = e instanceof ApiError ? e.message : 'Could not load templates.'));
+	$effect(() => {
+		void live.rev.templates;
+		void loadTemplates();
+	});
+	const mine = (t: Template) => atLeast(roleNow(), 'admin') || t.owner === userNow();
+	const specLine = (t: Template) => {
+		const sp = t.spec as Record<string, unknown>;
+		return [sp.kind, sp.n ? `n ${Number(sp.n).toLocaleString('en-IN')}` : null, sp.priority, sp.selector ? `on ${sp.selector}` : null].filter(Boolean).join(' · ');
+	};
+	async function saveTemplate() {
+		failure = null;
+		const v = validateJob(form);
+		errors = v.errors;
+		if (!v.value) return void (tplError = 'Fix the form first. A template stores the same job.');
+		tplBusy = 'save';
+		try {
+			await api.saveTemplate(tplName.trim(), v.value, tplNote.trim());
+			tplName = tplNote = '';
+			await loadTemplates();
+		} catch (e) {
+			tplError = e instanceof ApiError ? e.message : 'Could not save the template.';
+		}
+		tplBusy = '';
+	}
+	async function runTemplate(t: Template) {
+		tplBusy = t.name;
+		tplError = '';
+		try {
+			await goto(`/jobs/${(await api.runTemplate(t.name)).job.id}`);
+		} catch (e) {
+			tplError = e instanceof ApiError ? e.message : 'Could not run the template.';
+		}
+		tplBusy = '';
+	}
+	async function removeTemplate(t: Template) {
+		tplBusy = t.name;
+		tplError = '';
+		try {
+			await api.deleteTemplate(t.name);
+			await loadTemplates();
+		} catch (e) {
+			tplError = e instanceof ApiError ? e.message : 'Could not delete the template.';
+		}
+		tplBusy = '';
+	}
 	let errors = $state<Record<string, string>>({});
 	let busy = $state(false);
 	let failure = $state<string | null>(null);
@@ -93,12 +148,17 @@
 	};
 </script>
 
-<Page title="New job" subtitle="Cover a range of numbers across every connected PC.">
+<Page
+	title="New job"
+	subtitle="Cover a range of numbers across every connected PC."
+	tabs={[{ id: 'job', label: 'New job' }, { id: 'templates', label: 'Templates', badge: templates.length }]}
+	class="lg:grid-cols-[minmax(0,1fr)_22rem]"
+>
 	{#snippet actions()}<a href="/jobs" class={btnGhost}><ArrowLeft class="size-4" aria-hidden="true" />All jobs</a>{/snippet}
 {#if !atLeast(roleNow(), 'researcher')}
-	<Panel title="New job"><EmptyState icon={Lock} title="Your role cannot submit jobs" body="Ask an admin for the researcher role." /></Panel>
+	<Panel title="New job" tab="job"><EmptyState icon={Lock} title="Your role cannot submit jobs" body="Ask an admin for the researcher role." /></Panel>
 {:else}
-	<Panel title="New job">
+	<Panel title="New job" tab="job">
 	<form onsubmit={submit} novalidate class="max-w-2xl space-y-5">
 		<fieldset>
 			<legend class="mb-1.5 text-xs font-medium">Kind of work</legend>
@@ -232,4 +292,32 @@
 	</form>
 	</Panel>
 {/if}
+	<Panel title="Templates" tab="templates" count={templates.length}>
+		{#if tplError}<p class="text-bad mb-3 flex items-start gap-1.5 text-[13px]" role="alert"><CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" />{tplError}</p>{/if}
+		{#if templates.length}
+			<ul class="divide-line border-line divide-y rounded-lg border">
+				{#each templates as t (t.name)}
+					<li class="flex items-center gap-2 px-3 py-2">
+						<div class="min-w-0 flex-1">
+							<p class="truncate font-medium">{t.name}</p>
+							<p class="text-muted-foreground text-xs break-words">{specLine(t)}</p>
+							{#if t.note}<p class="text-muted-foreground text-xs break-words">{t.note}</p>{/if}
+							<p class="text-muted-foreground text-xs">by {t.owner || 'unknown'}</p>
+						</div>
+						<button type="button" class="{btnGhost} h-8 px-2.5" disabled={!canSubmit || !!tplBusy} title={canSubmit ? `Submit a job from ${t.name}` : 'Running a template needs the researcher role'} aria-label="Run {t.name}" onclick={() => runTemplate(t)}><Play class="size-4" aria-hidden="true" />Run</button>
+						<button type="button" class="{btnGhost} h-8 px-2.5" disabled={!mine(t) || !!tplBusy} title={mine(t) ? `Delete ${t.name}` : 'Only the owner or an admin can delete this template'} aria-label="Delete {t.name}" onclick={() => removeTemplate(t)}><Trash2 class="size-4" aria-hidden="true" /></button>
+					</li>
+				{/each}
+			</ul>
+		{:else}
+			<p class="text-muted-foreground py-4 text-center">No template yet. Fill in the form and save it below.</p>
+		{/if}
+		<div class="mt-4 space-y-2">
+			<p class="text-xs font-medium">Save the form as a template</p>
+			<input class={field} bind:value={tplName} placeholder="Name, for example nightly-sha" maxlength="40" autocomplete="off" aria-label="Template name" disabled={!canSubmit} />
+			<input class={field} bind:value={tplNote} placeholder="Note (optional)" maxlength="200" autocomplete="off" aria-label="Template note" disabled={!canSubmit} />
+			<button type="button" class="{btnGhost} w-full" disabled={!canSubmit || !tplName.trim() || !!tplBusy} title={canSubmit ? '' : 'Saving a template needs the researcher role'} onclick={saveTemplate}><Save class="size-4" aria-hidden="true" />Save template</button>
+			{#if !canSubmit}<p class="text-muted-foreground text-xs">Saving and running templates needs the researcher role. You are signed in as {roleNow()}.</p>{/if}
+		</div>
+	</Panel>
 </Page>

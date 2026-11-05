@@ -1,0 +1,1 @@
+import{_ as e,v as t}from"./BdQVl7rk.js";import{C as n}from"./CVkkw1dw.js";var r={name:`loader-circle`,size:24,node:[[`path`,{d:`M21 12a9 9 0 1 1-6.219-8.56`}]],aliases:[`loader-2`]};r.node;var i=new Set([`$$slots`,`$$events`,`$$legacy`]);function a(a,o){let s=e(o,i);n(a,t(()=>s,{get icon(){return r}}))}export{a as t};

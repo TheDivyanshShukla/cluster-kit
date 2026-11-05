@@ -578,7 +578,7 @@ pub fn fetch(dir: &Path, m: &Meta, srcs: &[Source]) -> io::Result<Got> {
         if have.iter().filter(|h| **h).count() > before {
             stall = Instant::now();
         }
-        if dead.iter().all(|d| *d) || stall.elapsed() > Duration::from_secs(20) {
+        if dead.iter().all(|d| *d) || stall.elapsed() > crate::tune::secs("blob_stall_s") {
             return Err(if dead.iter().all(|d| *d) { last } else { other("peers have not got the missing pieces yet; gave up") });
         }
         thread::sleep(Duration::from_millis(150));
@@ -745,6 +745,31 @@ pub fn env_for(job: u64) -> Vec<(String, String)> {
         e.push((format!("CK_BLOB_{i}"), p.display().to_string()));
     }
     e
+}
+
+/// Agent: upload one output file to the head's blob store with the job's upload capability (JOB-08). Returns (sha, size).
+/// ponytail: one connection per file, streamed from disk; no resume (a failed upload fails the chunk, which is retried).
+pub fn upload_file(job: u64, path: &Path) -> Result<(String, u64), String> {
+    let (port, tok) = JOB_BLOBS.lock().unwrap().iter().find(|x| x.0 == job).and_then(|x| x.2.clone()).ok_or("the head sent no upload capability for this job")?;
+    let host = HEAD_IP.lock().unwrap().clone();
+    let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let addr = (host.as_str(), port).to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("bad head address")?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| format!("upload: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(120))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(120))).ok();
+    let head = format!("PUT /api/v1/blobs HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {tok}\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n");
+    s.write_all(head.as_bytes()).and_then(|_| io::copy(&mut f, &mut s)).map_err(|e| format!("upload: {e}"))?;
+    let mut raw = vec![];
+    s.read_to_end(&mut raw).map_err(|e| format!("upload: {e}"))?;
+    let at = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or("upload: bad reply")?;
+    let status: u16 = String::from_utf8_lossy(&raw[..at]).split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let v: Value = serde_json::from_slice(&raw[at + 4..]).unwrap_or(Value::Null);
+    if status != 200 {
+        return Err(format!("upload refused (HTTP {status}): {}", v["error"]["message"].as_str().unwrap_or("")));
+    }
+    let sha = v["sha256"].as_str().filter(|s| valid_sha(s)).ok_or("upload: bad reply")?.to_string();
+    Ok((sha, v["size"].as_u64().unwrap_or(len)))
 }
 
 /// `@blob:<sha>[:offset:len]` -> `<path>` or `<path>\t<offset>\t<len>`; any other item unchanged.
@@ -1037,7 +1062,7 @@ fn observe_uplink(ctx: &Ctx) {
 /// A PC that has been downloading `sha` for a moment serves the pieces it has (see Part). Only downloads that started at least
 /// half a second ago count, and a fetcher picks holders already there: a chain, not a loop (a rare loop times out and goes to the head).
 fn partial_holder(w: &crate::head::Worker, sha: &str) -> bool {
-    w.fetching.get(sha).and_then(|f| f.since).is_some_and(|t| t.elapsed() >= Duration::from_millis(500))
+    w.fetching.get(sha).and_then(|f| f.since).is_some_and(|t| t.elapsed() >= Duration::from_millis(crate::tune::get("blob_partial_ms") as u64))
 }
 
 /// Is this connected PC one the blob logic applies to (a real agent that speaks blobs)?

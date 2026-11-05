@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Ban, CircleCheck, Play, Wrench, ArrowDownToLine, Moon, Sun, X } from '@lucide/svelte';
+	import { Ban, CircleCheck, Play, Wrench, ArrowDownToLine, Moon, ScanEye, Sun, X } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import type { NodeRow, NodeState } from '#lib/api/schema.ts';
 	import NodeOrg from '#lib/components/NodeOrg.svelte';
@@ -53,6 +53,17 @@
 		}
 		busy = false;
 	}
+	const here = $derived(rows.filter((n) => n.online));
+	async function identify() {
+		busy = true;
+		error = '';
+		try {
+			await api.identify(here.map((n) => n.node_id), 30);
+		} catch (e) {
+			error = e instanceof ApiError ? e.message : 'Could not ask the PCs to identify themselves.';
+		}
+		busy = false;
+	}
 	const awake = $derived(rows.filter((n) => n.power === 'awake' && n.online));
 	const asleep = $derived(rows.filter((n) => n.power === 'asleep'));
 	function go(state: NodeState, label: string, risky: boolean) {
@@ -78,6 +89,7 @@
 			</button>
 			<button type="button" class={b} disabled={busy || !awake.length} title={awake.length ? 'Put the PCs to sleep to save power' : 'None of the selected PCs is awake and connected'} onclick={() => (askSleep = true)}><Moon class="size-4" aria-hidden="true" />Sleep</button>
 			<button type="button" class={b} disabled={busy || !asleep.length} title={asleep.length ? 'Wake the PCs with Wake-on-LAN' : 'None of the selected PCs is asleep'} onclick={() => void power('wake')}><Sun class="size-4" aria-hidden="true" />Wake{asleep.length ? ` (${asleep.length})` : ''}</button>
+			<button type="button" class={b} disabled={busy || !here.length} title={here.length ? 'Each PC shows a banner and rings its bell for 30 seconds, so you can find it in the room' : 'None of the selected PCs is connected'} onclick={() => void identify()}><ScanEye class="size-4" aria-hidden="true" />Identify{here.length ? ` (${here.length})` : ''}</button>
 			<label class="min-w-40 flex-1">
 				<span class="sr-only">Reason (recorded with the change)</span>
 				<input bind:value={reason} maxlength="200" placeholder="Reason (recorded)" class={field} />

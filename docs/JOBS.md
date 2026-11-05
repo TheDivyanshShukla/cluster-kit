@@ -137,3 +137,10 @@ ck run --list files.txt --cmd "sh -c 'while read f; do sha256sum \"\$f\"; done'"
 ```
 
 Combine results on the head with a reducer: `--reducer sum`, `count`, `sort`, `lines` or `top:N` (console: the Result reducer switch).
+
+## Output files and templates (wave 15)
+A `cmd` or `list` program may write result files. The agent sets env `CK_OUT` to an empty directory for the chunk. Everything the program leaves there (regular files at the top level, exit 0) is uploaded to the head when the chunk ends; the chunk fails if the files together are over `out_files_mb` (default 256 MB). Pieces of one chunk share the directory, so name files by `$CK_START` (for example `$CK_OUT/part_$CK_START.csv`).
+
+List them with `ck job files ID`, fetch them with `ck job files ID --get DIR`, or use `GET /api/v1/jobs/ID/files` and `GET /api/v1/blobs/SHA`.
+
+A template stores a job body under a name: `ck job template save NAME job.json`, then `ck job submit --template NAME` (API: `POST /api/v1/jobs {"template": "NAME", "n": 5000}`; keys in the body replace the stored ones).

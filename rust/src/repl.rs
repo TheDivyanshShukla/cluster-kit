@@ -331,13 +331,14 @@ pub fn config_entry(ctx: &Ctx) -> Value {
         "tokens": st.tokens().iter().map(|(h, u)| json!([h, u])).collect::<Vec<_>>(),
         "node_keys": st.node_keys().iter().map(|(n, k)| json!([n, hex(k)])).collect::<Vec<_>>(),
         "nodes": st.nodes(),
+        "templates": st.templates().into_iter().map(|t| json!([t.0, t.1, t.2, t.3, t.4])).collect::<Vec<_>>(),
         // settings that live in store meta: they must survive a takeover too
         "meta": SETTINGS_META.iter().filter_map(|k| st.meta(k).map(|v| (k.to_string(), Value::String(v)))).collect::<serde_json::Map<_, _>>(),
     })
 }
 
 /// Store meta keys copied to standbys inside "config" entries (power, standby target, every tunable).
-pub const SETTINGS_META: &[&str] = &["power", "ha_settings", "tune", "asleep", "fence_key"];
+pub const SETTINGS_META: &[&str] = &["power", "ha_settings", "tune", "asleep", "fence_key", "quotas"];
 
 /// Fence key: 32 random bytes in store meta (replicated to standbys, so a promoted standby has it). Epoch beacons that
 /// can fence a head or redirect a standby are signed with it; an unsigned `ck/1` beacon is only for agents, who follow
@@ -565,7 +566,7 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
             let (mut offered, mut last_offer) = (HashSet::new(), None::<Instant>);
             loop {
                 // blobs the primary stores reach this standby over the blob port, so a takeover can serve them (every 5 s)
-                if caps & CAP_BLOBS != 0 && last_offer.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+                if caps & CAP_BLOBS != 0 && last_offer.is_none_or(|t| t.elapsed() >= crate::tune::secs("blob_offer_s")) {
                     last_offer = Some(Instant::now());
                     for o in crate::blobs::offers(ctx, &mut offered, 8) {
                         put_entry(&mut w, &mut htx, &Entry { seq: 0, epoch, kind: "blob".into(), data: o })?;
@@ -619,6 +620,10 @@ pub fn apply(st: &Store, e: &Entry) -> Result<(), String> {
         "part" => {
             let body: Vec<u8> = serde_json::from_value(d.get("body").cloned().unwrap_or_default()).map_err(|x| x.to_string())?;
             st.add_part(u("job")?, u("a")?, u("b")?, &body)?;
+            let files: Vec<(String, String, u64)> = d.get("files").and_then(|f| f.as_array()).into_iter().flatten().filter_map(|x| Some((x["name"].as_str()?.to_string(), x["sha"].as_str()?.to_string(), x["size"].as_u64()?))).collect();
+            if !files.is_empty() {
+                st.put_job_files(u("job")?, u("a")?, u("b")?, &files);
+            }
         }
         "state" => {
             let state = d.get("state").and_then(|x| x.as_str()).and_then(JobState::parse).ok_or("state: bad state")?;
@@ -639,6 +644,16 @@ fn apply_config(st: &Store, d: &Value) -> Result<(), String> {
     if let Some(m) = d.get("meta").and_then(|m| m.as_object()) {
         for (k, v) in m.iter().filter(|(k, _)| SETTINGS_META.contains(&k.as_str())) {
             st.set_meta(k, v.as_str().unwrap_or_default())?;
+        }
+    }
+    if let Some(ts) = d.get("templates").and_then(|x| x.as_array()) {
+        let want: std::collections::HashSet<&str> = ts.iter().filter_map(|t| t.get(0)?.as_str()).collect();
+        for t in st.templates().into_iter().filter(|t| !want.contains(t.0.as_str())) {
+            st.delete_template(&t.0);
+        }
+        for t in ts {
+            let g = |i: usize| t.get(i).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            st.put_template(&g(0), &g(1), &g(2), &g(3), t.get(4).and_then(|x| x.as_i64()).unwrap_or(0))?;
         }
     }
     for n in arr(d, "nodes") {

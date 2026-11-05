@@ -50,6 +50,9 @@ import {
 	Stats,
 	User,
 	UserList,
+	JobFiles,
+	Net,
+	TemplateList,
 	type Role
 } from './schema';
 
@@ -197,6 +200,18 @@ export const api = {
 	deleteReservation: async (id: number) => void (await send('DELETE', `/api/v1/reservations/${id}`)),
 	createJob: (j: NewJob) => call('POST', '/api/v1/jobs', JobOne, (NewJob.parse(j), j)),
 	cancelJob: (id: number) => call('POST', `/api/v1/jobs/${id}/cancel`, JobOne),
+	// wave 15
+	templates: () => call('GET', '/api/v1/templates', TemplateList),
+	saveTemplate: async (name: string, spec: unknown, note = '') => void (await send('POST', '/api/v1/templates', { name, spec, note })),
+	deleteTemplate: async (name: string) => void (await send('DELETE', `/api/v1/templates/${encodeURIComponent(name)}`)),
+	/** the stored spec with these fields laid over it */
+	runTemplate: (name: string, overrides: Record<string, unknown> = {}) => call('POST', '/api/v1/jobs', JobOne, { template: name, ...overrides }),
+	jobFiles: (id: number) => call('GET', `/api/v1/jobs/${id}/files`, JobFiles),
+	identify: (nodes: string[], secs = 30) => send('POST', '/api/v1/nodes/identify', { nodes, secs }).then(() => undefined),
+	setQuota: (name: string, q: { max_pcs: number; max_running: number }) => send('PUT', `/api/v1/users/${encodeURIComponent(name)}/quota`, q).then(() => undefined),
+	net: () => call('GET', '/api/v1/net', Net),
+	/** operator; burst = every PC at once, to learn the head uplink */
+	netProbe: (node_ids: string[] = [], burst = false) => send('POST', '/api/v1/net/probe', { node_ids, burst }).then(() => undefined),
 	// events
 	events: (limit = 50, before?: number | null) => call('GET', `/api/v1/events${page(limit, before)}`, EventList),
 	/** operator role; newest lines of the head's log files, filtered by the head */

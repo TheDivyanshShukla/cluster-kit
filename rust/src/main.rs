@@ -169,6 +169,8 @@ fn main() {
                 let all = std::env::var("CK_BLOB_FILES").map(|v| format!("{v}\n{f}")).unwrap_or(f);
                 std::env::set_var("CK_BLOB_FILES", all);
             }
+            "--template" => std::env::set_var("CK_TEMPLATE", args.next().unwrap_or_else(|| die("--template needs a name"))),
+            "--get" => std::env::set_var("CK_GET_DIR", args.next().unwrap_or_else(|| die("--get needs a directory"))),
             "--list" => std::env::set_var("CK_LIST_FILE", args.next().unwrap_or_else(|| die("--list needs a file"))),
             // first join of a PC (FLT-04); the agent reads it from CK_JOIN_CODE
             "--code" => std::env::set_var("CK_JOIN_CODE", args.next().unwrap_or_else(|| die("--code needs a value"))),

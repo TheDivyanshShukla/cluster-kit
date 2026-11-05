@@ -28,11 +28,16 @@ pub static GPU: OnceLock<Option<crate::gpu::Gpu>> = OnceLock::new();
 /// Run one chunk [a, b) of a job and return the RESULT body.
 /// Err((retry, message)): the chunk failed; retry = worth running again (JOB-04 exit code 75 or a timeout).
 pub fn run_task(kind: u8, job: u64, a: u64, b: u64, arg: &[u8]) -> Result<Vec<u8>, (bool, String)> {
+    run_task_out(kind, job, a, b, arg, None)
+}
+
+/// Like `run_task`; `out` = the chunk's CK_OUT directory (cmd and list jobs, JOB-08).
+pub fn run_task_out(kind: u8, job: u64, a: u64, b: u64, arg: &[u8], out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
     match kind {
         KIND_SHA => Ok(gpu_sha(job, a, b, arg).unwrap_or_else(|| sha_range(job, a, b, arg))),
         KIND_SYNTH => Ok(synth_range(job, a, b, arg)),
-        KIND_LIST => run_list_par(job, arg, a, b),
-        _ => run_cmd_par(job, arg, a, b),
+        KIND_LIST => run_list_par(job, arg, a, b, out),
+        _ => run_cmd_par(job, arg, a, b, out),
     }
 }
 
@@ -214,13 +219,13 @@ fn note_piece_cost(job: u64, items: u64, parts: u64, wall: f64) {
 
 // Split the chunk into one piece per thread and run the program on each piece in parallel,
 // so single-threaded programs use every core. Multi-threaded programs: start the worker with --threads 1.
-fn run_cmd_par(job: u64, cmd: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, String)> {
+fn run_cmd_par(job: u64, cmd: &[u8], a: u64, b: u64, out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
     let parts = pieces_for(job, b - a, copies_for(job, rayon::current_num_threads() as u64)).min(b - a).max(1);
     let step = (b - a).div_ceil(parts);
     let t = Instant::now();
     let res: Vec<_> = (0..parts)
         .into_par_iter()
-        .map(|i| run_cmd(cmd, job, parts, a + i * step, (a + (i + 1) * step).min(b)))
+        .map(|i| run_cmd(cmd, job, parts, a + i * step, (a + (i + 1) * step).min(b), out))
         .collect();
     note_piece_cost(job, b - a, parts, t.elapsed().as_secs_f64());
     let fails: Vec<&(bool, String)> = res.iter().filter_map(|r| r.as_ref().err()).collect();
@@ -232,7 +237,7 @@ fn run_cmd_par(job: u64, cmd: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, S
 
 /// List job (JOB-01): arg = command, 0x00, items joined by '\n' for [a, b). One contiguous piece of items per thread,
 /// the command runs once per piece with its items on stdin (one per line); stdout joined in order.
-fn run_list_par(job: u64, arg: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, String)> {
+fn run_list_par(job: u64, arg: &[u8], a: u64, b: u64, out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
     let split = arg.iter().position(|c| *c == 0).unwrap_or(arg.len());
     let (cmd, items) = (&arg[..split], arg.get(split + 1..).unwrap_or(&[]));
     let lines: Vec<std::borrow::Cow<[u8]>> = if items.is_empty() {
@@ -251,7 +256,7 @@ fn run_list_par(job: u64, arg: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, 
             let (lo, hi) = ((i * step) as usize, ((i + 1) * step).min(n) as usize);
             let mut stdin = lines[lo..hi].join(&b'\n');
             stdin.push(b'\n');
-            run_cmd_in(cmd, job, parts, a + lo as u64, a + hi as u64, Some(&stdin))
+            run_cmd_in(cmd, job, parts, a + lo as u64, a + hi as u64, Some(&stdin), out)
         })
         .collect();
     note_piece_cost(job, n, parts, t.elapsed().as_secs_f64());
@@ -306,13 +311,55 @@ fn out_max() -> usize {
 }
 static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// A chunk's `CK_OUT` directory (JOB-08): empty at the start, removed when dropped.
+pub struct OutDir(pub std::path::PathBuf);
+
+impl OutDir {
+    pub fn new() -> Option<OutDir> {
+        let d = env::temp_dir().join(format!("ck-out-{}-{}", std::process::id(), SCRATCH_SEQ.fetch_add(1, Relaxed)));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).ok().map(|_| OutDir(d))
+    }
+    /// Regular files at the top of the directory, sorted: (name, path, size). Err(message) = over `limit_mb`, too many, or a bad name.
+    pub fn files(&self, limit_mb: u64) -> Result<Vec<(String, std::path::PathBuf, u64)>, String> {
+        let mut v = vec![];
+        let mut total = 0u64;
+        for e in fs::read_dir(&self.0).map_err(|e| format!("CK_OUT: {e}"))?.flatten() {
+            let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
+            if !m.is_file() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.is_empty() || name.len() > 200 || name.starts_with('.') || name.contains(['/', '\\']) {
+                return Err(format!("output file name {name:?} is not allowed (1 to 200 characters, no leading dot, no slashes)"));
+            }
+            total += m.len();
+            if total > limit_mb << 20 {
+                return Err(format!("output files are over the {limit_mb} MB limit (out_files_mb)"));
+            }
+            v.push((name, e.path(), m.len()));
+        }
+        if v.len() > 1000 {
+            return Err("more than 1000 output files in one chunk".into());
+        }
+        v.sort();
+        Ok(v)
+    }
+}
+
+impl Drop for OutDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// One piece of a `--cmd` job (JOB-04): env CK_*, exit 0 = ok, 75 = retry, anything else = failed.
-fn run_cmd(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64) -> Result<Vec<u8>, (bool, String)> {
-    run_cmd_in(cmd, job, pieces, a, b, None)
+fn run_cmd(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
+    run_cmd_in(cmd, job, pieces, a, b, None, out)
 }
 
 /// `stdin` = Some(items): a list job piece. The command gets no START END arguments, only the env vars and the items.
-fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, stdin: Option<&[u8]>) -> Result<Vec<u8>, (bool, String)> {
+fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, stdin: Option<&[u8]>, out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
     let scratch = env::temp_dir().join(format!("ck-scratch-{}-{}", std::process::id(), SCRATCH_SEQ.fetch_add(1, Relaxed)));
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch).map_err(|e| (false, format!("scratch dir: {e}")))?;
@@ -321,7 +368,7 @@ fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, stdin: Option<&
     // ponytail: the head owns the attempt count; CK_ATTEMPT is only what the agent's environment says (default 1)
     let attempt = env::var("CK_ATTEMPT").unwrap_or_else(|_| "1".into());
     c.env("CK_JOB", job.to_string()).env("CK_TASK", format!("{job}:{a}-{b}")).env("CK_ATTEMPT", attempt)
-        .env("CK_THREADS", pieces.to_string()).env("CK_START", a.to_string()).env("CK_END", b.to_string()).env("CK_SCRATCH", &scratch);
+        .env("CK_THREADS", pieces.to_string()).env("CK_START", a.to_string()).env("CK_END", b.to_string()).env("CK_SCRATCH", &scratch).env("CK_OUT", out.unwrap_or(&scratch));
     let warm = crate::tune::n("warm_idle_s");
     c.env("CK_WARM_IDLE_S", warm.to_string());
     if warm == 0 { c.env("CK_WARM", "off"); }
@@ -469,7 +516,7 @@ mod tests {
 
     #[cfg(unix)]
     fn cmd(script: &str, a: u64, b: u64) -> Result<Vec<u8>, (bool, String)> {
-        run_cmd(format!("sh -c '{script}' x").as_bytes(), 7, 2, a, b)
+        run_cmd(format!("sh -c '{script}' x").as_bytes(), 7, 2, a, b, None)
     }
 
     #[cfg(unix)]
@@ -502,9 +549,9 @@ mod tests {
         assert!(e.0 && e.1.contains("75") && e.1.contains("oops"), "{e:?}");
         let e = cmd("echo a >&2; echo last >&2; exit 3", 0, 1).unwrap_err();
         assert!(!e.0 && e.1 == "exit 3: last", "{e:?}");
-        assert!(run_cmd(b"/no/such/program-x", 1, 1, 0, 1).is_err());
+        assert!(run_cmd(b"/no/such/program-x", 1, 1, 0, 1, None).is_err());
         // mixed pieces: retry only if every failing piece said 75
-        assert_eq!(run_cmd_par(1, b"sh -c 'exit 75' x", 0, 4).unwrap_err().0, true);
+        assert_eq!(run_cmd_par(1, b"sh -c 'exit 75' x", 0, 4, None).unwrap_err().0, true);
     }
 
     #[cfg(unix)]
@@ -514,19 +561,19 @@ mod tests {
         let arg = |c: &str| [c.as_bytes(), b"\0", items.as_bytes()].concat();
         let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
         // 10 items over 3 threads: pieces of 4, 4, 2 lines
-        let out = pool.install(|| run_list_par(7700, &arg("sh -c 'wc -l'"), 100, 110)).unwrap();
+        let out = pool.install(|| run_list_par(7700, &arg("sh -c 'wc -l'"), 100, 110, None)).unwrap();
         let counts: Vec<u32> = String::from_utf8(out).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
         assert_eq!(counts, [4, 4, 2]);
         // order, env range and stdin content
-        let out = pool.install(|| run_list_par(7702, &arg("sh -c 'echo $CK_START-$CK_END; cat'"), 100, 110)).unwrap();
+        let out = pool.install(|| run_list_par(7702, &arg("sh -c 'echo $CK_START-$CK_END; cat'"), 100, 110, None)).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "100-104\n0\n1\n2\n3\n104-108\n4\n5\n6\n7\n108-110\n8\n9\n");
         // exit codes
-        let e = pool.install(|| run_list_par(7703, &arg("sh -c 'exit 75'"), 0, 10)).unwrap_err();
+        let e = pool.install(|| run_list_par(7703, &arg("sh -c 'exit 75'"), 0, 10, None)).unwrap_err();
         assert!(e.0, "{e:?}");
-        let e = pool.install(|| run_list_par(7704, &arg("sh -c 'echo bad >&2; exit 2'"), 0, 10)).unwrap_err();
+        let e = pool.install(|| run_list_par(7704, &arg("sh -c 'echo bad >&2; exit 2'"), 0, 10, None)).unwrap_err();
         assert!(!e.0 && e.1 == "exit 2: bad", "{e:?}");
         // a program that ignores stdin is fine
-        assert!(run_list_par(7705, &arg("true"), 0, 10).is_ok());
+        assert!(run_list_par(7705, &arg("true"), 0, 10, None).is_ok());
     }
 
     #[test]
@@ -539,5 +586,22 @@ mod tests {
     fn cmd_scratch_removed() {
         let p = String::from_utf8(cmd("touch $CK_SCRATCH/f; echo $CK_SCRATCH", 0, 1).unwrap()).unwrap();
         assert!(p.contains("ck-scratch-") && !std::path::Path::new(p.trim()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ck_out_files_are_collected_and_limited() {
+        let d = OutDir::new().unwrap();
+        let p = d.0.clone();
+        run_cmd(b"sh -c 'echo hi > $CK_OUT/a.txt; echo yo > $CK_OUT/b_$CK_START.txt; mkdir $CK_OUT/sub; echo x > $CK_OUT/sub/c' x", 7, 1, 4, 9, Some(&d.0)).unwrap();
+        let f = d.files(1).unwrap();
+        assert_eq!(f.iter().map(|x| (x.0.as_str(), x.2)).collect::<Vec<_>>(), vec![("a.txt", 3), ("b_4.txt", 3)], "top-level regular files only");
+        std::fs::write(d.0.join("big"), vec![0u8; 2 << 20]).unwrap();
+        assert!(d.files(1).unwrap_err().contains("over the 1 MB"));
+        std::fs::write(d.0.join(".hidden"), b"x").unwrap();
+        std::fs::remove_file(d.0.join("big")).unwrap();
+        assert!(d.files(1).unwrap_err().contains("not allowed"));
+        drop(d);
+        assert!(!p.exists(), "dir removed on drop");
     }
 }

@@ -46,3 +46,17 @@ export function ago(ms: number | null | undefined, now = Date.now()): string {
 export function datetime(ms: number | null | undefined): string {
 	return ms == null ? dash : new Date(ms).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'medium' });
 }
+
+/** FLT-07: the PC is showing its "it is me" banner right now */
+export const identifying = (n: { identify_until_ms?: number | null }, now = Date.now()): boolean => (n.identify_until_ms ?? 0) > now;
+
+/** Link speed as people say it: 940 -> "940 Mbps", 2500 -> "2.5 Gbps" */
+export const mbps = (v: number | null | undefined): string => (v == null ? '—' : v >= 1000 ? `${+(v / 1000).toFixed(1)} Gbps` : `${Math.round(v)} Mbps`);
+
+/** A file size from bytes up: 900 B, 73 KiB, 4.2 MiB (bytes() starts at MiB) */
+export function fileSize(b: number): string {
+	if (!Number.isFinite(b) || b < 0) return dash;
+	if (b < 1024) return `${b} B`;
+	if (b < 2 ** 20) return `${Math.round(b / 1024)} KiB`;
+	return b < 2 ** 30 ? `${+(b / 2 ** 20).toFixed(1)} MiB` : `${+(b / 2 ** 30).toFixed(1)} GiB`;
+}

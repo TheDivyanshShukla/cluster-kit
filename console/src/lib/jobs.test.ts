@@ -4,7 +4,7 @@ import { atLeast, canCancel, emptyForm, etaMs, jobRate, mergeRows, progress, val
 
 const job = (o: Partial<JobRow> = {}): JobRow => ({
 	id: 1, name: 'j', kind: 'synth', from: 1, end: 101, chunk: 10, total: 100, done: 50, state: 'running',
-	submitter: 'ana', created_ms: 0, started_ms: 0, finished_ms: null, error: null, selector: '', priority: 2, policy: '', reducer: '', eta_ms: null, ...o
+	submitter: 'ana', created_ms: 0, started_ms: 0, finished_ms: null, error: null, selector: '', priority: 2, policy: '', reducer: '', eta_ms: null, wait_reason: null, files: 0, ...o
 });
 
 test('roles and cancel rights', () => {

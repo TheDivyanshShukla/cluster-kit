@@ -402,9 +402,9 @@ Suggested split for five people (put names in):
 - [x] HA-01 liveness and timeouts (1 s heartbeat, 5 s loss), with the cable-pull test (`kill -STOP`) in scripts/chaos.sh. `--spin` has no timeout yet.
 - [x] Protocol v2: a version in HELLO, JSON control frames reserved, FLT-01 node ID, FLT-02 inventory.
 - [x] SIM-01 virtual nodes (`ck agent --virtual N`) and the synthetic kernel (`ck run --synth NS`, JOB-09).
-- [ ] Security and install basics:
+- [x] Security and install basics:
   - [x] SEC-02: library (auth.rs) in M0, wired in M1 wave 3;
-  - [ ] SEC-03 command authorisation (M1, needs users);
+  - [x] SEC-03 command authorisation (cmd jobs need operator; templates and blobs need researcher);
   - [x] SEC-04 the systemd unit;
   - [x] OPS-01 the install command (`ck install`; dry-run checked, real install not yet run on Ubuntu).
 - [~] CI (NFR-09): .github/workflows/ci.yml written; it has never run, because nothing has been pushed.
@@ -417,7 +417,7 @@ Suggested split for five people (put names in):
 - [x] JOB-04 the contract and docs/JOBS.md (env vars, exit 0 / 75 retry / other failed); JOB-06 limits: 3 attempts per range, per-task timeout (the timeout path is unit-tested only).
 - [x] API-01 HTTP and SSE on port 7702 (dash.html kept at /legacy); SEC-01 auth (bootstrap, login, sessions, tokens, roles, throttle); OBS-04 audit log.
 - [x] Console pages: UI-01 Overview, UI-03 Nodes, UI-05 Jobs (list, detail, new), UI-10 Events and Users, with UI-13 live updates over SSE. Checked in a real browser against the real head.
-- [ ] UI-14 quality pass: not yet checked at the viewer and researcher roles, on Users and Nodes, or in dark mode at desktop width.
+- [x] UI-14 quality pass: viewer and researcher walkthrough (writes hidden or disabled with a reason), Users and Nodes, dark at 1440 and 390 (wave 15, against the mock; tick 22).
 - [x] UI-02 floor map v1 (place, auto-arrange, state/CPU/working overlays, box-select and act, table alternative); FLT-04 approvals and join codes; ORG-09 node states (drain then cordon checked live).
 - [x] SEC-02 wired: join code -> per-node key; CHALLENGE/PROOF on reconnect; every frame sealed after admission; `CK_FLEET=open` for development and chaos.sh.
 - [x] API-02 CLI parity: `ck admin ...`, `ck job ...`, `ck token`; a test fails when a route has no CLI command.
@@ -435,35 +435,35 @@ Suggested split for five people (put names in):
 
 - [x] Pure scheduler core (sched.rs); SCH-06 fixed/guided/adaptive with table tests (`--policy`); SCH-07 per-PC per-kind rates; FLT-06 3 s calibration at join (2026-11-05). Measured on one 10-core Mac: fixed and adaptive gave the same time (37.8 s vs 37.5 s) because the slowed virtual PCs were not slow enough; the real comparison needs E2 on lab PCs.
 - [x] SCH-03 estimates (`eta_ms`, `/estimate`), SCH-08 speculative tail copies (first result wins; the losing copy is not cancelled yet).
-- [ ] SCH-05 placement modes, SCH-09 preemption, SCH-04 fair share and quotas.
+- [x] SCH-05 placement modes (tick 15), SCH-09 preemption at chunk boundaries + `preempt: true`, SCH-04 fair share per user and quotas max_pcs/max_running (ticks 22).
 - [x] SCH-10 students first: presence probe (Linux logind, macOS HID idle, CPU fallback), busy at once / idle after 5 min, busy PCs get no new chunks; checked with CK_PRESENCE_FAKE. [ ] E6 pilot on 4 real PCs.
 - [x] JOB-01 list jobs (`--list FILE`, console List kind), JOB-07 reducers (`--reducer`, result?reducer=). Measured: sum over 1..2000 = 2001000.
-- [ ] JOB-05 bundles, JOB-08 output files, JOB-12 templates.
+- [x] JOB-05 bundles (blobs, tick 20), JOB-08 output files (`CK_OUT`, tick 22), JOB-12 templates (tick 22, replicated to standbys).
 
 ## M4 Resilience and architectures (weeks 8-13, until 2027-02-07)
 
 - [x] HA-03 standbys and the change log; HA-04 durable results; HA-05 election; HA-06 fencing. (Tick 5: kill -9 of the primary at 51 % -> standby promoted in 5.7 s, exact result; network-split test with real PCs still to run.)
 - [x] HA-07 planned switchover. (Settings: Make head, `ck admin switchover NODE`, POST /api/v1/ha/switchover. Mid-job on 10 virtual agents: exact 6138 hits; work resumed on the new head 3.7 s after the request, measured as first progress, so just above the 3 s target.)
 - [ ] HA-08 relays: discovery first, then tasks and bundles. (Discovery relays exist. Tick 7, one Mac: one head serves 200 agents at 2,100 tasks/s, 10x what 200 PCs need, so task relays are deferred until a fleet above ~500 PCs.)
-- [ ] HA-09 chaos script running in CI.
+- [x] HA-09 chaos script in CI (ubuntu job; like all CI, it has not run yet because nothing has been pushed).
 
 ## M5 Simulation (weeks 9-14, until 2027-02-14)
 
 - [ ] SIM-02 simulator, SIM-03 architectures, SIM-04 validation against real runs. (Tick 13: SIM-02/03 done as `ck sim`, 10,000 nodes x 1 h in 1.4 s, matches the local 200-agent point; SIM-04 needs the lab E1 data.)
-- [ ] SIM-05 / UI-09 Simulation Lab page (P2).
+- [x] SIM-05 / UI-09 Simulation Lab page (/sim, POST /api/v1/sim; tick 22).
 
 ## M6 Network and fleet operations (weeks 10-15, until 2027-02-21)
 
-- [ ] NET-01, NET-02, NET-07 topology and probes; NET-03 bundle distribution; NET-04 batching.
-- [ ] OPS-02 rolling upgrades; OPS-03 remote actions; OPS-04 backups.
-- [ ] NET-06 Wake-on-LAN and power windows; FLT-07 identify.
+- [x] NET-01, NET-02, NET-07 link probes, head uplink, per-lab speed (/network page); NET-03 bundle distribution with peer fan-out and partial pieces; NET-04 batching (SDK auto-batching, ~0.25 s pieces). Real subnets still to measure in the lab.
+- [x] OPS-02 rolling upgrades (OPERATIONS.md section 7, mixed-version warning); OPS-03 remote actions (drain, cordon, sleep, wake, identify); OPS-04 backups (`ck admin backup`, scheduled).
+- [x] NET-06 Wake-on-LAN, eco mode and power windows (dry-run tested; real WoL needs the lab); FLT-07 identify.
 - [ ] OPS-06 Windows agent.
 
 ## M7 Monitoring, advisor, experiments (weeks 9-16, until 2027-02-28)
 
-- [ ] OBS-01, OBS-02 metrics and fleet numbers; OBS-03 energy; OBS-05 alerts; OBS-06 advisor.
+- [x] OBS-01, OBS-02 metrics and fleet numbers; OBS-03 energy (power model, per-lab watts; real watts need a meter); OBS-05 alerts; OBS-06 advisor (`ck.advise`).
 - [ ] EXP-01..05: experiment runner, provenance, CSV for figs.py, fault scripts, labels. (Tick 9: EXP-01/02/03/05 in `scripts/experiment.py`; EXP-04 still open.)
-- [ ] UI-06 policies, UI-07 network, UI-08 experiments, UI-12 power-user features.
+- [x] UI-06 policies, UI-07 network, UI-08 experiments, UI-12 power-user features (command palette).
 
 ## M8 200 PCs and the paper (weeks 14-20, until 2027-03-28)
 
@@ -476,7 +476,7 @@ Suggested split for five people (put names in):
 - [ ] 24-hour proof-of-work soak, with a report (E7). (Tool ready: `python3 scripts/soak.py --head URL[,URL] --hours 24`, tick 8; the lab run is still to do.)
 - [ ] Rehearse the press demo three times: pull cables, kill the head, reserve a lab live.
 - [ ] Accessibility and performance pass on every page.
-- [ ] Docs: README quick start, docs/ARCHITECTURE.md, docs/OPERATIONS.md (runbook for lab staff; first version tick 11), docs/JOBS.md, docs/API.md.
+- [x] Docs: README quick start (every command run once), docs/ARCHITECTURE.md, docs/OPERATIONS.md, docs/JOBS.md, docs/API.md (tick 22).
 
 ## Open questions (the answers change the plan)
 

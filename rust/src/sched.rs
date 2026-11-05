@@ -95,6 +95,13 @@ pub fn pick_job(wid: u64, nodes: &[NodeView], jobs: &[JobView], reserves: &[Rese
     Some(if assigned(best.id) < share.div_ceil(same) { best.id } else { cur.id })
 }
 
+/// SCH-04 quotas. `q` = (max_pcs, max_running) of the job's owner, 0 = no limit; `rank` = the owner's older unfinished jobs;
+/// `holders` = PCs holding any chunk of the owner's jobs; `holds` = this PC is one of them. A job beyond the owner's
+/// max_running waits; a PC that is not yet working for the owner is refused while max_pcs PCs already are.
+pub fn quota_ok(q: (u32, u32), rank: usize, holders: usize, holds: bool) -> bool {
+    (q.1 == 0 || rank < q.1 as usize) && (q.0 == 0 || holds || holders < q.0 as usize)
+}
+
 /// A node that could take a chunk of a job now (matches, can work), for `place`.
 #[derive(Clone, Debug)]
 pub struct PlaceNode {
@@ -839,3 +846,13 @@ mod place_tests {
         assert_eq!(ids(place("efficient", 0, &z)), ["a", "b"]);
     }
 }
+    #[test]
+    fn quota_rules() {
+        // no limit
+        assert!(quota_ok((0, 0), 9, 99, false));
+        // max_running 2: the third job (rank 2) waits
+        assert!(quota_ok((0, 2), 1, 0, false) && !quota_ok((0, 2), 2, 0, false));
+        // max_pcs 2: a third PC is refused, a PC already working for the user is not
+        assert!(quota_ok((2, 0), 0, 1, false) && !quota_ok((2, 0), 0, 2, false) && quota_ok((2, 0), 0, 2, true));
+    }
+

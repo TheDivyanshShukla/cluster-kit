@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { ArrowLeft, CircleAlert, Clock, Download, FileQuestion, GitCompareArrows, Square } from '@lucide/svelte';
+	import { ArrowLeft, CircleAlert, Clock, Download, FileDown, FileQuestion, GitCompareArrows, Square } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
-	import type { Breakdown } from '#lib/api/schema.ts';
+	import type { Breakdown, JobFile } from '#lib/api/schema.ts';
 	import BreakdownPanel from '#lib/components/BreakdownPanel.svelte';
 	import Page from '#lib/components/Page.svelte';
 	import Panel from '#lib/components/Panel.svelte';
@@ -13,12 +13,18 @@
 	import ProgressBar from '#lib/components/ProgressBar.svelte';
 	import StateChip from '#lib/components/StateChip.svelte';
 	import { live } from '#lib/live.svelte.ts';
-	import { count, datetime, duration, rate } from '#lib/format.ts';
+	import { count, datetime, duration, fileSize, rate } from '#lib/format.ts';
 	import { canCancel, elapsedMs, etaMs, jobRate, progress } from '#lib/jobs.ts';
 	import { etaLeft, joinReducer, PLACEMENTS, POLICIES, reducerLabel, REDUCER_OPTIONS, splitReducer } from '#lib/sched.ts';
 	import { roleNow, userNow } from '#lib/session.svelte.ts';
 	import { btnDanger, btnGhost, card, field } from '#lib/ui.ts';
 
+	const WAIT: Record<string, string> = {
+		quota: 'waiting: you are at your quota',
+		priority: 'waiting: higher priority jobs hold the PCs',
+		no_pcs: 'waiting: no PC can run it now',
+		'': 'waiting for its turn'
+	};
 	const id = $derived(Number(page.params.id));
 	const SHOW = 100_000; // characters of result shown inline; the download has all of it
 
@@ -87,6 +93,16 @@
 		return () => clearTimeout(t);
 	});
 
+	// Output files written by the job's commands (JOB-08); refetched when the file count changes
+	let files = $state<JobFile[]>([]);
+	let filesError = $state('');
+	$effect(() => {
+		const jid = id, n = job?.files ?? 0;
+		if (!n) return void (files = []);
+		api.jobFiles(jid).then((r) => ((files = r.files), (filesError = ''))).catch((e) => (filesError = e instanceof ApiError ? e.message : 'Could not list the files.'));
+	});
+	const hasFiles = $derived((job?.files ?? 0) > 0);
+
 	// The switch starts on the reducer the job was submitted with.
 	$effect(() => {
 		if (!job || seeded === id) return;
@@ -151,6 +167,7 @@
 					['Use at most', hints.max_pcs > 0 ? `${hints.max_pcs} PC${hints.max_pcs === 1 ? '' : 's'}` : 'All PCs'],
 					['Placement', PLACEMENTS.find((p) => p.value === hints.placement)?.label ?? 'Spread'],
 					...(hints.mem_mb > 0 ? [['Memory per copy', `${count(hints.mem_mb)} MB`]] : []),
+					...(job.files > 0 ? [['Output files', count(job.files)]] : []),
 					['Reducer', job.reducer ? reducerLabel(job.reducer) : 'Raw parts'],
 					['Time left', job.state === 'running' ? (etaWords?.replace(' left', '') ?? duration(etaMs(job, now))) : '—']
 				]
@@ -160,8 +177,8 @@
 
 <Page
 	title={job ? `#${job.id} ${job.name || 'Untitled job'}` : 'Job'}
-	tabs={[{ id: 'job', label: 'Job' }, { id: 'time', label: 'Time' }, { id: 'result', label: 'Result' }]}
-	class="sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)] sm:grid-rows-[minmax(0,1fr)_minmax(0,1fr)]"
+	tabs={[{ id: 'job', label: 'Job' }, { id: 'time', label: 'Time' }, { id: 'result', label: 'Result' }, ...(hasFiles ? [{ id: 'files', label: 'Files', badge: job?.files }] : [])]}
+	class="sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)] {hasFiles ? 'sm:grid-rows-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)]' : 'sm:grid-rows-[minmax(0,1fr)_minmax(0,1fr)]'}"
 >
 	{#snippet actions()}
 		{#if job && job.state !== 'queued'}<a href="/compare?jobs={job.id}" class={btnGhost}><GitCompareArrows class="size-4" aria-hidden="true" />Compare with...</a>{/if}
@@ -185,7 +202,7 @@
 			{/if}
 		</Panel>
 	{:else}
-		<Panel title="Progress and facts" tab="job" class="sm:row-span-2">
+		<Panel title="Progress and facts" tab="job" class={hasFiles ? 'sm:row-span-3' : 'sm:row-span-2'}>
 			{#if cancelError}<p class="text-bad mb-3 flex items-center gap-1.5 text-[13px]" role="alert"><CircleAlert class="size-4 shrink-0" aria-hidden="true" />{cancelError}</p>{/if}
 			{#if job.state === 'failed'}
 				<p class="border-bad text-bad mb-3 flex items-start gap-2 rounded-lg border px-3 py-2.5" role="alert">
@@ -194,7 +211,7 @@
 			{/if}
 			<ProgressBar value={progress(job)} label="Job progress" tone={job.state === 'failed' ? 'bg-bad' : job.state === 'done' ? 'bg-ok' : 'bg-primary'} />
 			<p class="num text-muted-foreground mt-2 text-xs" aria-live="polite">
-				{count(job.done)} of {count(job.total)} numbers · {Math.round(progress(job) * 100)}%{job.state === 'queued' ? ' · waiting for its turn' : ''}
+				{count(job.done)} of {count(job.total)} numbers · {Math.round(progress(job) * 100)}%{job.state === 'queued' ? ` · ${WAIT[job.wait_reason ?? ''] ?? 'waiting for its turn'}` : ''}
 			</p>
 			{#if etaWords}<p class="mt-1 flex items-center gap-1.5 text-[13px] font-medium" aria-live="polite"><Clock class="text-muted-foreground size-4" aria-hidden="true" />{etaWords[0].toUpperCase() + etaWords.slice(1)}</p>{/if}
 			<dl class="border-line mt-4 grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-[var(--line)]">
@@ -246,6 +263,28 @@
 				</p>
 			{/if}
 		</Panel>
+		{#if hasFiles}
+			<Panel title="Output files" tab="files" count={files.length || job.files}>
+				{#if filesError}
+					<p class="text-bad text-[13px]" role="alert">{filesError}</p>
+				{:else if !files.length}
+					<div class="bg-raised h-16 animate-pulse rounded-lg" aria-busy="true"></div>
+				{:else}
+					<ul class="divide-line border-line divide-y rounded-lg border">
+						{#each files as f (f.chunk[0] + f.name)}
+							<li class="flex items-center gap-2 px-3 py-2">
+								<FileDown class="text-muted-foreground size-4 shrink-0" aria-hidden="true" />
+								<div class="min-w-0 flex-1">
+									<p class="truncate font-medium" title={f.name}>{f.name}</p>
+									<p class="num text-muted-foreground text-xs">chunk {count(f.chunk[0])} to {count(f.chunk[1] - 1)} · {fileSize(f.size)}</p>
+								</div>
+								<a href="/api/v1/blobs/{f.sha}" download={f.name} class="{btnGhost} h-8 px-2.5" aria-label="Download {f.name}"><Download class="size-4" aria-hidden="true" />Download</a>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</Panel>
+		{/if}
 	{/if}
 </Page>
 

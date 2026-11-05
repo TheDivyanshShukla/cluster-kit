@@ -130,6 +130,7 @@ pub struct State {
     pub acct: HashMap<u64, crate::research::Acct>, // wave 12: per-job time accounting for the Breakdown
     pub paused_s: f64,                     // seconds this head did not dispatch (no quorum / halted), finished stretches
     pub pause_since: Option<Instant>,      // start of the current no-dispatch stretch
+    pub quotas: HashMap<String, (u32, u32)>, // user -> (max_pcs, max_running); absent or 0 = no limit (SCH-04, meta "quotas")
 }
 
 fn who_of(w: &Worker) -> (String, String) {
@@ -472,6 +473,56 @@ fn placed(st: &State, j: &Job, wid: u64) -> bool {
     sched::place(&j.placement, j.max_pcs, &pn).contains(&me)
 }
 
+/// Workers holding a chunk of any of `user`'s jobs.
+fn user_pcs(st: &State, user: &str) -> usize {
+    st.workers.values().filter(|w| w.inflight.iter().any(|t| st.jobs.get(&t.0).is_some_and(|j| j.user == user))).count()
+}
+
+/// SCH-04 quotas: may `wid` take a new chunk of `j` under its owner's max_pcs and max_running? No quota = yes, without a scan.
+fn quota_ok(st: &State, j: &Job, wid: u64) -> bool {
+    let Some(&q) = st.quotas.get(&j.user) else { return true };
+    let rank = st.jobs.values().filter(|o| o.user == j.user && o.id < j.id).count();
+    let holds = st.workers.get(&wid).is_some_and(|w| w.inflight.iter().any(|t| st.jobs.get(&t.0).is_some_and(|o| o.user == j.user)));
+    sched::quota_ok(q, rank, user_pcs(st, &j.user), holds)
+}
+
+/// Why a running job holds no PC right now: "quota" | "priority" | "no_pcs", None when it is running or about to.
+pub fn wait_reason(ctx: &Ctx, id: u64) -> Option<&'static str> {
+    let st = ctx.sh.0.lock().unwrap();
+    let j = st.jobs.get(&id)?;
+    if !j.has_work() || st.workers.values().any(|w| w.inflight.iter().any(|t| t.0 == id)) {
+        return None;
+    }
+    let ok = |w: &Worker| can_work(w) && j.selector.matches(&w.attrs) && (j.only.is_empty() || j.only.contains(&w.addr));
+    let free: Vec<&Worker> = st.workers.values().filter(|w| ok(w) && w.inflight.is_empty()).collect();
+    if let Some(&q) = st.quotas.get(&j.user) {
+        let rank = st.jobs.values().filter(|o| o.user == j.user && o.id < j.id).count();
+        if !sched::quota_ok(q, rank, user_pcs(&st, &j.user), false) {
+            return Some("quota");
+        }
+    }
+    if free.is_empty() {
+        return Some("no_pcs");
+    }
+    st.jobs.values().any(|o| o.priority < j.priority && o.has_work()).then_some("priority")
+}
+
+/// Quota of one user: (max_pcs, max_running), 0 = no limit.
+pub fn quota_of(ctx: &Ctx, user: &str) -> (u32, u32) {
+    ctx.store.meta("quotas").and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).map_or((0, 0), |v| (v[user]["max_pcs"].as_u64().unwrap_or(0) as u32, v[user]["max_running"].as_u64().unwrap_or(0) as u32))
+}
+
+fn load_quotas(ctx: &Ctx, st: &mut State) {
+    let v: serde_json::Value = ctx.store.meta("quotas").and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    st.quotas = v.as_object().into_iter().flatten().map(|(u, q)| (u.clone(), (q["max_pcs"].as_u64().unwrap_or(0) as u32, q["max_running"].as_u64().unwrap_or(0) as u32))).filter(|(_, q)| *q != (0, 0)).collect();
+}
+
+/// api.rs after PUT /api/v1/users/{name}/quota: meta "quotas" changed; dispatch re-reads it at once.
+pub fn quotas_changed(ctx: &Ctx) {
+    load_quotas(ctx, &mut ctx.sh.0.lock().unwrap());
+    ctx.sh.1.notify_all();
+}
+
 /// Next chunk for `wid`: sched::pick_job chooses the job, sched::chunk_len the length, then the range comes from the job's list.
 /// ponytail: views are rebuilt per chunk, O(workers); cache them if a fleet of thousands shows it.
 fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
@@ -496,7 +547,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         return Some(out);
     }
     let addr = st.workers.get(&wid)?.addr.clone();
-    let id = if st.policy.reserves.is_empty() && st.jobs.len() == 1 && st.jobs.values().all(|j| !limited(j)) {
+    let id = if st.policy.reserves.is_empty() && st.jobs.len() == 1 && st.quotas.is_empty() && st.jobs.values().all(|j| !limited(j)) {
         // fast path, same answer as sched::pick_job with one job and no reserves (which is O(workers) with attrs cloned
         // per node, ~1 ms at 1,000 nodes, under the State lock, once per result)
         let (w, j) = (&st.workers[&wid], st.jobs.values().next()?);
@@ -506,7 +557,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         let jv: Vec<JobView> = st
             .jobs
             .values()
-            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: j.selector.clone(), has_work: j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) })
+            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: j.selector.clone(), has_work: j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) && quota_ok(st, j, wid) })
             .collect();
         sched::pick_job(wid, &views, &jv, &st.policy.reserves)?
     };
@@ -557,7 +608,7 @@ fn speculate_take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8
     if !st.policy.reserves.is_empty() && sched::reserved(&node_views(st), &st.policy.reserves).contains(&nkey(w)) {
         return None;
     }
-    for j in st.jobs.values().filter(|j| !j.has_work() && j.selector.matches(&w.attrs) && (j.max_pcs == 0 || (st.workers.values().filter(|o| o.inflight.iter().any(|t| t.0 == j.id)).count() as u32) < j.max_pcs) && (j.only.is_empty() || j.only.contains(&w.addr))) {
+    for j in st.jobs.values().filter(|j| !j.has_work() && j.selector.matches(&w.attrs) && (j.max_pcs == 0 || (st.workers.values().filter(|o| o.inflight.iter().any(|t| t.0 == j.id)).count() as u32) < j.max_pcs) && (j.only.is_empty() || j.only.contains(&w.addr)) && quota_ok(st, j, wid)) {
         let mut infl: Vec<sched::Inflight> = vec![];
         for (_, h) in st.workers.iter().filter(|(i, _)| **i != wid) {
             for k in h.inflight.iter().filter(|k| k.0 == j.id) {
@@ -1202,6 +1253,7 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     let t1 = now();
     let t0 = t1 - secs;
     crate::lgc!("chunk.done", {"job": job, "a": a, "b": b, "wid": wid, "ms": secs * 1000.0});
+    let files = FILES.lock().unwrap().remove(&(job, a, b));
     let mut st = sh.0.lock().unwrap();
     let kind = st.jobs.get(&job).map(|j| j.kind);
     let mut upd = None;
@@ -1255,9 +1307,12 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
         return Ok((ack_now(&st), credit)); // already stored (re-run, speculative copy, or an agent resending after a failover, HA-04): ACK at once
     }
     acct_kept(&mut st, job, wid, b - a, secs);
+    if let Some(f) = &files {
+        ctx.store.put_job_files(job, a, b, f);
+    }
     // HA-03/04: log the part; ACK when the standbys have it too. repl::record / durable_seq are called under the State
     // lock (order State -> repl), so repl must call durable_upto without holding its own locks.
-    let seq = crate::repl::record_with(ctx, "part", || serde_json::json!({ "job": job, "a": a, "b": b, "body": &p[RESULT_HDR..] }));
+    let seq = crate::repl::record_with(ctx, "part", || serde_json::json!({ "job": job, "a": a, "b": b, "body": &p[RESULT_HDR..], "files": files.as_ref().map(|f| f.iter().map(|(n, s, z)| serde_json::json!({"name": n, "sha": s, "size": z})).collect::<Vec<_>>()) }));
     let mut sends: Sends = vec![];
     if seq <= crate::repl::durable_seq(ctx) {
         sends.extend(ack_now(&st));
@@ -1443,8 +1498,62 @@ fn read_results(r: &mut impl Read, mac: &mut Option<FrameMac>, ctx: &Ctx, wid: u
 }
 
 /// CTRL from an agent: {"standby_started": true} | {"standby_failed": why} (HA-10), {"presence": "busy"|"idle"} (SCH-10), {"calib_mhs": F} (FLT-06) or {"energy_j": F} (OBS-03).
+/// Output files an agent reported for chunks whose RESULT has not arrived yet (JOB-08).
+/// ponytail: bounded at 10,000 chunks (cleared when over); a lost RESULT leaves its entry until then.
+static FILES: Mutex<BTreeMap<(u64, u64, u64), Vec<(String, String, u64)>>> = Mutex::new(BTreeMap::new());
+
+fn note_files(f: &serde_json::Value) {
+    let (Some(j), Some(a), Some(b)) = (f["job"].as_u64(), f["a"].as_u64(), f["b"].as_u64()) else { return };
+    let v: Vec<(String, String, u64)> = f["files"].as_array().into_iter().flatten().filter_map(|x| {
+        let (n, s) = (x["name"].as_str()?, x["sha"].as_str()?);
+        (crate::blobs::valid_sha(s) && !n.is_empty() && n.len() <= 200 && !n.starts_with('.') && !n.contains(['/', '\\'])).then(|| (n.to_string(), s.to_string(), x["size"].as_u64().unwrap_or(0)))
+    }).take(1000).collect();
+    let mut g = FILES.lock().unwrap();
+    if g.len() >= 10_000 {
+        g.clear();
+    }
+    g.insert((j, a, b), v);
+}
+
+/// FLT-07: node id -> epoch ms until which the PC shows "identify".
+static IDENT: Mutex<BTreeMap<String, i64>> = Mutex::new(BTreeMap::new());
+
+/// Send identify to the connected PCs among `ids`; (identified, offline).
+pub fn identify(ctx: &Ctx, ids: &[String], secs: u64) -> (Vec<String>, Vec<String>) {
+    let (mut on, mut off, mut outs) = (vec![], vec![], vec![]);
+    {
+        let st = ctx.sh.0.lock().unwrap();
+        for id in ids {
+            match st.workers.values().find(|w| w.out.is_some() && w.hello.as_ref().is_some_and(|h| &h.node_id == id)) {
+                Some(w) => {
+                    outs.push(w.out.clone().unwrap());
+                    on.push(id.clone());
+                }
+                None => off.push(id.clone()),
+            }
+        }
+    }
+    for o in &outs {
+        ctrl_to(o, serde_json::json!({"identify": secs}));
+    }
+    let until = now_ms() + secs as i64 * 1000;
+    let mut g = IDENT.lock().unwrap();
+    g.retain(|_, u| *u > now_ms());
+    on.iter().for_each(|id| { g.insert(id.clone(), until); });
+    (on, off)
+}
+
+/// Epoch ms the PC's identify ends, None when it is not identifying.
+pub fn identify_until(node_id: &str) -> Option<i64> {
+    IDENT.lock().unwrap().get(node_id).copied().filter(|u| *u > now_ms())
+}
+
 fn ctrl_in(ctx: &Ctx, wid: u64, p: &[u8]) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(p) else { return };
+    if let Some(f) = v.get("files") {
+        note_files(f);
+        return;
+    }
     let mut st = ctx.sh.0.lock().unwrap();
     if crate::blobs::is_ctrl(&v) {
         crate::blobs::on_ctrl(ctx, &mut st, wid, &v);
@@ -1751,6 +1860,7 @@ pub fn run(o: &Opts) {
     let store = crate::store::Store::open(&crate::store::default_path()).unwrap_or_else(|e| die(&format!("database: {e}")));
     let ctx = Arc::new(Ctx { sh: sh.clone(), store: Arc::new(store), bus: Default::default(), repl: Default::default() });
     crate::tune::load(ctx.store.meta("tune").as_deref());
+    load_quotas(&ctx, &mut ctx.sh.0.lock().unwrap());
     init_ha(&ctx);
     resume(&ctx);
     if !o.no_local && !fleet_open() {
@@ -2562,6 +2672,42 @@ mod tests {
         }
         assert_eq!(holders, BTreeSet::from([6, 7, 8]), "the three highest calib");
         assert_eq!(st.jobs[&j.id].max_pcs, 3);
+    }
+
+    #[test]
+    fn user_quota_caps_pcs_and_running_jobs() {
+        let c = ctx();
+        let mk = |n: u64| { let mut sp = spec(n); sp.chunk = 1000; sp.policy = "fixed".into(); sp.submitter = "ann".into(); sp };
+        let (j1, j2, j3) = (submit(&c, mk(100_000)).unwrap(), submit(&c, mk(100_000)).unwrap(), submit(&c, mk(100_000)).unwrap());
+        let mut st = c.sh.0.lock().unwrap();
+        for i in 1..=8u64 {
+            st.workers.insert(i, Worker { addr: format!("w{i}"), state: "active".into(), presence: "idle".into(), threads: 4, ..Default::default() });
+        }
+        st.quotas.insert("ann".into(), (2, 2));
+        let mut holders = BTreeSet::new();
+        let mut jobs = BTreeSet::new();
+        for _ in 0..3 {
+            for i in 1..=8u64 {
+                if let Some((jj, a, b, ..)) = take(&mut st, i) {
+                    st.workers.get_mut(&i).unwrap().inflight.push((jj, a, b));
+                    holders.insert(i);
+                    jobs.insert(jj);
+                }
+            }
+        }
+        assert_eq!(holders.len(), 2, "max_pcs 2 holds on 8 PCs: {holders:?}");
+        assert_eq!(jobs, BTreeSet::from([j1.id, j2.id]), "the third job waits (max_running 2)");
+        drop(st);
+        assert_eq!(wait_reason(&c, j3.id), Some("quota"));
+        assert_eq!(wait_reason(&c, j1.id), None, "it holds PCs");
+        c.sh.0.lock().unwrap().quotas.clear();
+        assert_eq!(wait_reason(&c, j3.id), None);
+        assert!(note_files_roundtrip());
+    }
+
+    fn note_files_roundtrip() -> bool {
+        note_files(&serde_json::json!({"job": 9, "a": 0, "b": 5, "files": [{"name": "a.txt", "sha": "ab".repeat(32), "size": 3}, {"name": "../x", "sha": "ab".repeat(32), "size": 1}, {"name": "ok", "sha": "zz", "size": 1}]}));
+        FILES.lock().unwrap().remove(&(9, 0, 5)).is_some_and(|v| v.len() == 1 && v[0].0 == "a.txt")
     }
 
     #[test]

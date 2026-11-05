@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { Moon, Sunrise, TriangleAlert } from '@lucide/svelte';
 	import type { LabRow } from '#lib/api/schema.ts';
+	import { identifying } from '#lib/format.ts';
 	import { live } from '#lib/live.svelte.ts';
 	import { clock } from '#lib/topology.ts';
 	import { CELL, look, tileLabel, type Item, type Overlay } from '#lib/map.ts';
@@ -24,7 +25,7 @@
 
 	// waking tiles show how long ago the packet went out; one clock tick per second only while some PC is waking
 	let now = $state(Date.now());
-	const anyWaking = $derived(items.some((i) => i.node.power === 'waking'));
+	const anyWaking = $derived(items.some((i) => i.node.power === 'waking' || identifying(i.node, now)));
 	$effect(() => {
 		if (!anyWaking) return;
 		const t = setInterval(() => (now = Date.now()), 1000);
@@ -76,6 +77,7 @@
 			<rect x="2" y="2" width={CELL - 4} height={CELL - 4} rx="6" class="{l.fill} {l.stroke}" stroke-width="1.5" stroke-dasharray={l.dash ? '4 2' : undefined} />
 			<text x={l.power ? 4 : CELL / 2} y="14" text-anchor={l.power ? 'start' : 'middle'} font-size={l.power ? 8.5 : 9} class="fill-muted-foreground pointer-events-none">{tileLabel(it.node)}</text>
 			<text x={CELL / 2} y="31" text-anchor="middle" font-size="15" font-weight="600" class="{l.text} pointer-events-none">{l.glyph}</text>
+				{#if identifying(it.node, now)}<rect x="1" y="1" width={CELL - 2} height={CELL - 2} rx="7" fill="none" class="ck-pulse stroke-primary pointer-events-none" stroke-width="4" />{/if}
 				{#if l.power === 'waking'}<rect x="2" y="2" width={CELL - 4} height={CELL - 4} rx="6" fill="none" class="ck-pulse stroke-warn pointer-events-none" stroke-width="1.5" />{/if}
 			{#if l.power === 'asleep'}<Moon x={CELL - 14} y="3" width="11" height="11" class="stroke-muted-foreground pointer-events-none" />
 			{:else if l.power === 'waking'}<Sunrise x={CELL - 14} y="3" width="11" height="11" class="stroke-warn pointer-events-none" />

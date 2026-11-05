@@ -8,11 +8,11 @@ const RANK: Record<Role, number> = { viewer: 0, researcher: 1, operator: 2, admi
 const PORT = Number(process.env.MOCK_PORT ?? 7942);
 const MODE = process.env.MOCK_AUTH ?? 'open';
 
-const users = new Map<string, { password: string; role: Role; created_ms: number }>();
+const users = new Map<string, { password: string; role: Role; created_ms: number; quota?: { max_pcs: number; max_running: number } }>();
 if (MODE === 'required') {
-	users.set('admin', { password: 'adminadminadmin', role: 'admin', created_ms: Date.now() - 864e5 });
+	users.set('admin', { password: 'adminadminadmin', role: 'admin', created_ms: Date.now() - 864e5, quota: { max_pcs: 0, max_running: 0 } });
 	users.set('vic', { password: 'viewerpass1234', role: 'viewer', created_ms: Date.now() - 3e8 });
-	users.set('ana', { password: 'researcherpass1', role: 'researcher', created_ms: Date.now() - 4e8 });
+	users.set('ana', { password: 'researcherpass1', role: 'researcher', created_ms: Date.now() - 4e8, quota: { max_pcs: 8, max_running: 2 } });
 	for (const [i, n] of ['ben', 'chitra', 'dev', 'esha', 'farid', 'gita', 'hari', 'indu', 'jai'].entries()) users.set(n, { password: 'researcherpass1', role: i % 4 === 0 ? 'operator' : i % 4 === 1 ? 'viewer' : 'researcher', created_ms: Date.now() - (5 + i) * 3e7 });
 }
 const sessions = new Map<string, string>(); // cookie -> user name
@@ -22,7 +22,7 @@ type Job = {
 	state: 'queued' | 'running' | 'done' | 'cancelled' | 'failed'; submitter: string;
 	created_ms: number; started_ms: number | null; finished_ms: number | null; error: string | null;
 	selector: string; priority: number; policy: string; reducer: string; eta_ms: number | null; items?: string[];
-	max_pcs?: number; placement?: string; mem_mb?: number;
+	max_pcs?: number; placement?: string; mem_mb?: number; wait_reason?: 'quota' | 'priority' | 'no_pcs' | null; files?: number;
 };
 const now = () => Date.now();
 const jobs: Job[] = [];
@@ -73,7 +73,7 @@ const workers = Array.from({ length: 30 }, (_, i) => {
 
 // ---- fleet: node registry, labs, join codes
 type NState = 'pending' | 'active' | 'cordoned' | 'draining' | 'maintenance' | 'retired';
-type Node = { node_id: string; host: string; addr: string; inventory: unknown; first_seen_ms: number; last_seen_ms: number; state: NState; state_reason: string; state_by: string; lab_id: number | null; x: number | null; y: number | null; online: boolean; calib_mhs: number | null; presence: 'busy' | 'idle'; labels: Record<string, string>; pools: string[]; class: string; power: 'awake' | 'asleep' | 'waking'; power_since_ms?: number };
+type Node = { node_id: string; host: string; addr: string; inventory: unknown; first_seen_ms: number; last_seen_ms: number; state: NState; state_reason: string; state_by: string; lab_id: number | null; x: number | null; y: number | null; online: boolean; calib_mhs: number | null; presence: 'busy' | 'idle'; labels: Record<string, string>; pools: string[]; class: string; power: 'awake' | 'asleep' | 'waking'; power_since_ms?: number; identify_until_ms?: number };
 const labs: { id: number; name: string; w: number; h: number; created_ms: number }[] = [
 	{ id: 1, name: 'Lab A', w: 6, h: 4, created_ms: ago(8e8) },
 	{ id: 2, name: 'Lab B', w: 5, h: 3, created_ms: ago(7e8) }
@@ -97,6 +97,28 @@ pools.set('gpu', { name: 'gpu', members: ['n001', 'n005', 'n009'], note: '' });
 const syncPools = () => { for (const n of nodes.values()) n.pools = [...pools.values()].filter((p) => p.members.includes(n.node_id)).map((p) => p.name); };
 syncPools();
 const caps: { id: number; selector: string; max_threads: number | null; note: string }[] = [{ id: 1, selector: 'lab="Lab B"', max_threads: 4, note: 'Students work here by day' }];
+// wave 15: output files on finished cmd jobs, and why queued jobs wait
+for (const j of jobs) {
+	if (j.state === 'done' && (j.kind === 'cmd' || j.id === 1)) j.files = 2 + (j.id % 3);
+	if (j.state === 'queued') j.wait_reason = j.id % 3 === 0 ? 'quota' : j.id % 3 === 1 ? 'priority' : 'no_pcs';
+}
+const fileList = (j: Job) => Array.from({ length: j.files ?? 0 }, (_, i) => ({ chunk: [j.from + i * j.chunk, j.from + (i + 1) * j.chunk], name: i % 2 ? `scores-${i}.csv` : `out-${i}.json`, sha: Bun.SHA256.hash(`${j.id}-${i}`, 'hex'), size: 2_048 * (i + 1) * 37 }));
+const templates: { name: string; spec: Record<string, unknown>; note: string; owner: string; created_ms: number }[] = [
+	{ name: 'nightly-sha', spec: { kind: 'sha', n: 200_000_000, sha: 'ab12cd34', priority: 'low', selector: 'pool=night' }, note: 'Nightly SHA batch on the night pool', owner: 'ana', created_ms: Date.now() - 6e8 },
+	{ name: 'grade-exams', spec: { kind: 'synth', n: 5_000_000, synth_ns: 800, priority: 'urgent' }, note: 'Exam grading, urgent', owner: 'ben', created_ms: Date.now() - 2e8 }
+];
+// ---- network (UI-07): shape of rust api.rs net_json
+let uplinkProbed = false;
+const netNodes = () => [...nodes.values()].filter((n) => n.online).map((n, i) => ({
+	node_id: n.node_id, host: n.host, lab: labs.find((l) => l.id === n.lab_id)?.name ?? 'Unplaced',
+	net_mbps: i % 11 === 7 ? null : (i % 5 === 0 ? 94 : 940) - (i % 7) * 4, rtt_ms: i % 11 === 7 ? null : 0.4 + (i % 6) * 0.35, probed_ms: i % 11 === 7 ? null : now() - (i % 9) * 60_000 - 5_000
+}));
+const netJson = () => {
+	const nn = netNodes(), by = new Map<string, number[]>();
+	for (const n of nn) if (n.net_mbps != null) (by.get(n.lab) ?? by.set(n.lab, []).get(n.lab)!).push(n.net_mbps);
+	const labsOut = [...by].map(([lab, v]) => { v.sort((a, b) => a - b); return { lab, pcs: v.length, mbps: v[v.length >> 1] }; });
+	return { head_uplink_mbps: uplinkProbed ? 940 : 1000, head_uplink_assumed: !uplinkProbed, head_bytes_sent: 18_400_000_000, nodes: nn, labs: labsOut };
+};
 const reserves: { id: number; selector: string; keep_n: number; keep_pct: number; note: string }[] = [{ id: 1, selector: 'lab="Lab A"', keep_n: 3, keep_pct: 0, note: 'Free for students' }];
 let capSeq = 1, resSeq = 1;
 // ---- time rules (mock clock = local time of this process)
@@ -168,7 +190,7 @@ function matchIds(q: string): string[] {
 const sendAll = (name: string, data: unknown) => { for (const s of subs) s(name, data); };
 const changed = (what: string) => sendAll('changed', { what });
 // contract: the node's `power` is {state, since_ms} on the wire
-const wire = (n: Node) => ({ ...n, power: { state: n.power, since_ms: n.power_since_ms ?? null }, power_since_ms: undefined });
+const wire = (n: Node) => ({ ...n, power: { state: n.power, since_ms: n.power_since_ms ?? null }, power_since_ms: undefined, identify_until_ms: (n.identify_until_ms ?? 0) > now() ? n.identify_until_ms : null });
 const setNode = (id: string, patch: Partial<Node>) => { const n = nodes.get(id)!; if (patch.power && patch.power !== n.power) patch = { ...patch, power_since_ms: now() }; Object.assign(n, patch); sendAll('node', wire(n)); };
 const takes = (id: string) => { const n = nodes.get(id)!; return n.online && (n.state === 'active' || n.state === 'draining'); };
 // states change over time: pc-05 drains then cordons, pc-30 (unplaced) drops off, pc-12 comes back from maintenance
@@ -595,7 +617,7 @@ async function handle(req: Request): Promise<Response> {
 	if (p === '/api/v1/tokens' && m === 'POST') return json({ token: `ckt_${crypto.randomUUID().replaceAll('-', '')}` });
 	if (p === '/api/v1/users') {
 		if ((d = need('admin'))) return d;
-		if (m === 'GET') return json({ users: [...users].map(([name, u]) => ({ name, role: u.role, created_ms: u.created_ms })) });
+		if (m === 'GET') return json({ users: [...users].map(([name, u]) => ({ name, role: u.role, created_ms: u.created_ms, quota: u.quota ?? { max_pcs: 0, max_running: 0 } })) });
 		if (m === 'POST') {
 			const b = await body();
 			if (!b.name || String(b.password ?? '').length < 12) return err(400, 'invalid_request', 'Name required and password at least 12 characters.');
@@ -650,6 +672,56 @@ async function handle(req: Request): Promise<Response> {
 			failover(0, b.to);
 			return json({ to: nodes.get(b.to)?.addr ?? b.to }, 202);
 		}
+	if (p === '/api/v1/templates') {
+		if (m === 'GET') return json({ templates });
+		if (m === 'POST') {
+			if ((d = need('researcher'))) return d;
+			const b = await body();
+			if (!/^[a-z0-9][a-z0-9_-]{0,39}$/i.test(String(b.name ?? '')) || !b.spec || typeof b.spec !== 'object') return err(400, 'invalid_request', 'Give a name (letters, digits, - and _) and a spec.');
+			const at = templates.findIndex((t) => t.name === b.name);
+			if (at >= 0 && templates[at].owner !== me.name && me.role !== 'admin') return err(403, 'forbidden', 'Only the owner or an admin can replace that template.');
+			const row = { name: b.name, spec: b.spec, note: String(b.note ?? ''), owner: at >= 0 ? templates[at].owner : me.name, created_ms: now() };
+			if (at >= 0) templates[at] = row; else templates.push(row);
+			return json({ template: row });
+		}
+	}
+	const tm = /^\/api\/v1\/templates\/([^/]+)$/.exec(p);
+	if (tm && m === 'DELETE') {
+		if ((d = need('researcher'))) return d;
+		const at = templates.findIndex((t) => t.name === decodeURIComponent(tm[1]));
+		if (at < 0) return err(404, 'not_found', 'No such template.');
+		if (templates[at].owner !== me.name && me.role !== 'admin') return err(403, 'forbidden', 'Only the owner or an admin can delete that template.');
+		templates.splice(at, 1);
+		return json({});
+	}
+	if (p === '/api/v1/nodes/identify' && m === 'POST') {
+		if ((d = need('operator'))) return d;
+		const b = await body();
+		const ids: string[] = Array.isArray(b.nodes) ? b.nodes : [];
+		if (!ids.length || ids.some((i) => !nodes.has(i)) || !(b.secs >= 1 && b.secs <= 600)) return err(400, 'invalid_request', 'nodes and secs 1 to 600 are required.');
+		for (const i of ids) setNode(i, { identify_until_ms: now() + b.secs * 1000 });
+		setTimeout(() => ids.forEach((i) => setNode(i, {})), b.secs * 1000 + 100);
+		return json({ nodes: ids.map((i) => wire(nodes.get(i)!)) });
+	}
+	const qm = /^\/api\/v1\/users\/([^/]+)\/quota$/.exec(p);
+	if (qm && m === 'PUT') {
+		if ((d = need('admin'))) return d;
+		const u = users.get(decodeURIComponent(qm[1]));
+		const b = await body();
+		if (!u) return err(404, 'not_found', 'No such user.');
+		if (!(Number.isInteger(b.max_pcs) && b.max_pcs >= 0) || !(Number.isInteger(b.max_running) && b.max_running >= 0)) return err(400, 'invalid_request', 'max_pcs and max_running are whole numbers, 0 or more.');
+		u.quota = { max_pcs: b.max_pcs, max_running: b.max_running };
+		logEvent('user.quota', me.name, `${decodeURIComponent(qm[1])}: ${b.max_pcs} PCs, ${b.max_running} running`);
+		return json({ user: { name: decodeURIComponent(qm[1]), role: u.role, quota: u.quota } });
+	}
+	if (/^\/api\/v1\/blobs\/[0-9a-f]{64}$/.test(p) && m === 'GET') return new Response('col_a,col_b\n1,2\n3,4\n', { headers: { 'content-type': 'application/octet-stream' } });
+	if (p === '/api/v1/net' && m === 'GET') return json(netJson());
+	if (p === '/api/v1/net/probe' && m === 'POST') {
+		if ((d = need('operator'))) return d;
+		const b = await body();
+		if (b.burst) setTimeout(() => (uplinkProbed = true), 1500);
+		return json({ queued: [...nodes.values()].filter((n) => n.online).length });
+	}
 	if (p === '/api/v1/nodes' && m === 'GET') return json({ nodes: [...nodes.values()].map(wire) });
 	const nm = /^\/api\/v1\/nodes\/([^/]+)(\/place)?$/.exec(p);
 	if (nm && m === 'GET' && !nm[2]) {
@@ -893,7 +965,13 @@ async function handle(req: Request): Promise<Response> {
 	}
 	if (p === '/api/v1/jobs' && m === 'POST') {
 		if ((d = need('researcher'))) return d;
-		const b = await body();
+		let b = await body();
+		if (b.template) {
+			const t = templates.find((x) => x.name === b.template);
+			if (!t) return err(404, 'not_found', `No template ${b.template}.`);
+			const { template: _t, ...over } = b;
+			b = { ...t.spec, ...over };
+		}
 		if (!['sha', 'cmd', 'synth', 'list'].includes(b.kind) || !(b.n > 0)) return err(400, 'invalid_request', 'kind and a positive n are required.');
 		if ((b.kind === 'cmd' || b.kind === 'list') && (d = need('operator'))) return d;
 		if (b.kind === 'list' && !(Array.isArray(b.items) && b.items.length)) return err(400, 'invalid_request', 'A list job needs items.');
@@ -908,11 +986,12 @@ async function handle(req: Request): Promise<Response> {
 		for (const s of subs) s('job', j);
 		return json({ job: j });
 	}
-	const jm = /^\/api\/v1\/jobs\/(\d+)(\/result|\/cancel)?$/.exec(p);
+	const jm = /^\/api\/v1\/jobs\/(\d+)(\/result|\/cancel|\/files)?$/.exec(p);
 	if (jm) {
 		const j = jobs.find((x) => x.id === Number(jm[1]));
 		if (!j) return err(404, 'not_found', `Job ${jm[1]} does not exist.`);
 		if (!jm[2]) return json({ job: j, parts: Math.floor(j.done / (j.chunk || 1_000_000)) });
+		if (jm[2] === '/files') return json({ files: fileList(j) });
 		if (jm[2] === '/result') return new Response(resultText(j, url.searchParams.get('reducer') ?? undefined), { headers: { 'content-type': 'text/plain' } });
 		if (m === 'POST') {
 			if ((d = need('researcher'))) return d;
@@ -969,7 +1048,7 @@ async function handle(req: Request): Promise<Response> {
 }
 
 // SSE `changed` after each successful write of a list (contract)
-const WRITES: [RegExp, string[]][] = [[/\/reserves/, ['reserves', 'candidates']], [/\/caps/, ['caps']], [/\/windows/, ['windows', 'timetable']], [/\/reservations/, ['bookings']], [/\/pools/, ['pools']], [/\/labels$/, ['labels']], [/\/ha\/settings/, ['candidates']]];
+const WRITES: [RegExp, string[]][] = [[/\/reserves/, ['reserves', 'candidates']], [/\/caps/, ['caps']], [/\/windows/, ['windows', 'timetable']], [/\/reservations/, ['bookings']], [/\/pools/, ['pools']], [/\/templates/, ['templates']], [/\/labels$/, ['labels']], [/\/ha\/settings/, ['candidates']]];
 async function serve(req: Request) {
 	const res = await handle(req);
 	if (req.method !== 'GET' && res.status < 300) for (const [re, whats] of WRITES) if (re.test(new URL(req.url).pathname)) whats.forEach(changed);

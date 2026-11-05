@@ -98,7 +98,7 @@ pub fn run(o: &Opts) {
         Some("show") => {
             let v = call(o, "GET", &format!("/api/v1/jobs/{}", id_arg(o)));
             let j = &v["job"];
-            for k in ["id", "name", "kind", "state", "submitter", "from", "end", "chunk", "done", "total", "priority", "selector", "created_ms", "started_ms", "finished_ms", "error"] {
+            for k in ["id", "name", "kind", "state", "submitter", "from", "end", "chunk", "done", "total", "priority", "selector", "wait_reason", "files", "created_ms", "started_ms", "finished_ms", "error"] {
                 println!("{k:<12} {}", dash(&j[k]));
             }
             println!("{:<12} {}", "parts", dash(&v["parts"]));
@@ -136,8 +136,55 @@ pub fn run(o: &Opts) {
                 println!("stragglers: {}", st.iter().map(dash).collect::<Vec<_>>().join(" "));
             }
         }
+        Some("submit") => {
+            let t = std::env::var("CK_TEMPLATE").unwrap_or_else(|_| die("usage: ck job submit --template NAME"));
+            let v = send(o, "POST", "/api/v1/jobs", serde_json::json!({"template": t}));
+            println!("{}", row(&v["job"]));
+        }
+        Some("template") => match o.rest.get(1).map(String::as_str) {
+            Some("ls") => {
+                for t in call(o, "GET", "/api/v1/templates")["templates"].as_array().cloned().unwrap_or_default() {
+                    println!("{:<24} {:<12} {:<6} {}", dash(&t["name"]), dash(&t["owner"]), dash(&t["spec"]["kind"]), dash(&t["note"]));
+                }
+            }
+            Some("save") => {
+                let (name, file) = (o.rest.get(2), o.rest.get(3));
+                let (Some(name), Some(file)) = (name, file) else { die("usage: ck job template save NAME FILE.json") };
+                let spec: Value = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}")).and_then(|t| serde_json::from_str(&t).map_err(|e| format!("{file}: {e}"))).unwrap_or_else(|e| die(&e));
+                let note = std::env::var("CK_NOTE").unwrap_or_default();
+                send(o, "POST", "/api/v1/templates", serde_json::json!({"name": name, "spec": spec, "note": note}));
+                println!("saved template {name}");
+            }
+            Some("rm") => {
+                let name = o.rest.get(2).unwrap_or_else(|| die("usage: ck job template rm NAME"));
+                call(o, "DELETE", &format!("/api/v1/templates/{}", enc(name)));
+                println!("removed template {name}");
+            }
+            _ => die("usage: ck job template ls | save NAME FILE.json | rm NAME   (note: CK_NOTE)"),
+        },
+        Some("files") => {
+            let id = id_arg(o);
+            let v = call(o, "GET", &format!("/api/v1/jobs/{id}/files"));
+            let dir = std::env::var("CK_GET_DIR").ok();
+            for f in v["files"].as_array().cloned().unwrap_or_default() {
+                let (name, sha, c) = (f["name"].as_str().unwrap_or(""), f["sha"].as_str().unwrap_or(""), &f["chunk"]);
+                println!("{:>10}-{:<10} {:>12}  {}  {}", dash(&c[0]), dash(&c[1]), dash(&f["size"]), &sha[..sha.len().min(12)], name);
+                if let Some(d) = &dir {
+                    if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+                        die(&format!("refusing unsafe file name {name:?}"));
+                    }
+                    let to = std::path::Path::new(d).join(format!("{}-{}", dash(&c[0]), dash(&c[1])));
+                    std::fs::create_dir_all(&to).unwrap_or_else(|e| die(&format!("{}: {e}", to.display())));
+                    let r = request(o, "GET", &format!("/api/v1/blobs/{}", enc(sha)), None, &[]).unwrap_or_else(|e| die(&e));
+                    if r.status >= 400 {
+                        die(&ok_json(r).unwrap_err());
+                    }
+                    std::fs::write(to.join(name), &r.body).unwrap_or_else(|e| die(&e.to_string()));
+                }
+            }
+        }
         Some("token") => token(o),
-        _ => die("usage: ck job ls | show ID | cancel ID | result ID | breakdown ID | token --name USER   (head: --head IP; auth: CK_TOKEN)"),
+        _ => die("usage: ck job ls | show ID | cancel ID | result ID | breakdown ID | files ID [--get DIR] | submit --template NAME | template ls|save NAME FILE|rm NAME | token --name USER   (head: --head IP; auth: CK_TOKEN)"),
     }
 }
 
@@ -184,6 +231,9 @@ pub const CLI_MAP: &[(&str, &str, &str)] = &[
     ("GET", "/reservations", "ck admin reservations"), ("POST", "/reservations", "ck admin reservation"), ("DELETE", "/reservations/{id}", "ck admin reservation-rm"),
     ("GET", "/estimate", "ck admin estimate"),
     ("PUT", "/blobs", "ck blob put FILE"), ("GET", "/blobs", "ck blob ls"), ("GET", "/blobs/{sha}", "ck blob get SHA > file"), ("GET", "/net", "ck admin net"), ("POST", "/net/probe", "ck admin net probe"),
+    ("GET", "/templates", "ck job template ls"), ("POST", "/templates", "ck job template save NAME FILE.json"), ("DELETE", "/templates/{name}", "ck job template rm NAME"),
+    ("GET", "/jobs/{id}/files", "ck job files ID [--get DIR]"), ("POST", "/nodes/identify", "ck admin identify NODE... [SECS]"),
+    ("PUT", "/users/{name}/quota", "ck admin quota USER MAX_PCS MAX_RUNNING"), ("POST", "/sim", "ck sim (the same scenario, run locally)"),
     ("GET", "/config", "ck admin config-export"), ("POST", "/config", "ck admin config-import"),
 ];
 
@@ -231,7 +281,7 @@ fn fmt_local(ms: i64, offset_min: i64) -> String {
 }
 
 fn usage_admin() -> ! {
-    die("usage: ck admin backup [PATH] | nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | net [probe] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | heads | tune [KEY VALUE|default] | alerts [ack ID] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
+    die("usage: ck admin backup [PATH] | nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | net [probe] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | identify NODE... [SECS] | quota USER MAX_PCS MAX_RUNNING | heads | tune [KEY VALUE|default] | alerts [ack ID] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
 }
 
 fn send(o: &Opts, method: &str, path: &str, body: Value) -> Value {
@@ -428,6 +478,17 @@ pub fn admin(o: &Opts) {
             let node = rest.get(1).unwrap_or_else(|| usage_admin());
             let v = send(o, "POST", "/api/v1/ha/switchover", serde_json::json!({"to": node}));
             println!("handing over to {} at {}", node, dash(&v["to"]));
+        }
+        Some("identify") => {
+            let secs = rest.last().and_then(|s| s.parse::<u64>().ok());
+            let ids = &rest[1..rest.len() - secs.is_some() as usize];
+            if ids.is_empty() { usage_admin() }
+            let v = send(o, "POST", "/api/v1/nodes/identify", serde_json::json!({"nodes": ids, "secs": secs.unwrap_or(30)}));
+            println!("identifying {} PC(s) for {} s", dash(&v["identified"]), secs.unwrap_or(30));
+        }
+        Some("quota") => {
+            let v = send(o, "PUT", &format!("/api/v1/users/{}/quota", enc(arg(o, 1))), serde_json::json!({"max_pcs": num(o, 2), "max_running": num(o, 3)}));
+            println!("{}  max_pcs {}  max_running {}", dash(&v["user"]["name"]), dash(&v["user"]["quota"]["max_pcs"]), dash(&v["user"]["quota"]["max_running"]));
         }
         Some(a @ ("sleep" | "wake")) => {
             if rest.len() < 2 { usage_admin() }

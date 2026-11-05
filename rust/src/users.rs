@@ -218,7 +218,10 @@ pub fn min_role(method: &str, path: &str) -> Option<Role> {
     Some(match (method, p) {
         (_, "/api/v1/me" | "/api/v1/bootstrap" | "/api/v1/login" | "/api/v1/logout") => return None,
         (_, "/api/v1/users" | "/api/v1/config") => Role::Admin,
-        ("POST", "/api/v1/jobs" | "/api/v1/experiments") => Role::Researcher,
+        ("POST", "/api/v1/jobs" | "/api/v1/experiments" | "/api/v1/templates" | "/api/v1/sim") => Role::Researcher,
+        ("DELETE", _) if p.starts_with("/api/v1/templates/") => Role::Researcher,
+        ("PUT", _) if p.starts_with("/api/v1/users/") && p.ends_with("/quota") => Role::Admin,
+        ("POST", "/api/v1/nodes/identify") => Role::Operator,
         ("PUT", "/api/v1/blobs") => Role::Researcher,
         ("GET" | "HEAD", _) if p.starts_with("/api/v1/blobs/") => Role::Researcher,
         ("POST", "/api/v1/net/probe") => Role::Operator,
@@ -242,7 +245,8 @@ pub fn min_role(method: &str, path: &str) -> Option<Role> {
 /// Every API route (method, pattern). api::tests checks each has a CLI command in jobcli::CLI_MAP (API-02).
 pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/me"), ("GET", "/ha"), ("POST", "/ha/switchover"), ("POST", "/bootstrap"), ("POST", "/login"), ("POST", "/logout"), ("POST", "/tokens"),
-    ("GET", "/users"), ("POST", "/users"), ("GET", "/cluster"),
+    ("GET", "/users"), ("POST", "/users"), ("PUT", "/users/{name}/quota"), ("GET", "/cluster"),
+    ("GET", "/templates"), ("POST", "/templates"), ("DELETE", "/templates/{name}"), ("GET", "/jobs/{id}/files"), ("POST", "/nodes/identify"), ("POST", "/sim"),
     ("GET", "/nodes"), ("GET", "/nodes/{id}"), ("POST", "/nodes/state"), ("PUT", "/nodes/{id}/place"),
     ("GET", "/labs"), ("POST", "/labs"), ("PATCH", "/labs/{id}"), ("DELETE", "/labs/{id}"), ("POST", "/join-codes"),
     ("GET", "/jobs"), ("POST", "/jobs"), ("GET", "/jobs/{id}"), ("GET", "/jobs/{id}/result"), ("POST", "/jobs/{id}/cancel"),

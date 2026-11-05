@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth::{self, FrameMac};
 use crate::head::{recv_any, Out};
-use crate::kernels::{run_task, CANCELLED, CANCELLED_RANGE};
+use crate::kernels::{run_task_out, CANCELLED, CANCELLED_RANGE};
 use crate::proto::*;
 use crate::{die, Opts};
 
@@ -174,13 +174,14 @@ struct Unacked {
     next: u64,
     by_seq: BTreeMap<u64, ((u64, u64, u64), Vec<u8>)>,
     idx: HashMap<(u64, u64, u64), u64>,
+    files: HashMap<(u64, u64, u64), Vec<u8>>, // CTRL {"files"} that goes before a resent RESULT (JOB-08)
     bytes: usize,
     max: (usize, usize), // (0, 0) = read the tunables on every add
 }
 
 impl Unacked {
     fn new(max_n: usize, max_bytes: usize) -> Self {
-        Unacked { next: 0, by_seq: BTreeMap::new(), idx: HashMap::new(), bytes: 0, max: (max_n, max_bytes) }
+        Unacked { next: 0, by_seq: BTreeMap::new(), idx: HashMap::new(), files: HashMap::new(), bytes: 0, max: (max_n, max_bytes) }
     }
     fn limits(&self) -> (usize, usize) {
         if self.max == (0, 0) { (crate::tune::n("unacked_max") as usize, (crate::tune::get("unacked_max_mb") * 1048576.0) as usize) } else { self.max }
@@ -195,11 +196,13 @@ impl Unacked {
         while self.by_seq.len() > max_n || self.bytes > max_bytes {
             let Some((_, (k, p))) = self.by_seq.pop_first() else { break };
             self.idx.remove(&k);
+            self.files.remove(&k);
             self.bytes -= p.len();
             crate::say!("agent.unacked_drop", "unacked results over the limit: dropped the oldest ({}, {}..{})", k.0, k.1, k.2);
         }
     }
     fn ack(&mut self, key: (u64, u64, u64)) -> bool {
+        self.files.remove(&key);
         let Some(s) = self.idx.remove(&key) else { return false };
         if let Some((_, p)) = self.by_seq.remove(&s) {
             self.bytes -= p.len();
@@ -207,8 +210,8 @@ impl Unacked {
         true
     }
     /// Payloads to resend after a reconnect, oldest first.
-    fn payloads(&self) -> impl Iterator<Item = &Vec<u8>> {
-        self.by_seq.values().map(|(_, p)| p)
+    fn payloads(&self) -> impl Iterator<Item = (Option<&Vec<u8>>, &Vec<u8>)> {
+        self.by_seq.values().map(|(k, p)| (self.files.get(k), p))
     }
 }
 
@@ -511,6 +514,33 @@ fn log_drained() {
     }
 }
 
+/// FLT-07: "this is the PC": log it, ring the terminal bell, and on Linux write a banner to /dev/tty1 when that is writable.
+/// macOS: no `say`, nothing audible beyond the bell.
+fn identify(secs: u64) {
+    crate::say!("agent.identify", "identify requested for {secs} s: this is PC {}", crate::identity::host());
+    eprint!("\x07");
+    #[cfg(target_os = "linux")]
+    if let Ok(mut t) = std::fs::OpenOptions::new().write(true).open("/dev/tty1") {
+        use std::io::Write;
+        let _ = write!(t, "\x07\r\n*** cluster-kit: this PC is {} (identify, {secs} s) ***\r\n", crate::identity::host());
+    }
+}
+
+/// Upload the chunk's CK_OUT files; the CTRL frame that reports them to the head (None = no files).
+fn upload_outputs(job: u64, a: u64, b: u64, d: &crate::kernels::OutDir) -> Result<Option<Vec<u8>>, (bool, String)> {
+    let files = d.files(crate::tune::n("out_files_mb")).map_err(|e| (false, e))?;
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let mut v = vec![];
+    for (name, path, _) in files {
+        let (sha, size) = crate::blobs::upload_file(job, &path).map_err(|e| (true, format!("{name}: {e}")))?;
+        v.push(serde_json::json!({"name": name, "sha": sha, "size": size}));
+    }
+    crate::lgc!("chunk.files", {"job": job, "a": a, "b": b, "files": v.len()});
+    Ok(Some(serde_json::json!({"files": {"job": job, "a": a, "b": b, "files": v}}).to_string().into_bytes()))
+}
+
 fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<Unacked>>, follow: Option<(String, String, u64)>) -> io::Result<()> {
     // HA-01: a head silent for LOST_AFTER (frozen, cable pulled) errors the reader out.
     // ponytail: with --spin the socket is non-blocking and there is no timeout.
@@ -544,7 +574,10 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
         if !u.by_seq.is_empty() {
             crate::say!("agent.resend", "resending {} un-ACKed results", u.by_seq.len());
         }
-        for p in u.payloads() {
+        for (f, p) in u.payloads() {
+            if let Some(f) = f {
+                send_w(CTRL, f)?;
+            }
             send_w(RESULT, p)?;
         }
     }
@@ -617,6 +650,9 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                 }
                 power_ctrl(&p, &w_r);
                 crate::kernels::note_job_ctrl(&p);
+                if let Some(secs) = serde_json::from_slice::<serde_json::Value>(&p).ok().and_then(|v| v.get("identify").and_then(|x| x.as_u64())) {
+                    identify(secs);
+                }
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&p) {
                     crate::blobs::agent_ctrl(&v, &w_r); // virtual agents too (shared cache; fetch() serialises per sha)
                 }
@@ -658,8 +694,10 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
             crate::lgc!("chunk.start", {"job": job, "a": a, "b": b});
             *cur.lock().unwrap() = Some((job, a, b));
             *RUNNING.lock().unwrap().entry((job, a)).or_default() += 1;
+            let outdir = if matches!(kind, KIND_CMD | KIND_LIST) { crate::kernels::OutDir::new() } else { None };
+            let od = outdir.as_ref().map(|d| d.0.as_path());
             let out = match pool_size(cap.load(Relaxed), threads) {
-                None => run_task(kind, job, a, b, arg),
+                None => run_task_out(kind, job, a, b, arg, od),
                 Some(n) => {
                     if !pools.contains_key(&n) {
                         match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
@@ -669,7 +707,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                             Err(e) => return Err(io::Error::other(format!("thread pool: {e}"))),
                         }
                     }
-                    pools[&n].install(|| run_task(kind, job, a, b, arg))
+                    pools[&n].install(|| run_task_out(kind, job, a, b, arg, od))
                 }
             };
             *cur.lock().unwrap() = None;
@@ -686,6 +724,15 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                 send_w(REQ, &[])?;
                 continue;
             }
+            // JOB-08: files the program left in CK_OUT go to the head's blob store before the result is reported
+            let (out, files_ctrl) = match (out, &outdir) {
+                (Ok(body), Some(d)) => match upload_outputs(job, a, b, d) {
+                    Ok(c) => (Ok(body), c),
+                    Err(e) => (Err(e), None),
+                },
+                (o, _) => (o, None),
+            };
+            drop(outdir);
             let body = match out {
                 Ok(body) => body,
                 Err((retry, msg)) => {
@@ -702,9 +749,15 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
             let us = t.elapsed().as_micros() as u64;
             let mut res = pack(&[job, a, b, CPU_X10.load(Relaxed), MEM_USED.load(Relaxed), MEM_TOTAL.load(Relaxed), us]);
             res.extend_from_slice(&body);
+            if let Some(c) = &files_ctrl {
+                send_w(CTRL, c)?; // before the RESULT on the same connection
+            }
             let pending = {
                 let mut u = unacked.lock().unwrap();
                 u.add((job, a, b), res.clone());
+                if let Some(c) = files_ctrl {
+                    u.files.insert((job, a, b), c);
+                }
                 (u.by_seq.len(), u.bytes)
             };
             crate::lgc!("chunk.end", {"job": job, "a": a, "b": b, "ms": us as f64 / 1000.0, "unacked": pending.0, "unacked_bytes": pending.1});
@@ -800,11 +853,11 @@ mod tests {
             u.add((1, i, i + 1), vec![i as u8; 10]);
         }
         assert_eq!(u.by_seq.len(), 3, "oldest two dropped");
-        assert_eq!(u.payloads().map(|p| p[0]).collect::<Vec<_>>(), vec![2, 3, 4], "resend oldest first");
+        assert_eq!(u.payloads().map(|(_, p)| p[0]).collect::<Vec<_>>(), vec![2, 3, 4], "resend oldest first");
         assert!(u.ack((1, 3, 4)) && !u.ack((1, 3, 4)) && !u.ack((1, 0, 1)));
         assert_eq!((u.by_seq.len(), u.bytes), (2, 20));
         u.add((1, 2, 3), vec![9; 10]); // same range again replaces, moves to the back
-        assert_eq!(u.payloads().map(|p| p[0]).collect::<Vec<_>>(), vec![4, 9]);
+        assert_eq!(u.payloads().map(|(_, p)| p[0]).collect::<Vec<_>>(), vec![4, 9]);
         let mut big = Unacked::new(100, 25);
         for i in 0..4u64 {
             big.add((1, i, i + 1), vec![0; 10]);

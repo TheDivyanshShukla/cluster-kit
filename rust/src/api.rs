@@ -252,6 +252,12 @@ fn job_json(ctx: &Ctx, j: &JobRow) -> Value {
     v["max_pcs"] = json!(max_pcs);
     v["placement"] = json!(placement);
     v["mem_mb"] = json!(mem_mb);
+    v["files"] = json!(ctx.store.job_file_count(j.id));
+    let wait = if j.state.finished() { None } else { head::wait_reason(ctx, j.id) };
+    v["wait_reason"] = json!(wait);
+    if wait == Some("quota") {
+        v["state"] = json!("queued"); // the row says running; to the owner it waits for its quota
+    }
     if let Some(sp) = ctx.store.spec(j.id).filter(|sp| !sp.blobs.is_empty()) {
         v["blobs"] = json!(sp.blobs);
         v["blob_mode"] = json!(sp.blob_mode);
@@ -299,6 +305,7 @@ fn changed_what(path: &str) -> &'static [&'static str] {
         ["reservations", ..] => &["bookings", "timetable"],
         ["windows", ..] => &["windows", "timetable"],
         ["pools", ..] => &["pools"],
+        ["templates", ..] => &["templates"],
         ["caps", ..] => &["caps"],
         ["nodes", _, "labels"] => &["labels"],
         ["ha", "settings"] => &["candidates"],
@@ -381,8 +388,17 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
                 Err(e) => fail(503, "unavailable", &e),
             }
         }
-        ("GET", ["users"]) => json_out(200, json!({"users": ctx.store.users()})),
+        ("GET", ["users"]) => json_out(200, json!({"users": ctx.store.users().iter().map(|u| user_json(ctx, u)).collect::<Vec<_>>()})),
         ("POST", ["users"]) => create_user(ctx, r, me),
+        ("PUT", ["users", name, "quota"]) => put_quota(ctx, r, name, me),
+        ("GET", ["templates"]) => json_out(200, json!({"templates": ctx.store.templates().into_iter().map(template_json).collect::<Vec<_>>()})),
+        ("POST", ["templates"]) => post_template(ctx, r, who.as_ref().unwrap()),
+        ("DELETE", ["templates", name]) => delete_template(ctx, name, who.as_ref().unwrap()),
+        ("GET", ["jobs", id, "files"]) => match id.parse::<u64>().ok().filter(|i| ctx.store.job(*i).is_some()) {
+            Some(id) => json_out(200, json!({"files": ctx.store.job_files(id).into_iter().map(|(a, b, name, sha, size)| json!({"chunk": [a, b], "name": name, "sha": sha, "size": size})).collect::<Vec<_>>()})),
+            None => fail(404, "not_found", "no such job"),
+        },
+        ("POST", ["nodes", "identify"]) => post_identify(ctx, r, me),
         ("GET", ["cluster"]) => Out::Plain { status: 200, ctype: "application/json", headers: vec![], body: cluster_cached(ctx).as_bytes().to_vec() },
         ("GET", ["nodes"]) => {
             let (on, org) = (online_ids(ctx), Org::load(ctx));
@@ -489,10 +505,19 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
         }
         ("POST", ["jobs"]) => {
             let who = who.unwrap();
-            let v = match parse_body(r) {
+            let mut v = match parse_body(r) {
                 Ok(v) => v,
                 Err(o) => return o,
             };
+            if let Some(t) = v.get("template") {
+                // JOB-12: the stored spec, with the body's other keys laid over it
+                let Some(t) = t.as_str().and_then(|n| ctx.store.template(n)) else { return fail(404, "not_found", "no such template") };
+                let mut spec: Value = serde_json::from_str(&t.1).unwrap_or(json!({}));
+                for (k, x) in v.as_object().into_iter().flatten().filter(|(k, _)| *k != "template") {
+                    spec[k] = x.clone();
+                }
+                v = spec;
+            }
             match job_spec(&v, &who) {
                 Err(m) if m.starts_with("forbidden: ") => fail(403, "forbidden", &m[11..]),
                 Err(m) => bad(&m),
@@ -646,6 +671,7 @@ fn node_json(ctx: &Ctx, n: &NodeRow, online: bool, org: &Org) -> Value {
     v["class"] = json!(select::class_of(&n.inventory));
     v["power"] = json!(crate::head::power_state(ctx, &n.node_id));
     v["power_since_ms"] = json!(crate::head::power_since(ctx, &n.node_id));
+    v["identify_until_ms"] = json!(crate::head::identify_until(&n.node_id));
     v
 }
 
@@ -1559,10 +1585,100 @@ fn create_user(ctx: &Ctx, r: &Req, actor: &str) -> Out {
     match ctx.store.create_user(name, &users::hash_password(pw, users::ITERS), role.name(), now_ms()) {
         Ok(u) => {
             audit(ctx, "user.created", actor, &format!("{} ({})", u.name, u.role));
-            json_out(200, json!({"user": u}))
+            json_out(200, json!({"user": user_json(ctx, &u)}))
         }
         Err(e) => fail(409, "conflict", &e),
     }
+}
+
+fn user_json(ctx: &Ctx, u: &crate::jobs::UserRow) -> Value {
+    let q = head::quota_of(ctx, &u.name);
+    let mut v = json!(u);
+    v["quota"] = json!({"max_pcs": q.0, "max_running": q.1});
+    v
+}
+
+/// PUT /api/v1/users/{name}/quota (admin): {"max_pcs", "max_running"}, 0 = no limit; a missing key keeps its value.
+fn put_quota(ctx: &Ctx, r: &Req, name: &str, actor: &str) -> Out {
+    let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
+    let Some(u) = ctx.store.users().into_iter().find(|u| u.name == name) else { return fail(404, "not_found", "no such user") };
+    let cur = head::quota_of(ctx, name);
+    let mut get = |k: &str, old: u32| match v.get(k) {
+        None => Ok(old),
+        Some(x) => uint(x).filter(|n| *n <= 1_000_000).map(|n| n as u32).ok_or(format!("{k} must be a whole number from 0 to 1000000")),
+    };
+    let (max_pcs, max_running) = match (get("max_pcs", cur.0), get("max_running", cur.1)) { (Ok(a), Ok(b)) => (a, b), (Err(e), _) | (_, Err(e)) => return bad(&e) };
+    let mut all: Value = ctx.store.meta("quotas").and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}));
+    if (max_pcs, max_running) == (0, 0) {
+        all.as_object_mut().map(|o| o.remove(name));
+    } else {
+        all[name] = json!({"max_pcs": max_pcs, "max_running": max_running});
+    }
+    if let Err(e) = ctx.store.set_meta("quotas", &all.to_string()) {
+        return fail(503, "unavailable", &e);
+    }
+    audit(ctx, "user.quota", actor, &format!("{name}: max_pcs {} -> {max_pcs}, max_running {} -> {max_running}", cur.0, cur.1));
+    head::quotas_changed(ctx);
+    json_out(200, json!({"user": user_json(ctx, &u)}))
+}
+
+fn template_json(t: (String, String, String, String, i64)) -> Value {
+    json!({"name": t.0, "spec": serde_json::from_str::<Value>(&t.1).unwrap_or(Value::Null), "note": t.2, "owner": t.3, "created_ms": t.4})
+}
+
+/// POST /api/v1/templates {"name","spec","note"} (researcher): same name replaces; only the owner or an admin may.
+fn post_template(ctx: &Ctx, r: &Req, who: &Who) -> Out {
+    let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
+    let name = str_field(&v, "name").unwrap_or("");
+    if !valid_name(name) {
+        return bad("name must be 1 to 64 letters, digits, '.', '_' or '-'");
+    }
+    let Some(spec) = v.get("spec").filter(|s| s.is_object()) else { return bad("spec must be a job body (see POST /jobs)") };
+    let note: String = str_field(&v, "note").unwrap_or("").chars().take(500).collect();
+    if let Err(m) = job_spec(spec, who) {
+        return match m.strip_prefix("forbidden: ") { Some(m) => fail(403, "forbidden", m), None => bad(&format!("spec: {m}")) };
+    }
+    if ctx.store.template(name).is_some_and(|t| t.3 != who.name && who.role < Role::Admin) {
+        return fail(403, "forbidden", "only the template's owner or an admin may replace it");
+    }
+    match ctx.store.put_template(name, &spec.to_string(), &note, &who.name, now_ms()) {
+        Ok(()) => {
+            audit(ctx, "template.saved", &who.name, name);
+            crate::head::refresh(ctx); // replicate to standbys now (config entry)
+            json_out(200, json!({"template": ctx.store.template(name).map(template_json)}))
+        }
+        Err(e) => fail(503, "unavailable", &e),
+    }
+}
+
+fn delete_template(ctx: &Ctx, name: &str, who: &Who) -> Out {
+    let Some(t) = ctx.store.template(name) else { return fail(404, "not_found", "no such template") };
+    if t.3 != who.name && who.role < Role::Admin {
+        return fail(403, "forbidden", "only the template's owner or an admin may delete it");
+    }
+    ctx.store.delete_template(name);
+    audit(ctx, "template.deleted", &who.name, name);
+    crate::head::refresh(ctx);
+    json_out(200, json!({}))
+}
+
+/// POST /api/v1/nodes/identify {"nodes": [id], "secs": 30} (operator).
+fn post_identify(ctx: &Ctx, r: &Req, actor: &str) -> Out {
+    let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
+    let secs = match v.get("secs") { None => 30, Some(x) => match uint(x).filter(|n| (1..=600).contains(n)) { Some(n) => n, None => return bad("secs must be a whole number from 1 to 600") } };
+    let Some(ids) = v.get("nodes").and_then(Value::as_array).filter(|a| !a.is_empty() && a.len() <= 1000).and_then(|a| a.iter().map(|x| x.as_str().map(String::from)).collect::<Option<Vec<_>>>()) else { return bad("nodes must be a list of 1 to 1000 node ids") };
+    if let Some(id) = ids.iter().find(|i| ctx.store.node(i).is_none()) {
+        return fail(404, "not_found", &format!("no such node {id}"));
+    }
+    let (on, off) = head::identify(ctx, &ids, secs);
+    let org = Org::load(ctx);
+    for id in &on {
+        if let Some(n) = ctx.store.node(id) {
+            publish_node(ctx, &n, true, &org);
+        }
+    }
+    audit(ctx, "node.identify", actor, &format!("{} PC(s) for {secs} s", on.len()));
+    json_out(200, json!({"identified": on, "offline": off, "secs": secs}))
 }
 
 // ---- SSE `log` tap (wave 14). No hook in log.rs: while any viewer is connected, one shared poller reads what the
@@ -1577,7 +1693,6 @@ struct Tail {
 }
 
 static TAIL: std::sync::Mutex<Option<Tail>> = std::sync::Mutex::new(None);
-const LOG_BATCH: usize = 200;
 
 fn tail_poll(t: &mut Tail) {
     if t.last.is_some_and(|l| l.elapsed() < Duration::from_millis(450)) {
@@ -1622,7 +1737,7 @@ fn tail_poll(t: &mut Tail) {
         return;
     }
     lines.sort_by_key(|l| l.0);
-    let skip = lines.len().saturating_sub(LOG_BATCH);
+    let skip = lines.len().saturating_sub(crate::tune::n("log_batch") as usize);
     let body = lines[skip..].iter().map(|l| l.1.as_str()).collect::<Vec<_>>().join(",");
     t.seq += 1;
     let seq = t.seq;
@@ -1648,7 +1763,7 @@ fn log_batch_after(seen: u64) -> Option<(u64, Arc<String>)> {
 fn cand_gen(ctx: &Ctx) -> u64 {
     static G: std::sync::Mutex<Option<(Instant, String, u64)>> = std::sync::Mutex::new(None);
     let mut g = G.lock().unwrap();
-    if g.as_ref().is_some_and(|x| x.0.elapsed() < Duration::from_secs(5)) {
+    if g.as_ref().is_some_and(|x| x.0.elapsed() < crate::tune::secs("cand_recheck_s")) {
         return g.as_ref().map_or(0, |x| x.2);
     }
     let sig = crate::head::candidates(ctx).iter().map(|c| format!("{}{}", c["node_id"].as_str().unwrap_or(""), c["eligible"])).collect::<Vec<_>>().join(",");
@@ -2135,6 +2250,53 @@ mod tests {
         assert_eq!((s, v["settings"]["target_standbys"].as_u64()), (200, Some(1)));
         assert_eq!(call(&c, &a, &op, "POST", "/api/v1/nodes/power", r#"{"node_ids":["x"],"action":"nap"}"#).0, 400);
         assert_eq!(call(&c, &a, &op, "POST", "/api/v1/nodes/power", r#"{"node_ids":["ghost"],"action":"wake"}"#).0, 404);
+    }
+
+    #[test]
+    fn templates_quota_identify_and_files_routes() {
+        let (c, a) = (ctx(), Auth::new(false));
+        let (ad, op, rs, rs2, vw) = (tok(&c, &a, "ad", "admin"), tok(&c, &a, "op", "operator"), tok(&c, &a, "rs", "researcher"), tok(&c, &a, "rs2", "researcher"), tok(&c, &a, "vw", "viewer"));
+        // templates: researcher saves, viewer only reads, the owner or an admin replaces
+        let body = r#"{"name":"t1","note":"n","spec":{"kind":"synth","n":1000,"synth_ns":1,"name":"from t1"}}"#;
+        assert_eq!(call(&c, &a, &vw, "POST", "/api/v1/templates", body).0, 403);
+        assert_eq!(call(&c, &a, &rs, "POST", "/api/v1/templates", body).0, 200);
+        assert_eq!(call(&c, &a, &rs, "POST", "/api/v1/templates", r#"{"name":"bad name","spec":{}}"#).0, 400);
+        assert_eq!(call(&c, &a, &rs, "POST", "/api/v1/templates", r#"{"name":"t2","spec":{"kind":"cmd","n":1,"cmd":"x"}}"#).0, 403, "researchers cannot save cmd jobs");
+        assert_eq!(call(&c, &a, &rs2, "POST", "/api/v1/templates", body).0, 403, "not the owner");
+        assert_eq!(call(&c, &a, &ad, "POST", "/api/v1/templates", body).0, 200, "admin may replace");
+        let (s, v) = call(&c, &a, &vw, "GET", "/api/v1/templates", "");
+        assert_eq!((s, v["templates"][0]["name"].as_str(), v["templates"][0]["owner"].as_str(), v["templates"][0]["spec"]["n"].as_u64()), (200, Some("t1"), Some("rs"), Some(1000)));
+        // run it with an override: n from the body, the rest from the spec
+        let (s, v) = call(&c, &a, &rs2, "POST", "/api/v1/jobs", r#"{"template":"t1","n":777}"#);
+        assert_eq!((s, v["job"]["total"].as_u64(), v["job"]["name"].as_str()), (200, Some(777), Some("from t1")), "{v}");
+        assert_eq!(call(&c, &a, &rs2, "POST", "/api/v1/jobs", r#"{"template":"nope"}"#).0, 404);
+        assert_eq!(call(&c, &a, &rs2, "DELETE", "/api/v1/templates/t1", "").0, 403);
+        assert_eq!(call(&c, &a, &rs, "DELETE", "/api/v1/templates/t1", "").0, 200);
+        assert_eq!(call(&c, &a, &rs, "DELETE", "/api/v1/templates/t1", "").0, 404);
+        // quota: admin only, shown on the user, 0/0 removes it
+        assert_eq!(call(&c, &a, &op, "PUT", "/api/v1/users/rs/quota", r#"{"max_pcs":2}"#).0, 403);
+        assert_eq!(call(&c, &a, &ad, "PUT", "/api/v1/users/rs/quota", r#"{"max_pcs":-1}"#).0, 400);
+        assert_eq!(call(&c, &a, &ad, "PUT", "/api/v1/users/ghost/quota", r#"{"max_pcs":2}"#).0, 404);
+        let (s, v) = call(&c, &a, &ad, "PUT", "/api/v1/users/rs/quota", r#"{"max_pcs":2,"max_running":3}"#);
+        assert_eq!((s, v["user"]["quota"]["max_pcs"].as_u64(), v["user"]["quota"]["max_running"].as_u64()), (200, Some(2), Some(3)));
+        let (_, v) = call(&c, &a, &ad, "GET", "/api/v1/users", "");
+        let q = |n: &str| v["users"].as_array().unwrap().iter().find(|u| u["name"] == n).unwrap()["quota"].clone();
+        assert_eq!((q("rs")["max_pcs"].as_u64(), q("op")["max_running"].as_u64()), (Some(2), Some(0)));
+        call(&c, &a, &ad, "PUT", "/api/v1/users/rs/quota", r#"{"max_pcs":0,"max_running":0}"#);
+        assert!(c.store.meta("quotas").is_some_and(|m| m == "{}"));
+        // identify: operator, secs 1..600, known nodes only
+        assert_eq!(call(&c, &a, &rs, "POST", "/api/v1/nodes/identify", r#"{"nodes":["n1"]}"#).0, 403);
+        assert_eq!(call(&c, &a, &op, "POST", "/api/v1/nodes/identify", r#"{"nodes":["n1"],"secs":601}"#).0, 400);
+        assert_eq!(call(&c, &a, &op, "POST", "/api/v1/nodes/identify", r#"{"nodes":[]}"#).0, 400);
+        assert_eq!(call(&c, &a, &op, "POST", "/api/v1/nodes/identify", r#"{"nodes":["ghost"]}"#).0, 404);
+        // files: listed per job, with the job's file count in its JSON
+        let (_, v) = call(&c, &a, &rs, "POST", "/api/v1/jobs", r#"{"kind":"synth","n":10,"synth_ns":1}"#);
+        let id = v["job"]["id"].as_u64().unwrap();
+        c.store.put_job_files(id, 0, 5, &[("a.txt".into(), "ab".repeat(32), 3), ("b.txt".into(), "cd".repeat(32), 4)]);
+        let (s, v) = call(&c, &a, &vw, "GET", &format!("/api/v1/jobs/{id}/files"), "");
+        assert_eq!((s, v["files"].as_array().map(Vec::len), v["files"][1]["name"].as_str(), v["files"][1]["chunk"][1].as_u64()), (200, Some(2), Some("b.txt"), Some(5)));
+        assert_eq!(call(&c, &a, &vw, "GET", &format!("/api/v1/jobs/{id}"), "").1["job"]["files"].as_u64(), Some(2));
+        assert_eq!(call(&c, &a, &vw, "GET", "/api/v1/jobs/99999/files", "").0, 404);
     }
 
     #[test]

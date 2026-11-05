@@ -105,6 +105,9 @@ pub const KNOBS: &[Knob] = &[
     k("blob_max_mb", "Network", 4096.0, 1.0, 1_000_000.0, "MB", Head, "Largest single blob accepted by PUT /api/v1/blobs."),
     k("net_probe_mb", "Network", 16.0, 0.1, 1024.0, "MB", Head, "Size of the probe transfer that measures a PC's link speed."),
     k("net_probe_every_s", "Network", 3600.0, 10.0, 604_800.0, "s", Head, "How often idle PCs get their link speed measured again."),
+    k("blob_partial_ms", "Network", 500.0, 0.0, 60_000.0, "ms", Head, "A PC downloading a blob serves its finished pieces to others only after this long."),
+    k("blob_stall_s", "Network", 20.0, 2.0, 3600.0, "s", Agent, "A blob download with no new piece for this long is given up (the head then serves it itself)."),
+    k("blob_offer_s", "Network", 5.0, 1.0, 600.0, "s", Head, "How often the primary offers new blobs to standby heads."),
     k("blob_auto_kb", "Network", 64.0, 1.0, 1_048_576.0, "KB", Both, "SDK: arguments and results above this size travel as blobs."),
     k("head_uplink_mbps_cap", "Network", 0.0, 0.0, 1_000_000.0, "Mbit/s", Head, "Head uplink used in estimates; 0 = learned from parallel transfers."),
     // retention and backups (src/store.rs maintenance, docs/OPERATIONS.md section 6)
@@ -112,6 +115,9 @@ pub const KNOBS: &[Knob] = &[
     k("parts_keep_days", "Retention", 0.0, 0.0, 36_500.0, "days", Head, "Result parts of jobs finished longer ago than this are deleted (the job row stays); 0 = keep forever."),
     k("backup_every_h", "Retention", 0.0, 0.0, 8760.0, "h", Head, "The head saves a copy of head.db to ck-data/backups this often; 0 = off."),
     k("backup_keep", "Retention", 7.0, 1.0, 1000.0, "files", Head, "Scheduled backups kept; the oldest are deleted."),
+    k("out_files_mb", "Agent limits", 256.0, 1.0, 65_536.0, "MB", Agent, "Output files (CK_OUT) a command chunk may leave behind; more makes the chunk fail."),
+    k("log_batch", "Logging", 200.0, 10.0, 10_000.0, "lines", Head, "Most log lines sent to the console in one live batch."),
+    k("cand_recheck_s", "Dynamic heads", 5.0, 1.0, 600.0, "s", Head, "Live head ranking is recomputed at most this often for the console."),
     k("warm_idle_s", "SDK", 120.0, 0.0, 3600.0, "s", Agent, "Idle seconds before a PC's warm Python worker exits; 0 = warm runner off."),
     // logging (src/log.rs, docs/LOGGING.md)
     k("log_level", "Logging", 3.0, 0.0, 4.0, "level", Both, "What is written to ck-data/logs: 0 off, 1 error, 2 warn, 3 info, 4 debug."),

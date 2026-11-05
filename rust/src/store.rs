@@ -164,6 +164,11 @@ ALTER TABLE jobs ADD COLUMN blob_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE nodes ADD COLUMN net_mbps REAL;
 ALTER TABLE nodes ADD COLUMN rtt_ms REAL;
 ALTER TABLE nodes ADD COLUMN probed_ms INTEGER;
+", "
+CREATE TABLE templates (name TEXT PRIMARY KEY, spec_json TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL, created_ms INTEGER NOT NULL);
+CREATE TABLE job_files (job_id INTEGER NOT NULL, start INTEGER NOT NULL, \"end\" INTEGER NOT NULL, name TEXT NOT NULL, sha TEXT NOT NULL,
+  size INTEGER NOT NULL, PRIMARY KEY (job_id, start, \"end\", name));
+CREATE INDEX job_files_sha ON job_files(sha);
 "];
 
 const NODE_SEL: &str = "SELECT node_id,host,addr,inventory,first_seen_ms,last_seen_ms,state,state_reason,state_by,lab_id,x,y,calib_mhs,net_mbps,rtt_ms,probed_ms FROM nodes";
@@ -1211,7 +1216,7 @@ impl Store {
     pub fn blob_rows(&self) -> Vec<(String, u64, u64, i64, i64)> {
         let c = self.db();
         let Ok(mut st) = c.prepare(
-            "SELECT sha,size,(SELECT COUNT(*) FROM jobs WHERE state IN ('queued','running') AND blobs LIKE '%\"' || blobs.sha || '\"%'),created_ms,last_used_ms FROM blobs ORDER BY created_ms DESC",
+            "SELECT sha,size,(SELECT COUNT(*) FROM jobs WHERE state IN ('queued','running') AND blobs LIKE '%\"' || blobs.sha || '\"%') + (SELECT COUNT(*) FROM job_files WHERE sha=blobs.sha),created_ms,last_used_ms FROM blobs ORDER BY created_ms DESC",
         ) else { return vec![] };
         st.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64, r.get(3)?, r.get(4)?))).map(|m| m.flatten().collect()).unwrap_or_default()
     }
@@ -1352,6 +1357,42 @@ impl Store {
     /// Small key/value settings: "epoch", "membership" (JSON list of node ids), "last_seq".
     pub fn meta(&self, key: &str) -> Option<String> {
         self.db().query_row("SELECT value FROM meta WHERE key=?", [key], |r| r.get(0)).optional().ok().flatten()
+    }
+    /// Output files of one chunk (JOB-08), replacing what an earlier copy of the chunk reported.
+    pub fn put_job_files(&self, job: u64, a: u64, b: u64, files: &[(String, String, u64)]) {
+        let c = self.db();
+        let _ = c.execute("DELETE FROM job_files WHERE job_id=?1 AND start=?2 AND \"end\"=?3", params![job as i64, a as i64, b as i64]);
+        for (name, sha, size) in files {
+            let _ = c.execute("INSERT OR REPLACE INTO job_files (job_id,start,\"end\",name,sha,size) VALUES (?1,?2,?3,?4,?5,?6)", params![job as i64, a as i64, b as i64, name, sha, *size as i64]);
+        }
+    }
+    /// (chunk start, chunk end, name, sha, size) of a job's output files, in chunk order.
+    pub fn job_files(&self, job: u64) -> Vec<(u64, u64, String, String, u64)> {
+        let c = self.db();
+        let Ok(mut st) = c.prepare("SELECT start,\"end\",name,sha,size FROM job_files WHERE job_id=? ORDER BY start,name") else { return vec![] };
+        st.query_map([job as i64], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get(2)?, r.get(3)?, r.get::<_, i64>(4)? as u64))).map(|m| m.flatten().collect()).unwrap_or_default()
+    }
+    pub fn job_file_count(&self, job: u64) -> u64 {
+        self.db().query_row("SELECT COUNT(*) FROM job_files WHERE job_id=?", [job as i64], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64
+    }
+    /// (name, spec_json, note, owner, created_ms)
+    pub fn templates(&self) -> Vec<(String, String, String, String, i64)> {
+        let c = self.db();
+        let Ok(mut st) = c.prepare("SELECT name,spec_json,note,owner,created_ms FROM templates ORDER BY name") else { return vec![] };
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).map(|m| m.flatten().collect()).unwrap_or_default()
+    }
+    pub fn template(&self, name: &str) -> Option<(String, String, String, String, i64)> {
+        self.db().query_row("SELECT name,spec_json,note,owner,created_ms FROM templates WHERE name=?", [name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional().ok().flatten()
+    }
+    /// Same name replaces spec and note; owner and created time stay.
+    pub fn put_template(&self, name: &str, spec_json: &str, note: &str, owner: &str, now_ms: i64) -> Result<(), String> {
+        self.db().execute(
+            "INSERT INTO templates (name,spec_json,note,owner,created_ms) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(name) DO UPDATE SET spec_json=?2, note=?3",
+            params![name, spec_json, note, owner, now_ms],
+        ).map(|_| ()).map_err(e)
+    }
+    pub fn delete_template(&self, name: &str) -> bool {
+        self.db().execute("DELETE FROM templates WHERE name=?", [name]).map(|n| n > 0).unwrap_or(false)
     }
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), String> {
         self.db().execute("INSERT INTO meta (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=?2", params![key, value]).map(|_| ()).map_err(e)
@@ -1733,6 +1774,37 @@ mod wave12_tests {
         s.add_sample(&Sample { ts_ms: 100 * 3_600_000, online: 3, busy: 2, rate: 5.0, energy_j: 1.0 }).unwrap();
         s.add_sample(&Sample { ts_ms: 200 * 3_600_000, online: 3, busy: 2, rate: 5.0, energy_j: 1.0 }).unwrap();
         assert_eq!(s.samples_between(0, i64::MAX).len(), 1, "samples older than 48 h are dropped");
+        let v: i64 = s.db().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, MIGRATIONS.len());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_9_templates_and_job_files() {
+        let dir = std::env::temp_dir().join(format!("ck-m9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("head.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            for m in &MIGRATIONS[..8] {
+                c.execute_batch(m).unwrap();
+            }
+            c.execute_batch("PRAGMA user_version = 8").unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        s.put_template("t", "{\"kind\":\"synth\"}", "n1", "ann", 5).unwrap();
+        s.put_template("t", "{\"kind\":\"sha\"}", "n2", "bob", 9).unwrap();
+        let t = s.template("t").unwrap();
+        assert_eq!((t.1.as_str(), t.2.as_str(), t.3.as_str(), t.4), ("{\"kind\":\"sha\"}", "n2", "ann", 5), "replace keeps owner and created time");
+        assert!(s.delete_template("t") && !s.delete_template("t") && s.templates().is_empty());
+        let sha = "ab".repeat(32);
+        s.put_job_files(3, 0, 10, &[("a".into(), sha.clone(), 4), ("b".into(), "cd".repeat(32), 5)]);
+        s.put_job_files(3, 0, 10, &[("a".into(), sha.clone(), 4)]);
+        assert_eq!((s.job_file_count(3), s.job_files(3).len()), (1, 1), "a re-run chunk replaces its files");
+        s.put_blob(&sha, 4, 1);
+        assert_eq!(s.blob_rows()[0].2, 1, "a blob named by a job file counts as referenced");
         let v: i64 = s.db().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v as usize, MIGRATIONS.len());
         drop(s);

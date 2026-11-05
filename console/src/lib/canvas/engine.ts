@@ -72,6 +72,8 @@ export class LiveEngine {
 	items: ReturnType<typeof toItems> = [];
 	cls: Cls[] = [];
 	jobOf: (number | null)[] = [];
+	/** PCs showing their identify banner: index -> until (epoch ms) */
+	private idents = new Map<string, number>();
 	counts: Record<Cls, number> = { busy: 0, idle: 0, use: 0, cord: 0, asleep: 0, waking: 0, lost: 0 };
 	jobIds = new Map<number, number>();
 	hosts: HostIndex = new Map();
@@ -268,6 +270,8 @@ export class LiveEngine {
 			const o = inp.overrides?.[node.node_id];
 			const view = o ? { ...node, ...o } : node;
 			const c = classOf(view, w);
+			if (node.identify_until_ms) this.idents.set(node.node_id, node.identify_until_ms);
+			else this.idents.delete(node.node_id);
 			this.cls[i] = c;
 			this.counts[c]++;
 			const a = attrsOf(node, labName.get(node.lab_id ?? -1), c, null, this.scene.pcs[i].r > 4 ? 16 : 8);
@@ -414,7 +418,12 @@ export class LiveEngine {
 	// ------------------------------------------------------------ drawing
 	get animating() {
 		const now = performance.now();
-		return this.particles.n > 0 || this.fx.some((f) => now - f.t0 < f.dur) || this.flashes.size > 0 || !!this.glide || !!this.roll || now - this.ghost < 700 || this.born.size > 0 || (!this.reduce && this.counts.waking > 0);
+		return this.particles.n > 0 || this.fx.some((f) => now - f.t0 < f.dur) || this.flashes.size > 0 || !!this.glide || !!this.roll || now - this.ghost < 700 || this.born.size > 0 || (!this.reduce && this.counts.waking > 0) || this.identifying();
+	}
+	private identifying() {
+		const t = Date.now();
+		for (const u of this.idents.values()) if (u > t) return true;
+		return false;
 	}
 	frame(now: number) {
 		this.particles.prune(now);
@@ -597,6 +606,22 @@ export class LiveEngine {
 			ctx.stroke();
 			ctx.setLineDash([]);
 		}
+		// identify: a wide primary ring that keeps pulsing until the head says the banner is off
+		const wall = Date.now();
+		for (const [id, until] of this.idents) {
+			if (until <= wall) continue;
+			const i = this.scene.index.get(id);
+			if (i == null) continue;
+			const s = pcs[i];
+			const ph = this.reduce ? 0.5 : (now % 1100) / 1100;
+			ctx.globalAlpha = this.reduce ? 0.9 : 1 - ph;
+			ctx.strokeStyle = T.primary;
+			ctx.lineWidth = 2.4 / Math.max(1, k * 0.6);
+			ctx.beginPath();
+			ctx.arc(s.x, s.y, s.r + 5 + ph * 9, 0, TAU);
+			ctx.stroke();
+		}
+		ctx.globalAlpha = 1;
 		for (const [id, until] of this.flashes) {
 			const i = this.scene.index.get(id);
 			if (i == null) continue;

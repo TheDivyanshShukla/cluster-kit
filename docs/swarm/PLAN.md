@@ -1,5 +1,5 @@
 # Swarm plan: wave 15, the last unbuilt requirements (JOB-08, JOB-12, FLT-07, SCH-04 quotas, UI-07, docs)
-status: running        updated: 2026-11-05
+status: done        updated: 2026-11-05
 
 ## Contracts (lead-fixed; h1 implements, h2 consumes)
 - Templates (JOB-12): migration 9 table `templates(name PK, spec_json, note, owner, created_ms)`. GET /api/v1/templates ->

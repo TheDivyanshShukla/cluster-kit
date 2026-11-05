@@ -25,3 +25,19 @@ test('durations and ages', () => {
 	expect(ago(10_000, 10_000)).toBe('just now');
 	expect(ago(0, 90_000)).toBe('1 m 30 s ago');
 });
+
+import { identifying, mbps } from './format';
+test('identifying and mbps', () => {
+	expect(identifying({ identify_until_ms: 2000 }, 1000)).toBe(true);
+	expect(identifying({ identify_until_ms: null }, 1000)).toBe(false);
+	expect(identifying({}, 1000)).toBe(false);
+	expect(mbps(940)).toBe('940 Mbps');
+	expect(mbps(2500)).toBe('2.5 Gbps');
+	expect(mbps(null)).toBe('—');
+});
+import { fileSize } from './format';
+test('fileSize', () => {
+	expect(fileSize(900)).toBe('900 B');
+	expect(fileSize(75_776)).toBe('74 KiB');
+	expect(fileSize(5 * 2 ** 20)).toBe('5 MiB');
+});

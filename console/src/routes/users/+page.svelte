@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { CircleAlert, Lock, UserPlus } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
-	import { Role } from '#lib/api/schema.ts';
+	import { Role, type Quota } from '#lib/api/schema.ts';
 	import DataTable, { type Col } from '#lib/components/DataTable.svelte';
 	import EmptyState from '#lib/components/EmptyState.svelte';
 	import Hl from '#lib/components/Hl.svelte';
@@ -15,7 +15,7 @@
 	import { roleNow } from '#lib/session.svelte.ts';
 	import { btnPrimary, field } from '#lib/ui.ts';
 
-	type Row = { name: string; role: Role; created_ms: number };
+	type Row = { name: string; role: Role; created_ms: number; quota: Quota };
 	const roles = Role.options;
 	const about: Record<Role, string> = {
 		viewer: 'Look only',
@@ -45,8 +45,34 @@
 	const cols: Col[] = [
 		{ key: 'name', label: 'Name', w: 'minmax(120px,1fr)', sort: true },
 		{ key: 'role', label: 'Role', w: '110px', sort: true },
-		{ key: 'created', label: 'Created', w: '190px', sort: true }
+		{ key: 'created', label: 'Created', w: '170px', sort: true },
+		{ key: 'pcs', label: 'Max PCs', w: '96px' },
+		{ key: 'run', label: 'Max running', w: '104px' },
+		{ key: 'save', label: '', w: '84px' }
 	];
+	// quota editor: 0 means no limit. A draft exists only while the numbers differ from the saved ones.
+	let draft = $state<Record<string, { pcs: number; run: number }>>({});
+	let qBusy = $state('');
+	let qError = $state<string | null>(null);
+	const dv = (u: Row) => draft[u.name] ?? { pcs: u.quota.max_pcs, run: u.quota.max_running };
+	const dirty = (u: Row) => dv(u).pcs !== u.quota.max_pcs || dv(u).run !== u.quota.max_running;
+	const okNum = (n: unknown) => Number.isInteger(n) && (n as number) >= 0;
+	function edit(u: Row, k: 'pcs' | 'run', v: number | null) {
+		draft[u.name] = { ...dv(u), [k]: v as number };
+	}
+	async function saveQuota(u: Row) {
+		const d = dv(u);
+		qBusy = u.name;
+		qError = null;
+		try {
+			await api.setQuota(u.name, { max_pcs: d.pcs, max_running: d.run });
+			delete draft[u.name];
+			await load();
+		} catch (e) {
+			qError = e instanceof ApiError ? e.message : 'Could not save the quota.';
+		}
+		qBusy = '';
+	}
 	const short = $derived(password.length > 0 && password.length < 12);
 
 	async function load() {
@@ -81,7 +107,7 @@
 
 <Page
 	title="Users"
-	subtitle="Who can sign in to this console, and what they may do."
+	subtitle="Who can sign in, what they may do, and how many PCs and running jobs each may hold (0 = no limit)."
 	tabs={[{ id: 'users', label: 'Users', badge: res.rows.length }, { id: 'add', label: 'Add a user' }]}
 	class="sm:grid-cols-[minmax(0,1fr)_17rem] lg:grid-cols-[minmax(0,1fr)_20rem]"
 >
@@ -97,10 +123,24 @@
 			{:else if error}
 				<div class="p-4"><EmptyState icon={CircleAlert} title="Could not load users" body={error} /></div>
 			{:else}
-				<DataTable label="Users" rows={res.rows} {cols} rowKey={(u) => u.name} sort={l.state.sort} dir={l.state.dir} onsort={(c) => l.sortBy(c)}>
+				{#if qError}<p class="text-bad px-3 pt-2 text-[13px]" role="alert">{qError}</p>{/if}
+				<DataTable label="Users" rows={res.rows} {cols} minW={720} rowKey={(u) => u.name} sort={l.state.sort} dir={l.state.dir} onsort={(c) => l.sortBy(c)}>
 					{#snippet cell(u, c)}
 						{#if c.key === 'name'}<span class="block truncate font-medium"><Hl text={u.name} q={l.state.q} /></span>
 						{:else if c.key === 'role'}{u.role}
+						{:else if c.key === 'pcs' || c.key === 'run'}
+							<input
+								class="{field} num h-8 w-full px-2 py-1 text-right"
+								type="number"
+								min="0"
+								step="1"
+								inputmode="numeric"
+								aria-label="{c.key === 'pcs' ? 'Most PCs' : 'Most running jobs'} for {u.name} (0 = no limit)"
+								value={c.key === 'pcs' ? dv(u).pcs : dv(u).run}
+								oninput={(e) => edit(u, c.key as 'pcs' | 'run', e.currentTarget.valueAsNumber)}
+							/>
+						{:else if c.key === 'save'}
+							{#if dirty(u)}<button type="button" class="{btnPrimary} h-8 px-3" disabled={qBusy === u.name || !okNum(dv(u).pcs) || !okNum(dv(u).run)} onclick={() => saveQuota(u)}>Save</button>{/if}
 						{:else}<span class="text-muted-foreground whitespace-nowrap">{datetime(u.created_ms)}</span>{/if}
 					{/snippet}
 					{#snippet empty()}

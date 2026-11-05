@@ -12,6 +12,58 @@ Both engines have:
 - **Auto-rejoin:** workers reconnect by themselves if the head restarts.
 - **Auto firewall:** ports open only while running, close on exit, and stale rules are cleared on the next start.
 
+## Quick start (Rust engine, one PC)
+
+Try the whole thing on one machine first. Use the `ck` binary directly; `kit rs ...` runs the same commands with the firewall handled.
+
+```
+# 1. Build (installs nothing else; add --no-default-features to skip GPU support)
+cd rust && cargo build --release && cd ..
+export PATH="$PWD/rust/target/release:$PATH"
+
+# 2. Start the head (console at http://127.0.0.1:7702)
+ck head --no-local-worker
+
+# 3. In a second terminal: join an agent. Here 4 pretend PCs on this machine;
+#    on a real PC use:  ck agent --head HEAD_IP   (no --head: it finds the head by broadcast)
+ck agent --head 127.0.0.1 --virtual 4
+
+# 4. Create the first admin: open http://127.0.0.1:7702 and fill the form, then get an API token
+CK_USER=admin ck token --head 127.0.0.1        # asks for the password, prints a token
+export CK_TOKEN=<the token>
+
+# 5. First job: SHA-256 search, then a program of your own
+ck admin nodes --head 127.0.0.1                # the agents should be online
+ck run --head 127.0.0.1 --n 1e8 --sha 00000
+cc -O2 examples/primes.c -o examples/primes    # run from the kit folder; agents must start there too
+ck run --head 127.0.0.1 --n 1e7 --from 0 --chunk 1e6 --cmd examples/primes | awk '{s+=$1} END {print s}'   # 664579
+ck job ls --head 127.0.0.1                     # past and running jobs
+ck logs --since 10m --kind node. --limit 5     # structured log (run on the head PC)
+```
+
+Open `http://127.0.0.1:7702` for the console: Overview, Nodes, Jobs (New job, results, breakdown), Live map, System settings. A new head asks for the first admin there. For a real lab (join codes, standby heads, running agents as a service) follow [docs/OPERATIONS.md](docs/OPERATIONS.md). How the pieces fit: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+### Python SDK
+
+Run ordinary Python functions on the cluster. The SDK needs only the standard library (Python 3.9 or newer).
+
+```
+pip install ./python                           # or: export PYTHONPATH=$PWD/python
+export CK_HEAD=http://127.0.0.1:7702 CK_TOKEN=<the token>
+```
+
+```python
+import clusterkit as ck
+
+def square(x):
+    return x * x
+
+if __name__ == "__main__":
+    print(ck.map(square, range(1000))[:5])     # [0, 1, 4, 9, 16], same order as a list comprehension
+```
+
+It runs locally when the cluster would not be faster. More: `examples/sdk/` (`sweep.py`, `model_avg.py`, `ml_torch.py`) and [docs/SDK.md](docs/SDK.md).
+
 ## Layout
 
 ```
@@ -20,7 +72,7 @@ python/                 Dask engine: cluster.py (head/worker/bench/firewall)
 rust/                   Rust engine: src/main.rs, src/gpu.rs + sha.wgsl (GPU), src/dash.html,
                         bench/mpi_pingpong.c + bench/mpi_sha.c (MPI baselines)
 examples/               example jobs: simple_sha256.py (start here, see docs/SIMPLE.md), dask_sha256.py (Dask), primes.c / primes.js / primes.py (any-language --cmd)
-docs/                   SIMPLE.md, BENCHMARK.md, UBUNTU.md, and the roadmap: CONSOLE_REQUIREMENTS.md
+docs/                   ARCHITECTURE.md (start here), OPERATIONS.md, API.md, SDK.md, SIMPLE.md, BENCHMARK.md, UBUNTU.md, roadmap: CONSOLE_REQUIREMENTS.md
 ```
 
 To add an engine later, create a folder and add one `case` branch to `kit` (and `kit.ps1`). To get firewall handling for free, start it through `python/cluster.py fwrun`.

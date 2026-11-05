@@ -77,7 +77,10 @@ export const JobRow = z.object({
 	priority: z.number().int().min(0).max(4).default(2),
 	policy: z.string().default(''),
 	reducer: z.string().default(''),
-	eta_ms: z.number().nullable().default(null)
+	eta_ms: z.number().nullable().default(null),
+	/** wave 15: why a queued job waits, and how many output files it produced */
+	wait_reason: z.enum(['quota', 'priority', 'no_pcs']).nullable().catch(null).default(null),
+	files: z.number().int().default(0)
 });
 export const JobList = z.object({ jobs: z.array(JobRow), next: z.number().nullable() });
 export const JobOne = z.object({ job: JobRow, parts: z.number().optional() });
@@ -87,7 +90,10 @@ export const Cluster = z.object({ now_ms: z.number(), workers: z.array(Worker), 
 export const EventRow = z.object({ id: z.number().int(), ts_ms: z.number(), kind: z.string(), actor: z.string(), detail: z.string() });
 export const EventList = z.object({ events: z.array(EventRow), next: z.number().nullable() });
 
-export const UserList = z.object({ users: z.array(z.object({ name: z.string(), role: Role, created_ms: z.number() })) });
+/** 0 = no limit */
+export const Quota = z.object({ max_pcs: z.number().int().default(0), max_running: z.number().int().default(0) });
+export type Quota = z.infer<typeof Quota>;
+export const UserList = z.object({ users: z.array(z.object({ name: z.string(), role: Role, created_ms: z.number(), quota: Quota.default({ max_pcs: 0, max_running: 0 }) })) });
 
 export const NodeState = z.enum(['pending', 'active', 'cordoned', 'draining', 'maintenance', 'retired']);
 /** contract: node `power` may be a plain state or {state, since_ms}; either way NodeRow gets `power` + `power_since_ms` */
@@ -120,7 +126,9 @@ export const NodeRow = z.preprocess(normNode, z.object({
 	/** NET-06: asleep = the head put it to sleep; waking = magic packet sent, not back yet */
 	power: z.enum(['awake', 'asleep', 'waking']).catch('awake'),
 	/** when the PC entered that power state (epoch ms); null if the head does not know */
-	power_since_ms: z.number().nullish()
+	power_since_ms: z.number().nullish(),
+	/** FLT-07: the PC is showing its "it is me" banner until this epoch ms; null when off */
+	identify_until_ms: z.number().nullish()
 }));
 export const NodeOne = z.object({ node: NodeRow });
 export const NodesChanged = z.object({ nodes: z.array(NodeRow) });
@@ -253,7 +261,7 @@ export type LabPower = z.infer<typeof LabPower>;
 export const PowerReply = z.object({ power: PowerSettings, asleep: z.array(z.string()).default([]), labs: z.array(LabPower).default([]) });
 
 /** SSE `changed`: a list was written, refetch it. SSE `log`: batched log lines. */
-export const WHAT = ['reserves', 'bookings', 'timetable', 'candidates', 'pools', 'caps', 'labels', 'windows'] as const;
+export const WHAT = ['templates', 'reserves', 'bookings', 'timetable', 'candidates', 'pools', 'caps', 'labels', 'windows'] as const;
 export type What = (typeof WHAT)[number];
 export const Changed = z.object({ what: z.enum(WHAT) });
 export const LogBatch = z.object({ lines: z.array(z.looseObject({ ts_ms: z.number(), level: z.enum(['error', 'warn', 'info', 'debug']), kind: z.string() })) });
@@ -346,3 +354,22 @@ export type Breakdown = z.infer<typeof Breakdown>;
 export type Alert = z.infer<typeof Alert>;
 export type ExperimentRow = z.infer<typeof ExperimentRow>;
 export type DayReport = z.infer<typeof DayReport>;
+
+/** Wave 15: templates (JOB-12), job output files (JOB-08), network (UI-07) */
+export const Template = z.object({ name: z.string(), spec: z.record(z.string(), z.unknown()), note: z.string().default(''), owner: z.string().default(''), created_ms: z.number() });
+export const TemplateList = z.object({ templates: z.array(Template) });
+export type Template = z.infer<typeof Template>;
+export const JobFile = z.object({ chunk: z.tuple([z.number(), z.number()]), name: z.string(), sha: z.string(), size: z.number() });
+export const JobFiles = z.object({ files: z.array(JobFile) });
+export type JobFile = z.infer<typeof JobFile>;
+export const NetNode = z.object({
+	node_id: z.string(), host: z.string().default(''), lab: z.string().default(''),
+	net_mbps: z.number().nullish(), rtt_ms: z.number().nullish(), probed_ms: z.number().nullish()
+});
+export const NetLab = z.object({ lab: z.string(), pcs: z.number().int(), mbps: z.number().nullish() });
+export const Net = z.object({
+	head_uplink_mbps: z.number().nullish(), head_uplink_assumed: z.boolean().default(false), head_bytes_sent: z.number().default(0),
+	nodes: z.array(NetNode), labs: z.array(NetLab)
+});
+export type Net = z.infer<typeof Net>;
+export type NetNode = z.infer<typeof NetNode>;
