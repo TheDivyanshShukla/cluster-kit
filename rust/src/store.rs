@@ -274,7 +274,17 @@ impl Store {
         if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(d).map_err(|x| format!("create {}: {x}", d.display()))?;
         }
-        setup(Connection::open(path).map_err(e)?)
+        let had_data = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
+        let had_wal = std::fs::metadata(path.with_extension("db-wal")).is_ok_and(|m| m.len() > 0);
+        let s = setup(Connection::open(path).map_err(e)?)?;
+        // A damaged file or WAL opens on whatever SQLite can recover; say so loudly instead of starting silently.
+        let check: String = s.db().query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap_or_else(|x| x.to_string());
+        if check != "ok" {
+            crate::warnl!("store.corrupt", "{}: integrity check failed ({check}); restore a backup (docs/OPERATIONS.md section 6)", path.display());
+        } else if !had_data && had_wal {
+            crate::warnl!("store.corrupt", "{}: database file was empty but a WAL existed; started from what the WAL held", path.display());
+        }
+        Ok(s)
     }
     /// Same schema in memory, for tests.
     pub fn memory() -> Store {

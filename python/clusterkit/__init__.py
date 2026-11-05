@@ -367,23 +367,27 @@ def _bulk_mb(b: float) -> str:
 def _profile(fn: Callable[..., Any], mode: str, items: list[Any]) -> tuple[float, float]:
     n = len(items)
     k = max(3, math.ceil(n * 0.01))
-    t0, done = time.perf_counter(), 0
-    for x in items[:k]:
-        _runner.apply(mode, fn, x)
-        done += 1
-        if time.perf_counter() - t0 > 2.0:
-            break
-    per = (time.perf_counter() - t0) / max(done, 1)
-    # memory: python allocations of one call (tracemalloc), or the RSS growth if that is larger
+    # item 0 runs once under tracemalloc (peak memory; also the only timing when items are slow, so a 2 s item is not run twice);
+    # the next ones run untraced and give the time per item
     rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    t0 = time.perf_counter()
     tracemalloc.start()
     try:
         _runner.apply(mode, fn, items[0])
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
+    first = time.perf_counter() - t0
     scale = 1 if sys.platform == "darwin" else 1024
     rss = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss0) * scale
+    t0, done = time.perf_counter(), 0
+    if first <= 2.0:
+        for x in items[1:k]:
+            _runner.apply(mode, fn, x)
+            done += 1
+            if time.perf_counter() - t0 > 2.0 - first:
+                break
+    per = (time.perf_counter() - t0) / done if done else first
     return per, max(peak, rss) / 1048576
 
 
@@ -487,7 +491,10 @@ def _plan(fn: Callable[..., Any], items: list[Any], mode: str, o: Opts, profile:
         best_k, best_t, prev = k, t, t
     if best_k:
         by_wall = math.ceil(n * per / (o["target_wall_s"] * m["speed"] * (sum(conc) / len(conc))))
-        best_k = max(1, min(best_k, by_wall))
+        capped = max(1, min(best_k, by_wall))
+        # fewer PCs is only worth it while the capped run still beats local by the 1.5x margin (else the cap alone sends work home)
+        if o["local"] == "never" or local_s >= 1.5 * cost(capped):
+            best_k = capped
         best_t = cost(best_k)
     if o["pcs"]:
         best_k = min(o["pcs"], len(conc)) or best_k

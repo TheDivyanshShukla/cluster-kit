@@ -29,11 +29,13 @@
 
 	const role = $derived(roleNow());
 	const parsed = $derived(parseQuery(q));
-	const ctx = $derived({ nodes: Object.values(live.nodes), labs: live.labs });
+	// closed palette: read nothing live, so a 5,000-PC fleet's every tick does not rebuild and rank 5,000 entries
+	const ctx = $derived(palette.open ? { nodes: Object.values(live.nodes), labs: live.labs } : { nodes: [], labs: [] });
 	const labName = (id: number | null) => live.labs.find((l) => l.id === id)?.name ?? 'no lab';
 
 	const entries = $derived.by<Entry[]>(() => {
 		const out: Entry[] = [];
+		if (!palette.open) return out;
 		for (const n of ctx.nodes) out.push({ id: `pc:${n.node_id}`, kind: 'pc', label: n.host, sub: `${labName(n.lab_id)} · ${n.online ? n.state : 'offline'}`, keys: `${n.node_id} ${n.class} ${Object.entries(n.labels).map(([k, v]) => `${k}=${v}`).join(' ')}`, href: `/live?sel=${encodeURIComponent(n.node_id)}` });
 		const jobs = new Map(extra.jobs.map((j) => [j.id, j]));
 		for (const j of Object.values(live.jobs)) jobs.set(j.id, j);

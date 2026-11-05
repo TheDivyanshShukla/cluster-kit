@@ -102,11 +102,18 @@ fn read_idx(path: &Path) -> Option<(u64, Vec<[u8; 32]>)> {
 
 /// Hash a reader into (whole sha, piece hashes, size), writing the bytes to `out` as they pass. Stops with an error past `max`.
 fn hash_stream(r: &mut dyn Read, mut out: Option<&mut File>, piece: u64, max: u64) -> io::Result<(String, Vec<[u8; 32]>, u64)> {
-    let (mut whole, mut ph, mut hashes) = (Sha256::new(), Sha256::new(), vec![]);
-    let (mut fill, mut total) = (0u64, 0u64);
-    let mut buf = vec![0u8; 1 << 20];
+    // one buffer per piece: the whole-blob hash, the piece hash and the disk write run on different cores
+    let (mut whole, mut hashes, mut total) = (Sha256::new(), vec![], 0u64);
+    let mut buf = vec![0u8; piece as usize];
     loop {
-        let n = r.read(&mut buf)?;
+        let mut n = 0;
+        while n < buf.len() {
+            let k = r.read(&mut buf[n..])?;
+            if k == 0 {
+                break;
+            }
+            n += k;
+        }
         if n == 0 {
             break;
         }
@@ -114,26 +121,27 @@ fn hash_stream(r: &mut dyn Read, mut out: Option<&mut File>, piece: u64, max: u6
         if total > max {
             return Err(other(format!("over the limit of {} MB", max >> 20)));
         }
-        if let Some(f) = out.as_deref_mut() {
-            f.write_all(&buf[..n])?;
-        }
-        whole.update(&buf[..n]);
-        let mut s = &buf[..n];
-        while !s.is_empty() {
-            let take = ((piece - fill) as usize).min(s.len());
-            ph.update(&s[..take]);
-            fill += take as u64;
-            s = &s[take..];
-            if fill == piece {
-                hashes.push(std::mem::take(&mut ph).finalize().into());
-                fill = 0;
-            }
-        }
-    }
-    if fill > 0 {
-        hashes.push(ph.finalize().into());
+        let b = &buf[..n];
+        let (_, (ph, wr)) = rayon::join(
+            || whole.update(b),
+            || rayon::join(|| <[u8; 32]>::from(Sha256::digest(b)), || out.as_deref_mut().map_or(Ok(()), |f| f.write_all(b))),
+        );
+        wr?;
+        hashes.push(ph);
     }
     Ok((hex(&whole.finalize()), hashes, total))
+}
+
+/// sha256 of a whole file, one pass.
+fn hash_whole(r: &mut dyn Read) -> io::Result<String> {
+    let (mut h, mut buf) = (Sha256::new(), vec![0u8; 1 << 20]);
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            return Ok(hex(&h.finalize()));
+        }
+        h.update(&buf[..n]);
+    }
 }
 
 /// Store a blob in `dir` from a stream (PUT /api/v1/blobs): (sha, size, existed). Never held in memory, never stored twice.
@@ -182,8 +190,21 @@ fn scan(dir: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
         .collect()
 }
 
+/// A killed fetch or upload leaves `<sha>.part` / `.tmp-*` behind and nothing else ever looks at them: delete those untouched for `max_age`.
+pub fn sweep_stale(dir: &Path, max_age: Duration) -> usize {
+    let Ok(rd) = fs::read_dir(dir) else { return 0 };
+    rd.flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            (n.starts_with(".tmp-") || n.ends_with(".part")) && e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|m| m.elapsed().ok()).is_some_and(|a| a > max_age)
+        })
+        .filter(|e| fs::remove_file(e.path()).is_ok())
+        .count()
+}
+
 /// Delete the least recently used blobs until the directory holds at most `limit` bytes; never `keep`.
 pub fn evict(dir: &Path, limit: u64, keep: &[String]) -> Vec<String> {
+    sweep_stale(dir, Duration::from_secs(6 * 3600));
     let mut all = scan(dir);
     let mut total: u64 = all.iter().map(|x| x.1).sum();
     all.sort_by_key(|x| x.2);
@@ -493,12 +514,16 @@ fn pull(f: &mut File, m: &Meta, have: &mut [bool], shared: &Mutex<Vec<bool>>, st
         return Err(other("the source holds a different blob"));
     }
     let mut got = 0;
-    for j in 0..have.len() {
-        let i = (start + j) % have.len();
-        if have[i] {
-            continue;
+    // a window of requests in flight: the source reads and seals the next piece while this side verifies the last
+    let want: Vec<usize> = (0..have.len()).map(|j| (start + j) % have.len()).filter(|i| !have[*i]).collect();
+    let (mut sent, mut done) = (0, 0);
+    while done < want.len() {
+        while sent < want.len() && sent - done < 3 {
+            send_sealed(&mut w, &mut tx, K_REQ, &proto::pack(&[want[sent] as u64]))?;
+            sent += 1;
         }
-        send_sealed(&mut w, &mut tx, K_REQ, &proto::pack(&[i as u64]))?;
+        let i = want[done];
+        done += 1;
         let (k, d) = recv_sealed(&mut r, &mut rx)?;
         if k == K_NOPE {
             continue;
@@ -586,7 +611,7 @@ pub fn fetch(dir: &Path, m: &Meta, srcs: &[Source]) -> io::Result<Got> {
     let from = if peer_bytes * 2 > bytes { "peer" } else { "head" }.to_string();
     f.flush()?;
     f.seek(SeekFrom::Start(0))?;
-    let (sha, _, _) = hash_stream(&mut f, None, m.piece, u64::MAX)?;
+    let sha = hash_whole(&mut f)?;
     if sha != m.sha {
         let _ = fs::remove_file(&part);
         return Err(other("the whole blob does not match its sha256; discarded"));
@@ -1270,6 +1295,7 @@ pub fn head_loop(ctx: Arc<Ctx>) {
 
 /// Above blob_store_gb delete the least recently used blobs that no unfinished job names.
 pub fn gc_store(ctx: &Ctx) -> usize {
+    sweep_stale(&store_dir(), Duration::from_secs(6 * 3600));
     let limit = (crate::tune::get("blob_store_gb") * 1073741824.0) as u64;
     let mut rows = ctx.store.blob_rows();
     let mut total: u64 = rows.iter().map(|r| r.1).sum();
@@ -1554,6 +1580,20 @@ mod tests {
         let (down, up, rtt) = probe(&Source { id, key, ..src }, 2.0).unwrap();
         assert!(down > 0.0 && up > 0.0 && rtt >= 0.0);
         std::env::remove_var("CK_TUNE_BLOB_PEER_FANOUT");
+    }
+
+    #[test]
+    fn stale_part_and_tmp_files_are_swept() {
+        let d = tmp("sweep");
+        let old = |n: &str| {
+            fs::write(d.join(n), b"x").unwrap();
+            OpenOptions::new().append(true).open(d.join(n)).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(7 * 3600)).unwrap();
+        };
+        old(".tmp-abc");
+        old("deadbeef.part");
+        fs::write(d.join("fresh.part"), b"x").unwrap();
+        assert_eq!(sweep_stale(&d, Duration::from_secs(6 * 3600)), 2);
+        assert!(d.join("fresh.part").exists() && !d.join(".tmp-abc").exists());
     }
 
     #[test]

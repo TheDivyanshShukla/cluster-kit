@@ -161,6 +161,12 @@ pub(crate) fn parse_last_head(t: &str) -> Option<(String, u64)> {
     Some((a, w.next().and_then(|e| e.strip_prefix("e=")).and_then(|e| e.parse().ok()).unwrap_or(0)))
 }
 
+/// 2 s after the first failure, doubling to 16 s, times a jitter of 0.75..1.25 (clock nanoseconds mixed with the pid).
+fn reconnect_delay(fails: u32) -> Duration {
+    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) ^ std::process::id().wrapping_mul(2654435761);
+    Duration::from_millis((1000u64 << fails.clamp(1, 4)) * (750 + (n % 500) as u64) / 1000)
+}
+
 fn connect(addr: &str) -> io::Result<TcpStream> {
     let a = addr.to_socket_addrs()?.next().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address"))?;
     TcpStream::connect_timeout(&a, Duration::from_secs(3))
@@ -376,7 +382,9 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
     });
     let mut first = true;
     let unacked = Arc::new(Mutex::new(Unacked::new(0, 0))); // survives reconnects, even to another head
+    let mut fails = 0u32; // consecutive short or failed sessions: reconnect delay doubles (2 s .. 16 s) with jitter, so a restarted head is not hit by every PC at once
     loop {
+        let began = Instant::now();
         // after a restart try the head we knew before waiting for a beacon
         let remembered = if first { std::fs::read_to_string(last_head_path()).ok().and_then(|t| parse_last_head(&t)) } else { None };
         first = false;
@@ -407,7 +415,8 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
             }
             Err(e) => crate::warnl!("agent.unreachable", "cannot reach head {ip}: {e}"),
         }
-        thread::sleep(Duration::from_secs(2));
+        fails = if began.elapsed() > Duration::from_secs(20) { 0 } else { (fails + 1).min(3) };
+        thread::sleep(reconnect_delay(fails));
     }
 }
 
@@ -547,6 +556,8 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     if !SPIN.load(Relaxed) {
         s.set_read_timeout(Some(lost_after()))?;
     }
+    // a head that stops reading (half-open link, full window) must not block a send forever
+    s.set_write_timeout(Some(lost_after().max(Duration::from_secs(10))))?;
     let node_id = match virt {
         Some(i) => format!("{}/v{i}", crate::identity::node_id()),
         None => crate::identity::node_id(),
@@ -621,6 +632,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     let cur: Arc<Mutex<Option<(u64, u64, u64)>>> = Arc::default(); // the chunk this agent computes now
     let (skip_r, unacked_r, cur_r, live_r) = (skip.clone(), unacked.clone(), cur.clone(), live.clone());
     let w_r = w.clone();
+    let sock_r = sock.try_clone()?;
     thread::spawn(move || loop {
         match recv_any(&mut r, &mut mac_r) {
             Ok((CANCEL, p)) => CANCELLED.store(u64_at(&p, 0).unwrap_or(0), Relaxed),
@@ -674,6 +686,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
             }
             Ok(_) => {} // HEARTBEAT and anything unknown
             Err(e) => {
+                let _ = sock_r.shutdown(std::net::Shutdown::Both); // unblocks a send stuck on a dead link
                 let _ = tx.send(Err(e));
                 break;
             }
@@ -863,5 +876,17 @@ mod tests {
             big.add((1, i, i + 1), vec![0; 10]);
         }
         assert_eq!((big.by_seq.len(), big.bytes), (2, 20), "byte bound");
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    #[test]
+    fn reconnect_delay_grows_and_is_bounded() {
+        for f in 0..8 {
+            let d = super::reconnect_delay(f).as_millis();
+            let base = 1000u128 << f.clamp(1, 4);
+            assert!(d >= base * 3 / 4 && d <= base * 5 / 4, "fails {f}: {d} ms");
+        }
     }
 }

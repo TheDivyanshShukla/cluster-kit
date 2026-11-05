@@ -71,10 +71,23 @@ pub fn pick_job(wid: u64, nodes: &[NodeView], jobs: &[JobView], reserves: &[Rese
     if !n.takes_tasks || reserved(nodes, reserves).contains(&n.node_id) {
         return None;
     }
-    let assigned = |id: u64| nodes.iter().filter(|o| o.wid != wid && o.job == Some(id)).count();
-    let user_of = |id: u64| jobs.iter().find(|j| j.id == id).map_or("", |j| j.user.as_str());
-    // SCH-04: nodes (other than this one) working for a user
-    let by_user = |u: &str| nodes.iter().filter(|o| o.wid != wid && o.job.is_some_and(|c| user_of(c) == u)).count();
+    let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for o in nodes.iter().filter(|o| o.wid != wid) {
+        if let Some(c) = o.job {
+            *counts.entry(c).or_default() += 1;
+        }
+    }
+    let busy = counts.values().sum();
+    pick_core(n, jobs, &counts, busy, &|sel| nodes.iter().filter(|o| o.takes_tasks && sel.matches(&o.attrs)).count())
+}
+
+/// pick_job's decision for node `n` (already known to take tasks and not be reserved) from precomputed facts, so the head
+/// can call it without building a NodeView per node: `counts` = nodes other than `n` per job they currently work for,
+/// `busy` = their sum, `share(sel)` = nodes that take tasks and match `sel`. O(jobs), the head's one-pass tallies are O(workers).
+pub fn pick_core(n: &NodeView, jobs: &[JobView], counts: &std::collections::HashMap<u64, usize>, busy: usize, share: &dyn Fn(&Selector) -> usize) -> Option<u64> {
+    let assigned = |id: u64| counts.get(&id).copied().unwrap_or(0);
+    // SCH-04: nodes (other than this one) working for a user; a node on a job that is not in `jobs` counts for user ""
+    let by_user = |u: &str| jobs.iter().filter(|j| j.user == u).map(|j| assigned(j.id)).sum::<usize>() + if u.is_empty() { busy - jobs.iter().map(|j| assigned(j.id)).sum::<usize>() } else { 0 };
     let key = |j: &JobView| (j.priority, by_user(&j.user), assigned(j.id), j.id);
     let elig: Vec<&JobView> = jobs.iter().filter(|j| j.has_work && j.selector.matches(&n.attrs)).collect();
     let best = elig.iter().min_by_key(|j| key(j))?;
@@ -90,7 +103,7 @@ pub fn pick_job(wid: u64, nodes: &[NodeView], jobs: &[JobView], reserves: &[Rese
     }
     // SCH-09: a strictly higher priority job pulls this node away at its chunk boundary, up to its fair share
     // ponytail: fair share = ceil(matching nodes / has-work jobs of that priority); ignores overlap between selectors
-    let share = nodes.iter().filter(|o| o.takes_tasks && best.selector.matches(&o.attrs)).count();
+    let share = share(&best.selector);
     let same = jobs.iter().filter(|j| j.has_work && j.priority == best.priority).count().max(1);
     Some(if assigned(best.id) < share.div_ceil(same) { best.id } else { cur.id })
 }
@@ -324,6 +337,48 @@ pub fn time_rule(attrs: &Attrs, now: Clock, windows: &[WindowView], reservations
 
 #[cfg(test)]
 mod tests {
+
+    /// pick_core (what the head calls) agrees with the original per-node-view algorithm on pseudo-random fleets.
+    #[test]
+    fn pick_core_matches_reference() {
+        fn reference(wid: u64, nodes: &[NodeView], jobs: &[JobView]) -> Option<u64> {
+            let n = nodes.iter().find(|n| n.wid == wid)?;
+            if !n.takes_tasks {
+                return None;
+            }
+            let assigned = |id: u64| nodes.iter().filter(|o| o.wid != wid && o.job == Some(id)).count();
+            let user_of = |id: u64| jobs.iter().find(|j| j.id == id).map_or("", |j| j.user.as_str());
+            let by_user = |u: &str| nodes.iter().filter(|o| o.wid != wid && o.job.is_some_and(|c| user_of(c) == u)).count();
+            let key = |j: &JobView| (j.priority, by_user(&j.user), assigned(j.id), j.id);
+            let elig: Vec<&JobView> = jobs.iter().filter(|j| j.has_work && j.selector.matches(&n.attrs)).collect();
+            let best = elig.iter().min_by_key(|j| key(j))?;
+            let Some(cur) = n.job.and_then(|c| elig.iter().find(|j| j.id == c)) else { return Some(best.id) };
+            if best.id == cur.id {
+                return Some(cur.id);
+            }
+            if best.priority == cur.priority {
+                let (kb, kc) = (key(best), key(cur));
+                let same_user = best.user == cur.user;
+                return Some(if kb.1 < kc.1 || (same_user && kb.2 < kc.2) { best.id } else { cur.id });
+            }
+            let share = nodes.iter().filter(|o| o.takes_tasks && best.selector.matches(&o.attrs)).count();
+            let same = jobs.iter().filter(|j| j.has_work && j.priority == best.priority).count().max(1);
+            Some(if assigned(best.id) < share.div_ceil(same) { best.id } else { cur.id })
+        }
+        let mut x = 12345u64;
+        let mut r = move |m: u64| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (x >> 33) % m
+        };
+        for _ in 0..500 {
+            let nj = 1 + r(5);
+            let jobs: Vec<JobView> = (1..=nj).map(|id| JobView { id, priority: r(3) as u8, selector: Selector::default(), has_work: r(4) != 0, user: ["", "a", "b"][r(3) as usize].into() }).collect();
+            let nodes: Vec<NodeView> = (0..1 + r(12)).map(|w| NodeView { wid: w, node_id: format!("n{w}"), attrs: Default::default(), takes_tasks: r(6) != 0, job: [None, Some(1 + r(7))][r(2) as usize], inflight: 0 }).collect();
+            for n in &nodes {
+                assert_eq!(pick_job(n.wid, &nodes, &jobs, &[]), reference(n.wid, &nodes, &jobs));
+            }
+        }
+    }
     use super::*;
     use crate::select::parse;
 

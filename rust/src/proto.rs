@@ -234,10 +234,13 @@ pub fn fleet_open() -> bool {
 /// direction (the writer only seals, the reader only opens), both built from the node key.
 pub fn send_sealed(s: &mut impl Write, mac: &mut crate::auth::FrameMac, kind: u8, payload: &[u8]) -> io::Result<()> {
     let tag = mac.seal(kind, payload);
-    let mut p = Vec::with_capacity(payload.len() + 40);
+    // one buffer: header, payload, tag (was three copies of a 4 MB piece)
+    let mut p = Vec::with_capacity(payload.len() + 45);
+    p.push(kind);
+    p.extend_from_slice(&((payload.len() + 40) as u32).to_le_bytes());
     p.extend_from_slice(payload);
     p.extend_from_slice(&tag);
-    send(s, kind, &p)
+    s.write_all(&p)
 }
 
 /// Receive and check a sealed frame; a bad, replayed or reordered tag is an error (drop the connection).

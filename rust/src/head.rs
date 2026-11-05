@@ -122,6 +122,7 @@ pub struct State {
     pub policy: Policy,
     pub reserved: BTreeSet<String>, // nodes the reserves keep free now (for the change event)
     pub blocked: usize,             // nodes blocked by time rules at the last refresh (for the change event)
+    pub fleet_cache: HashMap<(u64, u8), (Instant, usize, (usize, f64))>, // take(): fleet() per (job, kind), 100 ms stale at most
     pub rates: HashMap<(String, u8), f64>, // EWMA units/s per (node, kind) from RESULT compute time (SCH-07); survives reconnects
     pub halted: bool,                      // HA-06: a head with a higher epoch exists; dispatch nothing
     pub gated: bool,                       // HA-05: no quorum; dispatch nothing
@@ -552,6 +553,30 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         // per node, ~1 ms at 1,000 nodes, under the State lock, once per result)
         let (w, j) = (&st.workers[&wid], st.jobs.values().next()?);
         (can_work(w) && j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) && j.selector.matches(&w.attrs)).then_some(j.id)?
+    } else if st.policy.reserves.is_empty() {
+        // same answer as the branch below (sched::pick_job), without a NodeView (two Strings + attrs clone) per node:
+        // one pass tallies how many other nodes work for each job, sched::pick_core decides from the tallies
+        let jv: Vec<JobView> = st
+            .jobs
+            .values()
+            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: j.selector.clone(), has_work: j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) && quota_ok(st, j, wid) })
+            .collect();
+        let w = st.workers.get(&wid)?;
+        if !can_work(w) {
+            return None;
+        }
+        let me = NodeView { wid, node_id: String::new(), attrs: w.attrs.clone(), takes_tasks: true, job: w.inflight.last().map(|t| t.0), inflight: w.inflight.len() };
+        let mut counts: HashMap<u64, usize> = HashMap::new();
+        let mut busy = 0;
+        for (i, o) in st.workers.iter() {
+            if *i != wid {
+                if let Some(t) = o.inflight.last() {
+                    *counts.entry(t.0).or_default() += 1;
+                    busy += 1;
+                }
+            }
+        }
+        sched::pick_core(&me, &jv, &counts, busy, &|sel| st.workers.values().filter(|o| can_work(o) && sel.matches(&o.attrs)).count())?
     } else {
         let views = node_views(st);
         let jv: Vec<JobView> = st
@@ -563,9 +588,24 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
     };
     let j = st.jobs.get(&id)?;
     let remaining = j.requeue.iter().map(|r| r.1 - r.0).sum::<u64>() + j.end.saturating_sub(j.next);
-    let (nodes, fleet_rate) = fleet(st, &j.selector, j.kind);
+    let (nodes, fleet_rate) = {
+        // fleet() is O(workers) with a String per node; the EWMA rates it sums move slowly, so reuse it for 100 ms
+        let key = (id, j.kind);
+        match st.fleet_cache.get(&key) {
+            Some((t, n, v)) if *n == st.workers.len() && t.elapsed() < Duration::from_millis(100) => *v,
+            _ => {
+                let v = fleet(st, &j.selector, j.kind);
+                st.fleet_cache.insert(key, (Instant::now(), st.workers.len(), v));
+                v
+            }
+        }
+    };
+    let j = st.jobs.get(&id)?;
     let node_rate = node_rate(st, &st.workers[&wid], j.kind);
-    let min = if j.kind == KIND_LIST { 1 } else { 1_000 };
+    // A PC runs one chunk at a time and splits a list chunk over its threads (kernels::run_list_par), so a chunk smaller
+    // than the PC's thread count leaves threads idle (16 x 0.5 s items on 8 threads took 8 s as 16 chunks of 1). Floor it at
+    // the thread count, but never above this PC's share of what is left, so several PCs still split a small job.
+    let min = if j.kind == KIND_LIST { (st.workers[&wid].threads as u64).min(remaining.div_ceil(nodes.max(1) as u64)).max(1) } else { 1_000 };
     let len = sched::chunk_len(j.policy, j.chunk, j.total, remaining, node_rate, fleet_rate, nodes, min, crate::tune::n("max_chunk")).max(1);
     let j = st.jobs.get_mut(&id)?;
     let (mut a, mut b) = next_chunk(&mut j.requeue, &mut j.next, j.end, len)?;
@@ -902,11 +942,14 @@ fn refresh_soon(ctx: &Arc<Ctx>) {
         return;
     }
     let c = ctx.clone();
-    thread::spawn(move || {
+    let spawned = thread::Builder::new().stack_size(2 << 20).spawn(move || {
         thread::sleep(Duration::from_millis(500));
         PENDING.store(false, Relaxed);
         refresh(&c);
     });
+    if spawned.is_err() {
+        PENDING.store(false, Relaxed); // out of threads: the next call (or the watchdog's 5 s refresh) tries again; do not panic the caller
+    }
 }
 
 /// Rebuild every node's selector attributes, the parsed caps and reserves; send CTRL to agents whose effective cap
@@ -1429,11 +1472,9 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     ctrl_to(&w, tune_msg());
     refresh_soon(&ctx); // attributes and thread cap: coalesced, so a join storm is not O(W^2)
     let (credit, credits) = mpsc::channel();
-    let w2 = w.clone();
     let ctx2 = ctx.clone();
-    let feeder = thread::spawn(move || feed(w, ctx2, wid, credits));
-    let sh3 = sh.clone();
-    thread::spawn(move || heartbeat(w2, &sh3, wid)); // ends when the worker is removed or a send fails
+    // 512 KiB: feed() -> take() / store.items() / serde_json is shallow; threads are the scarce resource at thousands of workers
+    let feeder = thread::Builder::new().stack_size(512 << 10).spawn(move || feed(w, ctx2, wid, credits))?;
     let err = read_results(&mut r, &mut in_mac, &ctx, wid, credit).err();
 
     let mut st = sh.0.lock().unwrap();
@@ -1469,11 +1510,17 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     Ok(())
 }
 
-fn heartbeat(w: Arc<Mutex<Out>>, sh: &Shared, wid: u64) {
+/// One thread for all workers (was one per worker). A worker whose Out is busy is mid-send and needs no heartbeat;
+/// a dead socket is left to the reader (read timeout / reset), which removes the worker.
+/// ponytail: a peer that stops reading while its send buffer is full can stall this thread; add a write timeout then.
+fn heartbeat_all(sh: Shared) {
     loop {
         thread::sleep(heartbeat_every());
-        if !sh.0.lock().unwrap().workers.contains_key(&wid) || w.lock().unwrap().put(HEARTBEAT, &[]).is_err() {
-            return;
+        let outs: Vec<_> = sh.0.lock().unwrap().workers.values().filter_map(|w| w.out.clone()).collect();
+        for o in outs {
+            if let Ok(mut g) = o.try_lock() {
+                let _ = g.put(HEARTBEAT, &[]);
+            }
         }
     }
 }
@@ -1892,6 +1939,8 @@ pub fn run(o: &Opts) {
     });
     let ctx2 = ctx.clone();
     thread::spawn(move || crate::api::serve(ctx2));
+    let shb = ctx.sh.clone();
+    thread::spawn(move || heartbeat_all(shb));
     if !o.no_local {
         let (name, threads) = (o.name.clone(), o.threads);
         let use_gpu = o.gpu;
@@ -1904,7 +1953,7 @@ pub fn run(o: &Opts) {
     for s in l.incoming().flatten() {
         next_conn += 1;
         let (ctx, wid) = (ctx.clone(), next_conn);
-        thread::spawn(move || {
+        let _ = thread::Builder::new().stack_size(2 << 20).spawn(move || {
             let mut s = s;
             let _ = s.set_nodelay(true);
             // nobody has vouched for this connection yet: a hello is small and must arrive soon. Without the limits a

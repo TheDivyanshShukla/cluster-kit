@@ -1,8 +1,77 @@
 # Runs on the PCs as a pushed list-job script: items arrive on stdin (one codec line each), one result line per item
 # goes to stdout. A "PAYLOAD = '...'" line is put in front of this file before it is sent. Stdlib only.
 # ruff: noqa: FA102  (no __future__ import: the SDK puts BATCH/PAYLOAD lines in front of this file, and annotations here are strings)
-import base64, hashlib, json, os, pickle, sys, traceback, types, zlib
-from typing import Any, Callable, Optional  # noqa: F401  (annotations are strings: nothing newer than typing is needed on a PC)
+import hashlib, json, os, sys
+
+
+# ---- fast path (before the heavy imports below: pickle, zlib, typing... cost about 7 ms per process start): a task whose warm worker
+# is already up only needs hashlib/json/os/sys/socket here, hands its stdin to the worker and exits.
+def _code() -> "str":
+    g = globals().get("PAYLOAD")
+    if not g:  # code shipped as a blob: its sha is PAYLOAD_BLOB, the file is in the cache directory
+        with open(os.path.join(os.environ["CK_BLOBS"], PAYLOAD_BLOB)) as f:  # noqa: F821
+            g = f.read()
+    return g
+
+
+def _warm_dir() -> "Optional[str]":
+    import stat
+    if os.name == "nt" or not hasattr(os, "fork") or os.environ.get("CK_WARM") == "off":
+        return None
+    d = os.path.join(os.environ.get("TMPDIR") or "/tmp", "ck-warm-" + str(os.getuid()))
+    try:
+        os.makedirs(d, 0o700, exist_ok=True)
+        st = os.lstat(d)
+        return d if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077 else None
+    except OSError:
+        return None
+
+
+def _warm_client(g: "str", data: "str", real: "Any") -> "tuple[int, Optional[tuple[str, str, str]]]":
+    """Run the items on the warm worker. Returns (result lines delivered, directory to start a worker in or None)."""
+    import socket
+    d = _warm_dir()
+    if d is None:
+        return 0, None
+    key = hashlib.sha256((g + repr(globals().get("BATCH")) + "\0" + sys.executable + "\0" + sys.version).encode()).hexdigest()[:16]
+    sp = os.path.join(d, key + ".s")
+    got = 0
+    try:
+        c = socket.socket(socket.AF_UNIX)
+        try:
+            c.settimeout(5)
+            c.connect(sp)
+            socket.send_fds(c, [json.dumps({"env": dict(os.environ), "cwd": os.getcwd()}).encode()], [2])
+            if c.recv(1) != b"K":
+                raise OSError("worker refused")
+            c.settimeout(None)
+            c.sendall(data.encode("utf-8"))
+            c.shutdown(socket.SHUT_WR)
+            for line in c.makefile("r", encoding="utf-8"):
+                if line.endswith("\n"):  # a torn last line (worker died mid-write) is dropped and redone cold
+                    real.write(line)
+                    got += 1
+            real.flush()
+        finally:
+            c.close()
+        return got, None
+    except Exception:
+        if got:
+            return got, None
+    return 0, (d, sp, key)
+
+
+_PRE = None
+if __name__ == "__main__" and "__file__" in globals() and sys.argv[1:2] != ["--ck-warm"]:
+    _g = _code()
+    _lines = sys.stdin.readlines()
+    _done, _spawn = _warm_client(_g, "".join(_lines), sys.stdout)
+    if _done and _done >= len([x for x in _lines if x.strip()]):
+        os._exit(0)  # everything delivered (and flushed): skip the imports and the interpreter teardown
+    _PRE = (_g, _lines, _done, _spawn)
+
+import base64, pickle, traceback, types, zlib  # noqa: E402
+from typing import Any, Callable, Optional  # noqa: E402, F401  (annotations are evaluated here: typing is needed)
 
 MAGIC = b"CKOBJ1\n"  # first bytes of a blob that holds a pickled object (any other blob is a plain file: you get its path)
 LOCAL = {}  # type: "dict[str, Any]"  # sha -> Handle, for runs on the machine that made the handles
@@ -18,9 +87,20 @@ def _read(path: str) -> Any:
         return _U(f).load()
 
 
+_OBJ = {}  # type: "dict[str, Any]"  # sha -> unpickled object, so a shared 40 MB table is loaded once per process, not per item
+
+
 def blob(sha: str) -> Any:
+    """The object (loaded once per process and shared by every item: treat it as read-only) or the file's local path."""
+    if sha in _OBJ:
+        return _OBJ[sha]
     h = LOCAL.get(sha)
-    return h.local() if h is not None else _read(os.path.join(os.environ["CK_BLOBS"], sha))
+    v = h.local() if h is not None else _read(os.path.join(os.environ["CK_BLOBS"], sha))
+    if not isinstance(v, str):  # a path is cheap to recompute; objects are what cost
+        if len(_OBJ) >= 8:  # ponytail: FIFO of 8 objects; size-aware eviction if jobs pass many big handles
+            _OBJ.pop(next(iter(_OBJ)))
+        _OBJ[sha] = v
+    return v
 
 
 def resolve(x: Any, d: int = 2) -> Any:
@@ -151,19 +231,6 @@ def run(payload: dict[str, Any], lines: Any, out: Any, fn: Optional[Callable[...
 WARM_IDLE_S = 120.0  # exit after this long without a task (env CK_WARM_IDLE_S); CK_WARM=off disables; ponytail: make tunable (warm_idle_s)
 
 
-def _warm_dir() -> Optional[str]:
-    import stat, tempfile
-    if os.name == "nt" or not hasattr(os, "fork") or os.environ.get("CK_WARM") == "off":
-        return None
-    d = os.path.join(tempfile.gettempdir(), "ck-warm-" + str(os.getuid()))
-    try:
-        os.makedirs(d, 0o700, exist_ok=True)
-        st = os.lstat(d)
-        return d if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077 else None
-    except OSError:
-        return None
-
-
 def _peer_uid(c: Any) -> Optional[int]:
     import socket, struct
     try:
@@ -231,46 +298,9 @@ def _warm_worker(sock_path: str) -> None:
                 pass
 
 
-def _code() -> str:
-    g = globals().get("PAYLOAD")
-    if not g:  # code shipped as a blob: its sha is PAYLOAD_BLOB, the file is in the cache directory
-        with open(os.path.join(os.environ["CK_BLOBS"], PAYLOAD_BLOB)) as f:  # noqa: F821
-            g = f.read()
-    return g
-
-
-def _warm_try(g: str, data: str, real: Any) -> int:
-    """Run the items on the warm worker. Returns how many result lines it delivered (0 = nothing, caller runs everything cold)."""
-    import socket, subprocess, shutil
-    d = _warm_dir()
-    if d is None:
-        return 0
-    key = hashlib.sha256((g + repr(globals().get("BATCH")) + "\0" + sys.executable + "\0" + sys.version).encode()).hexdigest()[:16]
-    sp = os.path.join(d, key + ".s")
-    got = 0
-    try:
-        c = socket.socket(socket.AF_UNIX)
-        try:
-            c.settimeout(5)
-            c.connect(sp)
-            socket.send_fds(c, [json.dumps({"env": dict(os.environ), "cwd": os.getcwd()}).encode()], [2])
-            if c.recv(1) != b"K":
-                raise OSError("worker refused")
-            c.settimeout(None)
-            c.sendall(data.encode("utf-8"))
-            c.shutdown(socket.SHUT_WR)
-            for line in c.makefile("r", encoding="utf-8"):
-                if line.endswith("\n"):  # a torn last line (worker died mid-write) is dropped and redone cold
-                    real.write(line)
-                    got += 1
-            real.flush()
-        finally:
-            c.close()
-        return got
-    except Exception:
-        if got:
-            return got
-    # no worker yet (or it is stale): start one for the next task, at most one per key at a time, and run this one cold
+def _warm_spawn(d: str, sp: str, key: str) -> None:
+    """No worker yet (or it is stale): start one for the next task, at most one per key at a time; this task runs cold."""
+    import subprocess, shutil
     try:
         lock = os.path.join(d, key + ".lock")
         try:
@@ -278,7 +308,7 @@ def _warm_try(g: str, data: str, real: Any) -> int:
                 os.unlink(lock)
             os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
         except OSError:
-            return 0
+            return
         if os.path.exists(sp):
             os.unlink(sp)  # stale socket of a dead worker
         script = os.path.join(d, key + ".py")
@@ -287,19 +317,20 @@ def _warm_try(g: str, data: str, real: Any) -> int:
                          start_new_session=True)
     except Exception:
         pass
-    return 0
 
 
 def main() -> None:
     if sys.argv[1:2] == ["--ck-warm"]:
         return _warm_worker(sys.argv[2])
-    g = _code()
+    if _PRE:
+        g, lines, done, spawn = _PRE
+    else:
+        g, lines, done, spawn = _code(), None, 0, None
+        lines = sys.stdin.readlines()
     real, sys.stdout = sys.stdout, sys.stderr  # user print() must not corrupt the result stream
-    lines = sys.stdin.readlines()
-    done = 0
-    if "__file__" in globals():
-        done = _warm_try(g, "".join(lines), real)
     todo = [x for x in lines if x.strip()]
+    if spawn and not done:
+        _warm_spawn(*spawn)
     if done < len(todo):  # the warm worker delivered the first `done` results; everything else runs the plain way
         run(json.loads(zlib.decompress(base64.b64decode(g))), todo[done:], real)
 
