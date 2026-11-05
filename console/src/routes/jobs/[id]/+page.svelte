@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { ArrowLeft, CircleAlert, Clock, Download, FileQuestion, Square } from '@lucide/svelte';
+	import { ArrowLeft, CircleAlert, Clock, Download, FileQuestion, GitCompareArrows, Square } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
+	import type { Breakdown } from '#lib/api/schema.ts';
+	import BreakdownPanel from '#lib/components/BreakdownPanel.svelte';
 	import Page from '#lib/components/Page.svelte';
 	import Panel from '#lib/components/Panel.svelte';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
@@ -54,6 +56,35 @@
 			})
 			.catch((e) => (error = e instanceof ApiError ? { message: e.message, status: e.status } : { message: 'Could not load the job.', status: 0 }))
 			.finally(() => (fetched = true));
+	});
+
+	// Where the time went; a job that never started has none (404).
+	let bd = $state<Breakdown | null>(null);
+	let bdState = $state<'loading' | 'ok' | 'none' | 'error'>('loading');
+	let bdKey = '';
+	$effect(() => {
+		const jid = id, st = job?.state;
+		if (!st || st === 'queued') return void (bdState = 'none');
+		// refetched when the job changes state (running -> done), not on every tick
+		const key = `${jid}|${st}`;
+		if (key === bdKey) return;
+		bdKey = key;
+		if (!bd || bd.job !== jid) ((bd = null), (bdState = 'loading'));
+		api.breakdown(jid)
+			.then((r) => ((bd = r.breakdown), (bdState = 'ok')))
+			.catch((e) => (bdState = e instanceof ApiError && e.status === 404 ? 'none' : 'error'));
+	});
+
+	// while running, every `job` event on the stream refreshes the breakdown (at most once per 2 s)
+	let bdAt = 0;
+	$effect(() => {
+		const jid = id, j = live.jobs[id];
+		if (!j || j.state !== 'running') return;
+		const t = setTimeout(() => {
+			bdAt = Date.now();
+			api.breakdown(jid).then((r) => ((bd = r.breakdown), (bdState = 'ok'))).catch(() => {});
+		}, Math.max(0, 2000 - (Date.now() - bdAt)));
+		return () => clearTimeout(t);
 	});
 
 	// The switch starts on the reducer the job was submitted with.
@@ -129,10 +160,11 @@
 
 <Page
 	title={job ? `#${job.id} ${job.name || 'Untitled job'}` : 'Job'}
-	tabs={[{ id: 'job', label: 'Job' }, { id: 'result', label: 'Result' }]}
-	class="sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]"
+	tabs={[{ id: 'job', label: 'Job' }, { id: 'time', label: 'Time' }, { id: 'result', label: 'Result' }]}
+	class="sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)] sm:grid-rows-[minmax(0,1fr)_minmax(0,1fr)]"
 >
 	{#snippet actions()}
+		{#if job && job.state !== 'queued'}<a href="/compare?jobs={job.id}" class={btnGhost}><GitCompareArrows class="size-4" aria-hidden="true" />Compare with...</a>{/if}
 		{#if job}<StateChip state={job.state} /><PriorityChip priority={job.priority} />{/if}
 		{#if job && canCancel(roleNow(), userNow(), job)}
 			<button type="button" class={btnDanger} onclick={() => (confirmOpen = true)}><Square class="size-4" aria-hidden="true" />Cancel job</button>
@@ -141,9 +173,9 @@
 	{/snippet}
 
 	{#if !job && !fetched}
-		<Panel title="Job" tab="job" class="sm:col-span-2"><div class="bg-raised h-40 animate-pulse rounded-lg" aria-busy="true"></div></Panel>
+		<Panel title="Job" tab="job" class="sm:col-span-2 sm:row-span-2"><div class="bg-raised h-40 animate-pulse rounded-lg" aria-busy="true"></div></Panel>
 	{:else if !job}
-		<Panel title="Job" tab="job" class="sm:col-span-2">
+		<Panel title="Job" tab="job" class="sm:col-span-2 sm:row-span-2">
 			{#if error && error.status !== 404}
 				<EmptyState icon={CircleAlert} title="Could not load this job" body={error.message} />
 			{:else}
@@ -153,7 +185,7 @@
 			{/if}
 		</Panel>
 	{:else}
-		<Panel title="Progress and facts" tab="job">
+		<Panel title="Progress and facts" tab="job" class="sm:row-span-2">
 			{#if cancelError}<p class="text-bad mb-3 flex items-center gap-1.5 text-[13px]" role="alert"><CircleAlert class="size-4 shrink-0" aria-hidden="true" />{cancelError}</p>{/if}
 			{#if job.state === 'failed'}
 				<p class="border-bad text-bad mb-3 flex items-start gap-2 rounded-lg border px-3 py-2.5" role="alert">
@@ -173,6 +205,18 @@
 					</div>
 				{/each}
 			</dl>
+		</Panel>
+
+		<Panel title="Where the time went" tab="time" scroll={false} pad={false}>
+			{#if bdState === 'ok' && bd}
+				<BreakdownPanel b={bd} />
+			{:else if bdState === 'loading'}
+				<div class="bg-raised m-3 h-32 animate-pulse rounded-lg" aria-busy="true"></div>
+			{:else if bdState === 'error'}
+				<p class="text-bad p-4 text-[13px]" role="alert">Could not read the time breakdown.</p>
+			{:else}
+				<p class="text-muted-foreground px-4 py-6 text-center">{job.state === 'queued' ? 'The breakdown appears once the job has started.' : 'This job has no time breakdown.'}</p>
+			{/if}
 		</Panel>
 
 		<Panel title="Result" tab="result">

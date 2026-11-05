@@ -18,7 +18,7 @@ export type Scene = {
 
 export const CELL = 20;
 const PAD = 8;
-const HEAD_H = 104;
+const HEAD_H = 124;
 const GAP = 14;
 const TOP = 22; // lab title strip
 
@@ -112,10 +112,17 @@ export function hitPc(scene: Scene, wx: number, wy: number, slack = 3): Slot | n
 	let best: Slot | null = null, bd = Infinity;
 	for (const s of scene.pcs) {
 		const d = Math.hypot(s.x - wx, s.y - wy);
-		if (d <= s.r + slack && d < bd) {
+		if (Math.max(Math.abs(s.x - wx), Math.abs(s.y - wy)) <= s.r + 2 + slack && d < bd) {
 			best = s;
 			bd = d;
 		}
 	}
 	return best;
+}
+
+/** Scale and offset that fit a world box in a w x h screen box, leaving `top` and `bottom` px free. */
+export function fitBox(b: { x: number; y: number; w: number; h: number }, w: number, h: number, top = 0, bottom = 0, margin = 16, maxK = 10): View {
+	const aw = Math.max(40, w - margin * 2), ah = Math.max(40, h - top - bottom - margin * 2);
+	const k = Math.max(0.05, Math.min(maxK, aw / Math.max(1, b.w), ah / Math.max(1, b.h)));
+	return { k, tx: (w - b.w * k) / 2 - b.x * k, ty: top + margin + (ah - b.h * k) / 2 - b.y * k };
 }

@@ -1367,7 +1367,28 @@ impl<F: FnMut() -> String> Sse<F> {
     }
     fn frame(&mut self, event: &str, data: &str) {
         self.buf = format!("event: {event}\ndata: {data}\n\n").into_bytes();
+        pad_chunk(&mut self.buf);
         self.pos = 0;
+    }
+}
+
+/// tiny_http sends a streamed body through a chunked encoder that holds bytes until 8 KiB have collected, so a small
+/// SSE frame would wait for the next big one (measured 0.2-2.4 s late). Pad every frame with an SSE comment to a whole
+/// number of 8 KiB chunks so it leaves at once. ponytail: ~8 KiB per small event; an async server with explicit
+/// flush would avoid the padding.
+const SSE_CHUNK: usize = 8192;
+
+fn pad_chunk(buf: &mut Vec<u8>) {
+    let rem = buf.len() % SSE_CHUNK;
+    if rem != 0 {
+        let pad = SSE_CHUNK - rem;
+        if pad < 4 {
+            buf.resize(buf.len() + pad, b'\n'); // too small for ":\n\n"; blank lines are ignored by SSE parsers
+        } else {
+            buf.push(b':');
+            buf.resize(buf.len() + pad - 3, b' ');
+            buf.extend_from_slice(b"\n\n");
+        }
     }
 }
 
@@ -1385,6 +1406,7 @@ impl<F: FnMut() -> String> Read for Sse<F> {
             } else if now >= self.next_ping {
                 self.next_ping = now + Duration::from_secs(15);
                 self.buf = b": ping\n\n".to_vec();
+                pad_chunk(&mut self.buf);
                 self.pos = 0;
             } else {
                 match self.rx.recv_timeout(self.next_cluster.min(self.next_ping).saturating_duration_since(now)) {
@@ -1904,13 +1926,19 @@ mod tests {
         let bus = Bus::default();
         let mut s = Sse::new(bus.subscribe(), || "{}".into());
         bus.publish("job", "{\"id\":1}");
-        let mut got = String::new();
-        let mut b = [0u8; 256];
-        let n = s.read(&mut b).unwrap();
-        got.push_str(&String::from_utf8_lossy(&b[..n]));
-        assert!(got.starts_with("event: cluster\ndata: {}"), "{got}");
-        let n = s.read(&mut b).unwrap();
-        assert!(String::from_utf8_lossy(&b[..n]).starts_with("event: job"));
+        // frames are padded to whole 8 KiB chunks (pad_chunk) so each leaves tiny_http at once
+        let mut b = vec![0u8; SSE_CHUNK];
+        let mut read_frame = |s: &mut Sse<_>| {
+            let mut f = vec![];
+            while f.len() < SSE_CHUNK {
+                let n = s.read(&mut b[..SSE_CHUNK - f.len()]).unwrap();
+                f.extend_from_slice(&b[..n]);
+            }
+            String::from_utf8(f).unwrap()
+        };
+        let got = read_frame(&mut s);
+        assert!(got.starts_with("event: cluster\ndata: {}") && got.len() % SSE_CHUNK == 0, "{}", &got[..40]);
+        assert!(read_frame(&mut s).starts_with("event: job"));
         drop(bus);
         let mut rest = vec![];
         let _ = s.read_to_end(&mut rest); // cluster ticks may precede EOF

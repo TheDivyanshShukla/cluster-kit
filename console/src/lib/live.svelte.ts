@@ -4,7 +4,7 @@
 import { api, ApiError } from './api/client';
 import { runningJobs } from './jobs';
 import { failoverStep, noFailover, primaryAddr, type Failover } from './ha';
-import { Cluster, EventRow, HaStatus, JobRow, NodeRow, type HaSettings, type LabRow, type PowerSettings } from './api/schema';
+import { Alert, Cluster, EventRow, HaStatus, JobRow, NodeRow, type HaSettings, type LabRow, type PowerSettings } from './api/schema';
 
 export const live = $state({
 	cluster: null as Cluster | null,
@@ -33,8 +33,11 @@ export const live = $state({
 	handover: null as { to: string; at: number } | null,
 	/** node_id -> when this console first saw it waking (the API has no wake timestamp) */
 	wakeSince: {} as Record<string, number>,
-	powerCfg: null as PowerSettings | null
+	powerCfg: null as PowerSettings | null,
+	/** every alert seen: read at start, then `alert` events (merged by id). Active ones have `active` set. */
+	alerts: [] as Alert[]
 });
+const putAlert = (a: Alert) => (live.alerts = [a, ...live.alerts.filter((x) => x.id !== a.id)].sort((x, y) => y.last_ms - x.last_ms));
 
 function noteWake(n: NodeRow) {
 	if (n.power === 'waking') live.wakeSince[n.node_id] ??= Date.now();
@@ -138,6 +141,7 @@ async function probe() {
 		else live.error = e instanceof ApiError ? e.message : 'Something went wrong reading the head.';
 	}
 	void loadHa();
+	api.alerts().then((r) => r.alerts.forEach(putAlert)).catch(() => {});
 }
 
 function connect() {
@@ -162,6 +166,7 @@ function connect() {
 		live.nodes[n.node_id] = n;
 		noteWake(n);
 	});
+	listen('alert', (v) => Alert.safeParse(v), putAlert);
 	listen('event', (v) => EventRow.safeParse(v), (ev) => {
 		live.events = [ev, ...live.events.filter((x) => x.id !== ev.id)].slice(0, 100);
 		if (ev.kind === 'ha.recruit') {

@@ -52,7 +52,7 @@
 	};
 	const l = new Listing<Item>(spec);
 
-	let sel = $state('');
+	let sel = $state(typeof location === 'undefined' ? '' : (new URLSearchParams(location.search).get('sel') ?? ''));
 	let matched = $state<string[] | null>(null);
 	let selected = $state<string[]>([]);
 	let focus = $state<string | null>(null);
@@ -70,10 +70,10 @@
 		{ key: 'host', label: 'PC', w: 'minmax(96px,1.6fr)', sort: true },
 		{ key: 'state', label: 'State', w: 'minmax(120px,150px)', sort: true },
 		{ key: 'lab', label: 'Lab', w: 'minmax(80px,0.8fr)', sort: true, min: 700 },
-		{ key: 'threads', label: 'Threads', w: '84px', right: true, sort: true, min: 900 },
-		{ key: 'ram', label: 'RAM', w: '84px', right: true, sort: true, min: 900 },
-		{ key: 'cpu', label: 'CPU', w: '68px', right: true, sort: true },
-		{ key: 'rate', label: 'Rate', w: '84px', right: true, sort: true, min: 1100 }
+		{ key: 'threads', label: 'Threads', w: '96px', right: true, sort: true, min: 900 },
+		{ key: 'ram', label: 'RAM', w: '92px', right: true, sort: true, min: 900 },
+		{ key: 'cpu', label: 'CPU', w: '88px', right: true, sort: true },
+		{ key: 'rate', label: 'Rate', w: '104px', right: true, sort: true, min: 1100 }
 	];
 	const cols = $derived<Col[]>([...(canAct ? [{ key: 'sel', label: '', w: '36px' }] : []), ...COLS.filter((c) => vp.w >= (c.min ?? 0))]);
 

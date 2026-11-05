@@ -1,1 +1,0 @@
-import{n as e,r as t}from"./Ntd9Rets.js";import{X as n}from"./px487t6k.js";var r={name:`minus`,size:24,node:[[`path`,{d:`M5 12h14`}]]};r.node;var i=new Set([`$$slots`,`$$events`,`$$legacy`]);function a(a,o){let s=e(o,i);n(a,t(()=>s,{get icon(){return r}}))}export{a as t};

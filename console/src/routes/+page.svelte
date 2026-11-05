@@ -73,7 +73,7 @@
 
 		<Panel title="Live canvas" tab="canvas" label="Live canvas" class="sm:row-start-2" scroll={false} pad={false}>
 			{#snippet actions()}<a href="/live" class="text-primary text-xs hover:underline">Open Live</a>{/snippet}
-			<div class="min-h-0 flex-1 p-1"><LiveCanvas /></div>
+			<div class="min-h-0 flex-1 p-1"><LiveCanvas compact /></div>
 		</Panel>
 
 		<Panel title="Who holds the cluster" tab="head" class="sm:row-start-2 sm:col-start-2">

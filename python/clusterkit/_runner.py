@@ -48,16 +48,25 @@ def apply(mode, fn, x):
     return fn(**x) if mode == "kw" else fn(*x) if mode == "star" else fn(x)
 
 
+def _one(mode, fn, x):
+    try:
+        return ("ok", apply(mode, fn, x))
+    except BaseException:  # one bad item must not lose the others
+        return ("err", traceback.format_exc())
+
+
 def run(payload, lines, out):
     fn = load(payload)
+    batch = payload.get("batch")  # a line is a list of items; its result line is the list of their results
     for line in lines:
         line = line.strip()
         if not line:
             continue
         try:
-            res = ("ok", apply(payload["mode"], fn, dec(line)))
+            x = dec(line)
+            res = [_one(payload["mode"], fn, y) for y in x] if batch else _one(payload["mode"], fn, x)
             s = enc(res)
-        except BaseException:  # one bad item must not lose the others
+        except BaseException:
             s = enc(("err", traceback.format_exc()))
         out.write(s + "\n")
     out.flush()

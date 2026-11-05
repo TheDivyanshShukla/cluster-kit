@@ -9,7 +9,21 @@ export class History {
 	version = 0;
 	private prev = new Map<string, number>();
 	/** Record one snapshot; `tasks` is the chunk-count increase since the previous one, per second. */
-	push(workers: Pick<Worker, 'node_id' | 'id' | 'chunks' | 'busy'>[], t: number) {
+	/** per PC, one sample every ~5 s for the last 30 minutes (the side panel's Activity tab) */
+	perNode = new Map<string, { t: number[]; cpu: number[]; rate: number[] }>();
+	private lastNode = 0;
+	push(workers: (Pick<Worker, 'node_id' | 'id' | 'chunks' | 'busy'> & Partial<Pick<Worker, 'cpu' | 'rate'>>)[], t: number) {
+		if (t - this.lastNode >= 5000) {
+			this.lastNode = t;
+			for (const w of workers) {
+				if (!w.node_id) continue;
+				const s = this.perNode.get(w.node_id) ?? this.perNode.set(w.node_id, { t: [], cpu: [], rate: [] }).get(w.node_id)!;
+				s.t.push(t);
+				s.cpu.push(w.cpu ?? 0);
+				s.rate.push(w.rate ?? 0);
+				if (s.t.length > 360 || s.t[0] < t - SPAN_MS) (s.t.shift(), s.cpu.shift(), s.rate.shift());
+			}
+		}
 		let d = 0, busy = 0;
 		const seen = new Map<string, number>();
 		for (const w of workers) {

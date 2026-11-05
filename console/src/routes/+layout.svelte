@@ -1,15 +1,17 @@
 <script lang="ts">
 	import '../app.css';
 	import { page } from '$app/state';
-	import { CalendarClock, CircleAlert, Gauge, ListChecks, Radio, LogOut, Map as MapIcon, Moon, MonitorPlay, Server, Settings, SlidersHorizontal, Sun, User as UserIcon, Users, WifiOff } from '@lucide/svelte';
+	import { Bell, CalendarClock, CircleAlert, FileText, FlaskConical, Gauge, Search, ListChecks, Radio, LogOut, Map as MapIcon, Moon, MonitorPlay, Server, Settings, SlidersHorizontal, Sun, User as UserIcon, Users, WifiOff } from '@lucide/svelte';
 	import type { LayoutProps } from './$types';
 	import AuthForm from '#lib/components/AuthForm.svelte';
+	import CommandPalette from '#lib/components/CommandPalette.svelte';
 	import EmptyState from '#lib/components/EmptyState.svelte';
 	import HaBanners from '#lib/components/HaBanners.svelte';
 	import { history } from '#lib/canvas/history.ts';
 	import { isStandby, live, startLive } from '#lib/live.svelte.ts';
 	import { atLeast } from '#lib/jobs.ts';
 	import { authed, loadMe, roleNow, session, signOut, userNow } from '#lib/session.svelte.ts';
+	import { palette } from '#lib/palette.svelte.ts';
 	import { btnGhost } from '#lib/ui.ts';
 
 	let { children }: LayoutProps = $props();
@@ -31,11 +33,15 @@
 			{ href: '/jobs', label: 'Jobs', icon: ListChecks, show: true },
 			{ href: '/policies', label: 'Policies', icon: SlidersHorizontal, show: true },
 			{ href: '/events', label: 'Events', icon: CalendarClock, show: true },
+			{ href: '/experiments', label: 'Experiments', icon: FlaskConical, show: true },
+			{ href: '/alerts', label: 'Alerts', icon: Bell, show: true },
+			{ href: '/report', label: 'Report', icon: FileText, show: true },
 			{ href: '/wall', label: 'Wall mode', icon: MonitorPlay, show: true },
 			{ href: '/settings', label: 'System', icon: Settings, show: atLeast(roleNow(), 'operator') },
 			{ href: '/users', label: 'Users', icon: Users, show: atLeast(roleNow(), 'admin') }
 		].filter((n) => n.show)
 	);
+	const nActive = $derived(live.alerts.filter((a) => a.active).length);
 	const isActive = (href: string) => (href === '/' ? page.url.pathname === '/' : page.url.pathname.startsWith(href));
 
 	let dark = $state(
@@ -77,9 +83,12 @@
 	<div class="flex h-dvh flex-col overflow-hidden md:flex-row">
 		<aside class="border-line bg-surface flex shrink-0 items-center gap-1 border-b px-3 py-1.5 md:h-dvh md:w-52 md:flex-col md:items-stretch md:border-r md:border-b-0 md:px-3 md:py-4">
 			<a href="/" class="mr-2 flex items-center gap-2 px-2 font-semibold tracking-tight md:mr-0 md:mb-5" aria-label="Cluster Kit home">
-				<span class="bg-primary size-2.5 shrink-0 rounded-sm" aria-hidden="true"></span><span class="hidden md:inline">Cluster Kit</span>
+				<span class="{live.link === 'live' ? 'bg-primary' : 'bg-warn'} size-2.5 shrink-0 rounded-sm" aria-hidden="true" title={live.link === 'live' ? 'Live' : 'Reconnecting…'}></span><span class="hidden md:inline">Cluster Kit</span>
 			</a>
-			<nav class="flex min-w-0 gap-0.5 overflow-x-auto md:flex-col md:gap-1 md:overflow-visible" aria-label="Main">
+			<button type="button" onclick={() => (palette.open = true)} class="text-muted-foreground hover:bg-raised hover:text-foreground border-line flex shrink-0 items-center gap-2 rounded-lg border px-2 py-2 text-[13px] md:mb-2 md:px-2.5 md:py-1.5" aria-label="Search and commands" aria-keyshortcuts="Control+K Meta+K">
+				<Search class="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span class="hidden md:inline">Search</span><kbd class="border-line ml-auto hidden rounded border px-1 text-[11px] md:inline">Ctrl K</kbd>
+			</button>
+			<nav class="thin relative flex min-w-0 gap-0.5 overflow-x-auto md:flex-col md:gap-1 md:overflow-visible" aria-label="Main">
 				{#each nav as item (item.href)}
 					{@const active = isActive(item.href)}
 					<a
@@ -90,7 +99,7 @@
 							? 'bg-raised text-foreground font-medium'
 							: 'text-muted-foreground hover:bg-raised hover:text-foreground'}"
 					>
-						<item.icon class="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span class="max-md:sr-only">{item.label}</span>
+						<item.icon class="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span class="max-md:sr-only">{item.label}</span>{#if item.href === '/alerts' && nActive > 0}<span class="bg-bad text-primary-foreground num ml-auto rounded-full px-1.5 text-[11px] max-md:absolute max-md:hidden" aria-label="{nActive} active alerts">{nActive}</span>{/if}
 					</a>
 				{/each}
 			</nav>
@@ -99,7 +108,7 @@
 					{#if live.link === 'reconnecting'}
 						<span class="text-warn inline-flex items-center gap-1"><WifiOff class="size-3.5" aria-hidden="true" />Reconnecting…</span>
 					{:else}
-						<span class="num">{online}</span> PC{online === 1 ? '' : 's'} connected
+						<span class="text-ok mr-1.5 inline-flex items-center gap-1" title="Live: updates stream in as they happen"><span class="bg-ok inline-block size-1.5 rounded-full motion-safe:animate-pulse" aria-hidden="true"></span>Live</span><span class="num">{online}</span> PC{online === 1 ? '' : 's'} connected
 					{/if}
 				</p>
 				<button
@@ -142,6 +151,8 @@
 		</main>
 	</div>
 {/if}
+
+{#if authed()}<CommandPalette />{/if}
 
 <!-- the page never scrolls: panels do (docs/DESIGN.md section 8) -->
 <style>

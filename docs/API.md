@@ -183,3 +183,31 @@ PowerSettings `{"mode": "off"|"eco", "idle_min": 15, "keep_awake": 4, "wake_on_d
 Tunable = `{"key", "group", "value", "default", "min", "max", "unit", "scope": "head"|"agent"|"both", "help", "source": "default"|"db"|"env"|"head"}`. A value set by env `CK_TUNE_<KEY>` wins over the database and shows `source: "env"` (the console shows it read-only).
 
 Candidate = `{"node_id", "host", "lab": name or null, "score": 0-100, "parts": {"speed", "memory", "stability", "free"} (each 0-1), "role": "head"|"standby"|"candidate", "eligible": bool, "why": "" or the reason it cannot be a standby (virtual, not connected, not active, no selector match)}`. Score = `sched::head_score` with the weights head_w_*; inputs: calibration MH/s, cores, RAM, `node.lost` events in the last 24 h, presence. HA-10 recruiting takes the best eligible candidate in a lab without a standby (any lab if all have one); the planned switchover target in the console defaults to the best standby.
+
+## Research features (wave 12): time breakdown, alerts, experiments, daily report
+
+| Method and path | Role | Body | Reply |
+| --- | --- | --- | --- |
+| GET `/api/v1/jobs/{id}/breakdown` | viewer | | `{"breakdown": Breakdown}` |
+| GET `/api/v1/alerts` | viewer | `?active=1` | `{"alerts": [Alert]}` newest first |
+| POST `/api/v1/alerts/{id}/ack` | operator | | `{"alert": Alert}` |
+| POST `/api/v1/experiments` | researcher | `{"name", "raw_csv": text, "runs_jsonl": text, "sim": optional JSON}` (the files scripts/experiment.py writes; max 16 MB) | `{"experiment": ExperimentRow}` |
+| GET `/api/v1/experiments` | viewer | | `{"experiments": [ExperimentRow]}` (no file bodies) |
+| GET `/api/v1/experiments/{id}` | viewer | | `{"experiment": ExperimentRow, "raw_csv", "runs_jsonl", "sim"}` |
+| GET `/api/v1/report?day=YYYY-MM-DD` | viewer | | `{"report": DayReport}` (local day, CK_TZ_OFFSET_MIN) |
+
+Breakdown = `{"job", "wall_s", "pc_seconds": {"compute", "dispatch_wait", "tail_idle", "recompute", "failover_pause", "other"}, "per_pc": [{"node_id", "host", "chunks", "numbers", "rate", "busy_s"}], "chunk_s": {"p50", "p90", "max"}, "stragglers": [node_id], "efficiency": 0-1}`. pc_seconds splits (number of PCs that held the job) x wall time: compute = the sum of chunk compute times; dispatch_wait = time a PC was idle with no chunk while the job still had unassigned work; tail_idle = idle while only in-flight work remained; recompute = compute spent on chunks later discarded (lost PC, losing speculative copy); failover_pause = wall time when no head dispatched, x PCs; other = the remainder (never negative).
+
+Alert = `{"id", "kind": "slow_pc"|"flaky_pc"|"head_hot"|"standby_behind"|"reserve_at_risk"|"no_standby", "severity": "info"|"warn"|"bad", "node_id" or null, "detail", "since_ms", "last_ms", "active": bool, "acked_by" or null}`. Rules (thresholds are tunables, group "Alerts"):
+- slow_pc: rate below fleet median − alert_slow_mad x MAD for alert_slow_min_s;
+- flaky_pc: more than alert_flaky_losses node.lost in 24 h;
+- head_hot: head CPU above alert_head_cpu_pct for 60 s;
+- standby_behind: lag above alert_standby_lag changes for 30 s;
+- reserve_at_risk: a reserve holds fewer PCs than asked;
+- no_standby: fewer standbys than target for alert_no_standby_s.
+
+An alert opens (event `alert.open`), stays active while the condition holds, closes (event `alert.close`) after it clears for 60 s, and is never duplicated while active. SSE event `alert` sends an Alert whenever one changes.
+
+ExperimentRow = `{"id", "name", "submitter", "created_ms", "configs", "repeats", "virtual": bool, "commit", "pcs_max"}` (parsed from the uploaded files).
+
+DayReport = `{"day", "throughput_peak", "throughput_mean", "work_done": {"numbers", "items", "jobs_done", "jobs_failed"}, "pcs": {"seen", "max_online", "mean_online"}, "failures": {"pcs_lost", "recovered_chunks", "head_failovers"}, "energy_kwh" or null, "busy_share", "top_jobs": [{"id", "name", "pc_hours"}], "alerts": n}`, built from the store (jobs, parts, events) and per-minute samples the head keeps for 48 h (new table `samples`: ts_ms, online, busy, rate, energy_j).

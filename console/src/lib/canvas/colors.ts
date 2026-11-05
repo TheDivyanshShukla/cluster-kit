@@ -21,10 +21,11 @@ export function readTokens(host: HTMLElement): Tokens {
 	return t;
 }
 
-const BASE_HUE = 195; // the console's accent hue; job hues rotate around it
-/** Slot 0 is the primary colour, 1..7 rotate its hue, -1 (more than 8 jobs) is grey. */
+/** Okabe-Ito order (colour-blind safe): orange, sky blue, bluish green, yellow, blue, vermillion, reddish purple. Slot 0 is the console's primary. */
+export const OKABE = ['#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7'] as const;
+/** Slot 0 is the primary colour, 1..7 the Okabe-Ito hues, -1 (more than 8 jobs) is grey. */
 export function jobColor(t: Pick<Tokens, 'primary' | 'idle' | 'dark'>, slot: number): string {
 	if (slot < 0) return t.idle;
 	if (slot === 0) return t.primary;
-	return `oklch(${t.dark ? 0.74 : 0.52} 0.11 ${(BASE_HUE + slot * 47) % 360})`;
+	return OKABE[(slot - 1) % OKABE.length];
 }

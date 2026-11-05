@@ -1,13 +1,12 @@
 <script lang="ts">
 	import { Activity, ArrowRightLeft, Crown, ListChecks, Moon, Plug, Sunrise, UserPlus, User as UserIcon, WifiOff, X, Wrench } from '@lucide/svelte';
-	import type { Component } from 'svelte';
+	import { untrack, type Component } from 'svelte';
 	import { api } from '#lib/api/client.ts';
 	import type { EventRow } from '#lib/api/schema.ts';
 	import { hostIndex, idsIn, railKind, railText, type RailKey, type Tone } from '#lib/canvas/effects.ts';
 	import { CLS_WORDS } from '#lib/canvas/state.ts';
 	import LiveCanvas from '#lib/components/LiveCanvas.svelte';
-	import NodeActions from '#lib/components/NodeActions.svelte';
-	import NodeStateChip from '#lib/components/NodeStateChip.svelte';
+	import PcPanel from '#lib/components/PcPanel.svelte';
 	import TimelineScrubber from '#lib/components/TimelineScrubber.svelte';
 	import { rate } from '#lib/format.ts';
 	import { mergeRows } from '#lib/jobs.ts';
@@ -15,10 +14,15 @@
 	import Page from '#lib/components/Page.svelte';
 	import Panel from '#lib/components/Panel.svelte';
 	import { field } from '#lib/ui.ts';
+	import { params, patchQuery } from '#lib/urlstate.svelte.ts';
 
-	let filter = $state('');
+	let filter = $state(params().get('filter') ?? '');
 	let replayAt = $state<number | null>(null);
-	let pinned = $state<string | null>(null);
+	let pinned = $state<string | null>(params().get('sel'));
+	$effect(() => {
+		const sel = pinned;
+		untrack(() => patchQuery((p) => (sel ? p.set('sel', sel) : p.delete('sel'))));
+	});
 	let matched = $state<[number, number]>([0, 0]);
 	let canvasRef = $state<LiveCanvas>();
 
@@ -50,8 +54,6 @@
 		if (ids[0]) pinned = ids[0];
 	}
 	const node = $derived(pinned ? live.nodes[pinned] : undefined);
-	const worker = $derived(live.cluster?.workers.find((w) => w.node_id === pinned));
-	const recent = $derived(pinned ? all.filter((e) => idsIn(e, hosts).includes(pinned!)).slice(0, 6) : []);
 </script>
 
 <Page
@@ -69,7 +71,7 @@
 	{/snippet}
 
 	<Panel title="Canvas" tab="canvas" label="Live canvas" scroll={false} pad={false} class="sm:row-start-1">
-		<div class="min-h-0 flex-1 p-1"><LiveCanvas bind:this={canvasRef} {filter} {replayAt} replayEvents={all} onpick={(id) => (pinned = id)} onmatch={(a, b) => (matched = [a, b])} /></div>
+		<div class="min-h-0 flex-1 p-1"><LiveCanvas bind:this={canvasRef} urlState selected={pinned} {filter} {replayAt} replayEvents={all} onpick={(id) => (pinned = id)} onmatch={(a, b) => (matched = [a, b])} /></div>
 	</Panel>
 
 	<Panel title="Timeline" tab="timeline" scroll={false} class="sm:row-start-2">
@@ -94,19 +96,9 @@
 				{/each}
 			</ul>
 		</Panel>
-		{#if node}
-			<Panel title={node.host} tab="canvas" label="Selected PC" scroll={false} class="sm:max-h-[55%] sm:shrink-0">
-				{#snippet actions()}
-					<NodeStateChip state={node.state} online={node.online} power={node.power} id={node.node_id} />
-					<button type="button" class="text-muted-foreground hover:text-foreground inline-flex size-8 items-center justify-center" aria-label="Close" onclick={() => (pinned = null)}><X class="size-4" aria-hidden="true" /></button>
-				{/snippet}
-				<div class="thin max-h-[40dvh] min-h-0 overflow-auto">
-					<p class="text-muted-foreground text-xs">{live.labs.find((l) => l.id === node.lab_id)?.name ?? 'no lab'}{worker?.rate ? ` · ${rate(worker.rate)}` : ''}</p>
-					{#if recent.length}
-						<ul class="text-muted-foreground mt-2 space-y-0.5 text-xs">{#each recent as e (e.id)}<li class="truncate"><span class="num">{stamp(e.ts_ms)}</span> {railText(e)}</li>{/each}</ul>
-					{:else}<p class="text-muted-foreground mt-2 text-xs">No recent events for this PC.</p>{/if}
-					{#if replayAt == null}<div class="mt-3"><NodeActions ids={[node.node_id]} ondone={() => (pinned = null)} /></div>{/if}
-				</div>
+		{#if pinned}
+			<Panel title={node?.host ?? pinned} tab="canvas" label="Selected PC" scroll={false} pad={false} class="sm:max-h-[58%] sm:shrink-0 max-sm:min-h-72">
+				<PcPanel id={pinned} events={all} readonly={replayAt != null} onclose={() => (pinned = null)} />
 			</Panel>
 		{/if}
 	</div>

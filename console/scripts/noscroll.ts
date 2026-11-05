@@ -7,9 +7,9 @@ const { chromium } = (await import(process.env.PW ?? `${process.env.HOME}/.atlas
 
 const BASE = process.env.BASE ?? 'http://localhost:5180';
 const SHOTS = process.env.SHOTS;
-const PAGES = ['/', '/nodes', '/map', '/live', '/jobs', '/jobs/8', '/jobs/new', '/events', '/events?view=logs', '/policies', '/settings', '/users', '/wall'];
+const PAGES = ['/', '/nodes', '/map', '/live', '/jobs', '/jobs/8', '/experiments', '/experiments/1', '/compare?jobs=1,4', '/alerts', '/report', '/jobs/new', '/events', '/events?view=logs', '/policies', '/settings', '/users', '/wall'];
 const SIZES = [[1440, 900], [1024, 768], [390, 844]] as const;
-const shotNames: Record<string, string> = { '/': 'overview', '/nodes': 'nodes', '/jobs': 'jobs', '/events': 'events', '/events?view=logs': 'logs', '/settings': 'system' };
+const shotNames: Record<string, string> = { '/': 'overview', '/nodes': 'nodes', '/jobs': 'jobs', '/events': 'events', '/events?view=logs': 'logs', '/settings': 'system', '/experiments': 'experiments', '/experiments/1': 'experiment', '/compare?jobs=1,4': 'compare', '/alerts': 'alerts', '/report': 'report', '/jobs/8': 'job' };
 
 // the cached browser may be a newer build than this playwright expects: CHROME=<path> overrides
 const cache = `${process.env.HOME}/Library/Caches/ms-playwright`;

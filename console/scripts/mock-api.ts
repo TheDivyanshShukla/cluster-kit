@@ -2,6 +2,7 @@
 //   MOCK_AUTH=open (default) | required | bootstrap     bun run scripts/mock-api.ts
 // Then: CK_DASH=7942 bun run dev -- --port 5174. Logins in "required" mode: admin / adminadminadmin.
 // Fake data only; it serves nothing but /api/v1/* and /stats.
+import { research } from './mock-research.ts';
 type Role = 'viewer' | 'researcher' | 'operator' | 'admin';
 const RANK: Record<Role, number> = { viewer: 0, researcher: 1, operator: 2, admin: 3 };
 const PORT = Number(process.env.MOCK_PORT ?? 7942);
@@ -879,6 +880,10 @@ async function handle(req: Request): Promise<Response> {
 			cancel() { subs.delete(send); timers.forEach(clearInterval); }
 		});
 		return new Response(stream, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' } });
+	}
+	if (p.startsWith('/api/v1/')) {
+	const r = await research({ p, m, url, me, RANK, json, err, body, jobs, workers, now, subs });
+	if (r) return r;
 	}
 	return err(404, 'not_found', `No route ${m} ${p}.`);
 }

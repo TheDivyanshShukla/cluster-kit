@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { fitView, hitPc, layoutScene, type LabIn, type PcIn } from './layout';
+import { fitBox, fitView, hitPc, layoutScene, type LabIn, type PcIn } from './layout';
 
 const labs: LabIn[] = [{ id: 1, name: 'A', w: 6, h: 4 }, { id: 2, name: 'B', w: 5, h: 3 }];
 const pc = (id: string, lab: number | null = null, x: number | null = null, y: number | null = null): PcIn => ({ id, lab_id: lab, x, y, threads: 8 });
@@ -47,4 +47,11 @@ test('fitView keeps the scene inside the box; hitPc finds the nearest', () => {
 	const a = s.pcs[0];
 	expect(hitPc(s, a.x + 1, a.y)?.id).toBe('a');
 	expect(hitPc(s, a.x + 200, a.y + 200)).toBeNull();
+});
+
+test('fitBox centres the box between the free margins', () => {
+	const v = fitBox({ x: 100, y: 50, w: 200, h: 100 }, 400, 300, 40, 20, 0, 10);
+	expect(v.k).toBe(2);
+	expect(100 * v.k + v.tx + (200 * v.k) / 2).toBeCloseTo(200);
+	expect(50 * v.k + v.ty + (100 * v.k) / 2).toBeCloseTo(40 + (300 - 60) / 2);
 });

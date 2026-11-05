@@ -4,8 +4,10 @@ import type { EventRow, HaStatus, JobRow, LabRow, NodeRow, Worker } from '../api
 import { toItems } from '../map';
 import { effectFor, hostIndex, schedule, type HostIndex, type Live, type Tone } from './effects';
 import { jobColor, readTokens, type Tokens } from './colors';
+import { heat, layerValue, lodOf, type Layer, type Lod } from './layers';
+import { rate as fmtRate } from '../format';
 import { drawGlyph } from './glyphs';
-import { fitView, hitPc, layoutScene, toWorld, type PcIn, type Scene, type View } from './layout';
+import { fitBox, fitView, hitPc, layoutScene, toWorld, type PcIn, type Scene, type View } from './layout';
 import { Particles, planParticles } from './particles';
 import type { NodeSnap } from './replay';
 import { attrsOf, classOf, CLASSES, jobSlots, makeJobFinder, type Cls } from './state';
@@ -23,8 +25,12 @@ export type Input = {
 	overrides: Record<string, NodeSnap> | null;
 	/** node id of the head once a promotion told us (else the head is just "HEAD") */
 	headId: string | null;
+	/** node_id -> losses in 24 h (Reliability layer) and head score 0-100 (Head fitness layer) */
+	losses?: Record<string, number>;
+	scores?: Record<string, number>;
 };
-type Group = { cls: Cls; slot: number; dim: boolean; idx: number[] };
+type Group = { cls: Cls; fill: string; a: number; dim: boolean; idx: number[] };
+export type LabStat = { busy: number; awake: number; total: number; rate: number; share: number };
 const TAU = Math.PI * 2;
 const ease = (u: number) => 1 - (1 - u) ** 3;
 
@@ -34,8 +40,27 @@ export class LiveEngine {
 	scene: Scene = layoutScene([], []);
 	view: View = { k: 1, tx: 0, ty: 0 };
 	userView = false;
-	/** screen px kept free at the bottom for the legend */
+	/** screen px kept free at the bottom for the legend and at the top for the toolbar */
 	padBottom = 0;
+	padTop = 0;
+	layer: Layer = 'status';
+	selected: string | null = null;
+	follow: number | null = null;
+	bundles = false;
+	lod: Lod = 'square';
+	labStats = new Map<number, LabStat>();
+	maxRate = 0;
+	maxLoss = 0;
+	/** called after the user (or fit/follow) changed the view */
+	onview: (() => void) | null = null;
+	cpu = new Float32Array(0);
+	ram = new Float32Array(0);
+	rateOf = new Float32Array(0);
+	loss = new Uint16Array(0);
+	score = new Float32Array(0);
+	mini: { x: number; y: number; w: number; h: number; s: number } | null = null;
+	private jobNames = new Map<number, string>();
+	private hostOfI: string[] = [];
 	w = 300;
 	h = 200;
 	dpr = 1;
@@ -81,6 +106,7 @@ export class LiveEngine {
 	}
 	retheme(host: HTMLElement) {
 		this.tokens = readTokens(host);
+		if (this.cls.length) this.buildGroups();
 		this.dirty = true;
 	}
 	resize(w: number, h: number, dpr: number) {
@@ -94,29 +120,97 @@ export class LiveEngine {
 	}
 	resetView() {
 		this.userView = false;
+		this.follow = null;
 		this.view = this.fit();
 		this.dirty = true;
+		this.onview?.();
 	}
 	private fit() {
-		return fitView(this.scene, this.w, Math.max(60, this.h - this.padBottom));
+		const v = fitView(this.scene, this.w, Math.max(60, this.h - this.padBottom - this.padTop));
+		return { ...v, ty: v.ty + this.padTop };
 	}
-	setPad(px: number) {
-		if (px === this.padBottom) return;
-		this.padBottom = px;
+	setPad(bottom: number, top = this.padTop) {
+		if (bottom === this.padBottom && top === this.padTop) return;
+		this.padBottom = bottom;
+		this.padTop = top;
 		if (!this.userView) this.view = this.fit();
 		this.dirty = true;
 	}
 	zoomAt(sx: number, sy: number, f: number) {
-		const k = Math.min(8, Math.max(0.1, this.view.k * f));
+		const k = Math.min(10, Math.max(0.1, this.view.k * f));
 		const wp = toWorld(this.view, sx, sy);
 		this.view = { k, tx: sx - wp.x * k, ty: sy - wp.y * k };
-		this.userView = true;
-		this.dirty = true;
+		this.touch();
 	}
 	panBy(dx: number, dy: number) {
 		this.view = { ...this.view, tx: this.view.tx + dx, ty: this.view.ty + dy };
+		this.touch();
+	}
+	private touch() {
+		this.userView = true;
+		this.follow = null;
+		this.dirty = true;
+		this.onview?.();
+	}
+	/** world point at the middle of the free canvas area */
+	centre() {
+		return toWorld(this.view, this.w / 2, this.padTop + (this.h - this.padTop - this.padBottom) / 2);
+	}
+	setView(k: number, cx: number, cy: number) {
+		this.view = { k, tx: this.w / 2 - cx * k, ty: this.padTop + (this.h - this.padTop - this.padBottom) / 2 - cy * k };
 		this.userView = true;
 		this.dirty = true;
+	}
+	centerOn(wx: number, wy: number) {
+		this.setView(this.view.k, wx, wy);
+		this.touch();
+	}
+	fitLab(id: number) {
+		const l = this.scene.labs.find((x) => x.id === id);
+		if (!l) return;
+		this.view = fitBox(l, this.w, this.h, this.padTop, this.padBottom);
+		this.touch();
+	}
+	setFollow(job: number | null) {
+		this.follow = job;
+		if (job != null) this.followFit();
+		else this.dirty = true;
+	}
+	private followFit() {
+		let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+		for (let i = 0; i < this.jobOf.length; i++) {
+			if (this.jobOf[i] !== this.follow) continue;
+			const s = this.scene.pcs[i];
+			x0 = Math.min(x0, s.x - 12); y0 = Math.min(y0, s.y - 12); x1 = Math.max(x1, s.x + 12); y1 = Math.max(y1, s.y + 12);
+		}
+		if (x1 < x0) return;
+		this.view = fitBox({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, this.w, this.h, this.padTop, this.padBottom, 16, 4);
+		this.userView = true;
+		this.dirty = true;
+		this.onview?.();
+	}
+	setLayer(l: Layer) {
+		if (l === this.layer) return;
+		this.layer = l;
+		this.buildGroups();
+		this.dirty = true;
+	}
+	setSelected(id: string | null) {
+		this.selected = id;
+		this.dirty = true;
+	}
+	/** minimap click: the world point under it, or null when the click is elsewhere */
+	miniAt(sx: number, sy: number): { x: number; y: number } | null {
+		const m = this.mini;
+		if (!m || sx < m.x || sx > m.x + m.w || sy < m.y || sy > m.y + m.h) return null;
+		return { x: (sx - m.x) / m.s, y: (sy - m.y) / m.s };
+	}
+	/** per-PC numbers for the tooltip and the side panel */
+	metricsOf(id: string) {
+		const i = this.scene.index.get(id);
+		if (i == null) return null;
+		const f = (v: number) => (Number.isNaN(v) ? null : v);
+		return { cls: this.cls[i], job: this.jobOf[i], cpu: f(this.cpu[i]), ram: f(this.ram[i]), rate: f(this.rateOf[i]), losses: this.loss[i], score: f(this.score[i]) };
 	}
 	/** PC id under a screen point. */
 	hit(sx: number, sy: number): string | null {
@@ -159,6 +253,16 @@ export class LiveEngine {
 		this.jobOf = new Array(n).fill(null);
 		const attrs: Attrs[] = new Array(n);
 		this.counts = { busy: 0, idle: 0, use: 0, cord: 0, asleep: 0, waking: 0, lost: 0 };
+		this.cpu = new Float32Array(n).fill(NaN);
+		this.ram = new Float32Array(n).fill(NaN);
+		this.rateOf = new Float32Array(n).fill(NaN);
+		this.loss = new Uint16Array(n);
+		this.score = new Float32Array(n).fill(NaN);
+		this.hostOfI = new Array(n);
+		this.jobNames = new Map(inp.jobs.map((j) => [j.id, j.name]));
+		this.maxRate = 0;
+		this.maxLoss = 0;
+		const labs = new Map<number, LabStat>();
 		for (const { node, w } of items) {
 			const i = this.scene.index.get(node.node_id)!;
 			const o = inp.overrides?.[node.node_id];
@@ -170,10 +274,30 @@ export class LiveEngine {
 			if (c === 'busy') this.jobOf[i] = finder(a);
 			a.job = this.jobOf[i] == null ? undefined : String(this.jobOf[i]);
 			attrs[i] = a;
+			this.hostOfI[i] = node.host;
+			if (w && !this.replay) {
+				this.cpu[i] = w.cpu;
+				this.ram[i] = w.mem_total > 0 ? (w.mem_used / w.mem_total) * 100 : NaN;
+				this.rateOf[i] = w.rate;
+				this.maxRate = Math.max(this.maxRate, w.rate);
+			}
+			this.loss[i] = inp.losses?.[node.node_id] ?? 0;
+			this.maxLoss = Math.max(this.maxLoss, this.loss[i]);
+			const sc = inp.scores?.[node.node_id];
+			if (sc != null) this.score[i] = sc;
+			const ls = labs.get(this.scene.pcs[i].lab) ?? labs.set(this.scene.pcs[i].lab, { busy: 0, awake: 0, total: 0, rate: 0, share: 0 }).get(this.scene.pcs[i].lab)!;
+			ls.total++;
+			if (c === 'busy') ls.busy++;
+			if (c !== 'asleep' && c !== 'lost' && c !== 'waking') ls.awake++;
+			if (!Number.isNaN(this.rateOf[i])) ls.rate += this.rateOf[i];
 		}
+		const sum = [...labs.values()].reduce((a, l) => a + l.rate, 0);
+		for (const l of labs.values()) l.share = sum > 0 ? l.rate / sum : 0;
+		this.labStats = labs;
 		this.dim = new Uint8Array(n);
 		if (inp.filter) for (let i = 0; i < n; i++) this.dim[i] = inp.filter(attrs[i]) ? 0 : 1;
 		this.buildGroups();
+		if (this.follow != null && !this.replay) this.followFit();
 		this.setHa(inp, now);
 		if (!this.replay) this.ingestChunks(inp.workers, now);
 		else this.particles.clear();
@@ -183,16 +307,36 @@ export class LiveEngine {
 	get matched() {
 		return this.dim.length - this.dim.reduce((a, d) => a + d, 0);
 	}
+	/** fill colour and alpha of PC i for the active layer */
+	private paint(i: number): { fill: string; a: number } {
+		const T = this.tokens, c = this.cls[i];
+		if (c === 'lost') return { fill: T.bad, a: 1 };
+		if (c === 'asleep') return { fill: T.idle, a: 0.35 };
+		if (c === 'waking') return { fill: T.warn, a: 0.5 };
+		switch (this.layer) {
+			case 'status': return c === 'busy' ? { fill: T.primary, a: 1 } : { fill: T.surface, a: 1 };
+			case 'power': return { fill: T.ok, a: 0.85 };
+			case 'job': {
+				const j = this.jobOf[i];
+				return c === 'busy' ? { fill: jobColor(T, j == null ? -1 : (this.jobIds.get(j) ?? -1)), a: 1 } : { fill: T.surface, a: 1 };
+			}
+			default: {
+				const f = (v: number) => (Number.isNaN(v) ? null : v);
+				const v = layerValue(this.layer, { cpu: f(this.cpu[i]), rate: f(this.rateOf[i]), losses: this.loss[i], score: f(this.score[i]) }, { rate: this.maxRate, losses: this.maxLoss });
+				return v == null ? { fill: T.idle, a: 0.25 } : { fill: heat(v), a: 1 };
+			}
+		}
+	}
 	private buildGroups() {
 		const m = new Map<string, Group>();
 		for (let i = 0; i < this.cls.length; i++) {
 			const cls = this.cls[i];
-			const slot = cls === 'busy' ? (this.jobOf[i] == null ? -1 : (this.jobIds.get(this.jobOf[i]!) ?? -1)) : 0;
 			const dim = this.dim[i] === 1;
-			const key = `${cls}|${slot}|${dim}`;
-			(m.get(key) ?? m.set(key, { cls, slot, dim, idx: [] }).get(key)!).idx.push(i);
+			const { fill, a } = this.paint(i);
+			const key = `${cls}|${fill}|${a}|${dim}`;
+			(m.get(key) ?? m.set(key, { cls, fill, a, dim, idx: [] }).get(key)!).idx.push(i);
 		}
-		this.groups = [...m.values()].sort((a, b) => CLASSES.indexOf(a.cls) - CLASSES.indexOf(b.cls));
+		this.groups = [...m.values()];
 	}
 
 	private ingestChunks(workers: Worker[], now: number) {
@@ -291,7 +435,8 @@ export class LiveEngine {
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 		ctx.clearRect(0, 0, this.w, this.h);
 		ctx.setTransform(dpr * v.k, 0, 0, dpr * v.k, dpr * v.tx, dpr * v.ty);
-		// lab regions
+		this.lod = this.huge ? 'point' : lodOf(18 * v.k);
+		// lab regions with a header strip
 		ctx.lineWidth = 1 / v.k;
 		for (const l of this.scene.labs) {
 			ctx.beginPath();
@@ -302,68 +447,152 @@ export class LiveEngine {
 			ctx.globalAlpha = 1;
 			ctx.strokeStyle = T.line;
 			ctx.stroke();
+			ctx.beginPath();
+			ctx.roundRect(l.x, l.y, l.w, 22, [8, 8, 0, 0]);
+			ctx.fillStyle = T.raised;
+			ctx.fill();
 		}
+		if (this.bundles) this.drawBundles();
 		this.drawHeadRow(now);
 		this.drawPcs(now);
 		this.drawParticles(now);
 		this.drawFx(now);
 		// screen-space text on top
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		if (this.lod === 'card') this.drawCards();
 		this.drawLabels(now);
+		this.drawMini();
+	}
+
+	/** one curved band per lab from the head, width = the lab's share of the work */
+	private drawBundles() {
+		const { ctx, tokens: T, scene: S } = this;
+		const top = Math.max(1, ...[...this.labStats.values()].map((l) => l.rate));
+		ctx.strokeStyle = T.primary;
+		ctx.lineCap = 'round';
+		for (const l of S.labs) {
+			const st = this.labStats.get(l.id);
+			if (!st || st.rate <= 0) continue;
+			const x = l.x + l.w / 2, y = l.y;
+			ctx.lineWidth = 1.5 + (st.rate / top) * 10;
+			ctx.globalAlpha = 0.3;
+			ctx.beginPath();
+			ctx.moveTo(S.head.x, S.head.y + 16);
+			ctx.quadraticCurveTo(S.head.x, (S.head.y + y) / 2 + 20, x, y);
+			ctx.stroke();
+		}
+		ctx.globalAlpha = 1;
+		ctx.lineCap = 'butt';
 	}
 
 	private drawPcs(now: number) {
 		const { ctx, tokens: T, view: v } = this;
 		const pulse = this.reduce ? 0.6 : 0.5 + 0.4 * Math.sin(now / 280);
-		const px = this.huge ? 1.5 / v.k : 0;
+		const k = v.k;
+		const x0 = -v.tx / k - 12, y0 = -v.ty / k - 12, x1 = (this.w - v.tx) / k + 12, y1 = (this.h - v.ty) / k + 12;
+		const pcs = this.scene.pcs;
+		const vis = (s: { x: number; y: number }) => s.x > x0 && s.x < x1 && s.y > y0 && s.y < y1;
+		const point = this.lod === 'point';
+		const card = this.lod === 'card';
+		const half = (i: number) => (card ? 9 : point ? Math.max(pcs[i].r + 2, 1.4 / k) : pcs[i].r + 2);
+		const hair = 1.1 / Math.max(1, k * 0.6);
 		for (const g of this.groups) {
 			ctx.beginPath();
+			let any = false;
 			for (const i of g.idx) {
-				const s = this.scene.pcs[i];
-				const r = px || s.r;
-				ctx.moveTo(s.x + r, s.y);
-				ctx.arc(s.x, s.y, r, 0, TAU);
+				const s = pcs[i];
+				if (!vis(s)) continue;
+				any = true;
+				const h = half(i);
+				if (point) ctx.rect(s.x - h, s.y - h, h * 2, h * 2);
+				else ctx.roundRect(s.x - h, s.y - h, h * 2, h * 2, Math.min(3, h * 0.35));
 			}
+			if (!any) continue;
 			const a = g.dim ? 0.15 : 1;
-			const col = g.cls === 'busy' ? jobColor(T, g.slot) : g.cls === 'lost' ? T.bad : g.cls === 'waking' ? T.warn : T.idle;
-			ctx.lineWidth = (g.cls === 'use' ? 1.6 : 1.1) / Math.max(1, v.k * 0.6);
+			ctx.globalAlpha = a * (card ? 1 : g.a) * (g.cls === 'waking' ? pulse + 0.4 : 1);
+			ctx.fillStyle = card ? T.surface : g.fill;
+			ctx.fill();
+			if (point) continue;
+			ctx.globalAlpha = a;
+			ctx.lineWidth = (g.cls === 'use' ? 1.6 : hair);
 			ctx.setLineDash(g.cls === 'asleep' ? [2, 2] : []);
-			switch (g.cls) {
-				case 'busy': ctx.globalAlpha = a; ctx.fillStyle = col; ctx.fill(); break;
-				case 'lost': ctx.globalAlpha = a; ctx.fillStyle = col; ctx.fill(); break;
-				case 'waking': ctx.globalAlpha = a * pulse; ctx.fillStyle = col; ctx.fill(); ctx.globalAlpha = a; ctx.strokeStyle = col; ctx.stroke(); break;
-				case 'asleep': ctx.globalAlpha = a * 0.35; ctx.fillStyle = T.idle; ctx.fill(); ctx.globalAlpha = a * 0.8; ctx.strokeStyle = T.idle; ctx.stroke(); break;
-				case 'use': ctx.globalAlpha = a; ctx.fillStyle = T.surface; ctx.fill(); ctx.strokeStyle = T.warn; ctx.stroke(); break;
-				default: ctx.globalAlpha = a; ctx.fillStyle = T.surface; ctx.fill(); ctx.strokeStyle = T.idle; ctx.stroke();
+			const stroke = g.cls === 'use' || g.cls === 'waking' ? T.warn : g.cls === 'lost' ? T.bad : g.fill === T.surface || g.cls === 'asleep' || g.cls === 'cord' ? T.idle : card ? T.line : null;
+			if (stroke) {
+				ctx.strokeStyle = stroke;
+				ctx.stroke();
 			}
 			ctx.setLineDash([]);
-			if (g.cls === 'cord') {
-				// hatched: a diagonal stroke through the disc
+			if (card) {
+				// the layer's value rides on a band across the top of the card
+				ctx.globalAlpha = a * g.a;
+				ctx.fillStyle = g.fill;
 				ctx.beginPath();
 				for (const i of g.idx) {
-					const s = this.scene.pcs[i];
-					const r = (px || s.r) * 0.75;
-					ctx.moveTo(s.x - r, s.y + r);
-					ctx.lineTo(s.x + r, s.y - r);
+					const s = pcs[i];
+					if (vis(s)) ctx.roundRect(s.x - 9, s.y - 9, 18, 3.2, [3, 3, 0, 0]);
 				}
-				ctx.globalAlpha = a;
-				ctx.strokeStyle = T.idle;
-				ctx.stroke();
+				ctx.fill();
 			}
 		}
 		ctx.globalAlpha = 1;
-		// standbys wear a ring; flashed PCs a pulsing primary ring
-		if (!this.huge) {
-			ctx.lineWidth = 1 / Math.max(1, v.k * 0.6);
+		if (!point) {
+			// cordoned or draining: a diagonal through the square; badges in the corner (shape, never colour alone)
+			const diag = new Path2D(), dotUse = new Path2D(), crescent = new Path2D(), ringWake = new Path2D(), cross = new Path2D();
+			const stripes = new Map<number, Path2D>();
+			const ring = new Path2D();
+			let nDiag = 0;
+			for (let i = 0; i < pcs.length; i++) {
+				const s = pcs[i];
+				if (!vis(s) || this.dim[i] === 1) continue;
+				const h = half(i), c = this.cls[i];
+				if (c === 'cord') (diag.moveTo(s.x - h * 0.7, s.y + h * 0.7), diag.lineTo(s.x + h * 0.7, s.y - h * 0.7), nDiag++);
+				const bx = s.x + h - 1, by = s.y - h + 1;
+				if (c === 'use') (dotUse.moveTo(bx + 2.2, by), dotUse.arc(bx, by, 2.2, 0, TAU));
+				else if (c === 'asleep') (crescent.moveTo(bx + Math.cos(Math.PI * 0.6) * 2.2, by + Math.sin(Math.PI * 0.6) * 2.2), crescent.arc(bx, by, 2.2, Math.PI * 0.6, Math.PI * 1.9));
+				else if (c === 'waking') (ringWake.moveTo(bx + 2.2, by), ringWake.arc(bx, by, 2.2, 0, TAU));
+				else if (c === 'lost') (cross.moveTo(bx - 2, by - 2), cross.lineTo(bx + 2, by + 2), cross.moveTo(bx + 2, by - 2), cross.lineTo(bx - 2, by + 2));
+				if (!card && k * h * 2 >= 9) {
+					const cpu = this.cpu[i];
+					if (!Number.isNaN(cpu) && c !== 'asleep' && c !== 'lost' && cpu > 0) (ring.moveTo(s.x, s.y - h - 1.6), ring.arc(s.x, s.y, h + 1.6, -Math.PI / 2, -Math.PI / 2 + Math.min(1, cpu / 100) * TAU - 0.001));
+					const j = c === 'busy' ? this.jobOf[i] : null;
+					if (j != null) {
+						const slot = this.jobIds.get(j) ?? -1;
+						(stripes.get(slot) ?? stripes.set(slot, new Path2D()).get(slot)!).rect(s.x - h, s.y - h + 2, Math.max(2.4, 2 / k), h * 2 - 4);
+					}
+				}
+			}
+			ctx.lineWidth = 1.2 / Math.max(1, k * 0.6);
+			ctx.strokeStyle = T.idle;
+			if (nDiag) ctx.stroke(diag);
+			ctx.strokeStyle = T.warn; ctx.fillStyle = T.warn;
+			ctx.fill(dotUse);
+			ctx.stroke(ringWake);
+			ctx.strokeStyle = T.idle;
+			ctx.stroke(crescent);
+			ctx.strokeStyle = T.bad;
+			ctx.stroke(cross);
+			ctx.lineWidth = 1.5 / Math.max(1, k * 0.7);
+			ctx.strokeStyle = T.fg;
+			ctx.globalAlpha = 0.65;
+			ctx.stroke(ring);
+			ctx.globalAlpha = 1;
+			for (const [slot, p] of stripes) {
+				ctx.fillStyle = jobColor(T, slot);
+				ctx.fill(p);
+			}
+		}
+		// standbys wear a dashed ring; flashed PCs a pulsing primary ring; the selected PC a halo
+		if (!this.huge && !point) {
+			ctx.lineWidth = 1 / Math.max(1, k * 0.6);
 			ctx.strokeStyle = T.muted;
 			ctx.setLineDash([1.5, 1.5]);
 			ctx.beginPath();
 			for (const id of this.standbyIds) {
 				const i = this.scene.index.get(id);
 				if (i == null) continue;
-				const s = this.scene.pcs[i];
-				ctx.moveTo(s.x + s.r + 2.5, s.y);
-				ctx.arc(s.x, s.y, s.r + 2.5, 0, TAU);
+				const s = pcs[i];
+				ctx.moveTo(s.x + s.r + 4.5, s.y);
+				ctx.arc(s.x, s.y, s.r + 4.5, 0, TAU);
 			}
 			ctx.stroke();
 			ctx.setLineDash([]);
@@ -371,16 +600,124 @@ export class LiveEngine {
 		for (const [id, until] of this.flashes) {
 			const i = this.scene.index.get(id);
 			if (i == null) continue;
-			const s = this.scene.pcs[i];
+			const s = pcs[i];
 			const u = 1 - (until - now) / 2200;
 			ctx.globalAlpha = Math.max(0, 1 - u) * (0.6 + 0.4 * Math.sin(now / 90));
 			ctx.strokeStyle = T.primary;
-			ctx.lineWidth = 2 / Math.max(1, v.k * 0.6);
+			ctx.lineWidth = 2 / Math.max(1, k * 0.6);
 			ctx.beginPath();
-			ctx.arc(s.x, s.y, s.r + 4 + u * 6, 0, TAU);
+			ctx.arc(s.x, s.y, s.r + 6 + u * 6, 0, TAU);
 			ctx.stroke();
 		}
 		ctx.globalAlpha = 1;
+		const si = this.selected ? this.scene.index.get(this.selected) : null;
+		if (si != null) {
+			const s = pcs[si];
+			const r = half(si) + 4;
+			ctx.strokeStyle = T.primary;
+			ctx.lineWidth = 2.4 / Math.max(1, k * 0.7);
+			ctx.globalAlpha = 0.25;
+			ctx.beginPath();
+			ctx.roundRect(s.x - r - 2, s.y - r - 2, (r + 2) * 2, (r + 2) * 2, 6);
+			ctx.stroke();
+			ctx.globalAlpha = 1;
+			ctx.beginPath();
+			ctx.roundRect(s.x - r, s.y - r, r * 2, r * 2, 5);
+			ctx.stroke();
+		}
+	}
+
+	/** near zoom: a mini card per visible PC, drawn in screen space */
+	private drawCards() {
+		const { ctx, tokens: T, view: v } = this;
+		ctx.textBaseline = 'middle';
+		ctx.textAlign = 'left';
+		const pcs = this.scene.pcs;
+		for (let i = 0; i < pcs.length; i++) {
+			const s = pcs[i];
+			const sx = s.x * v.k + v.tx, sy = s.y * v.k + v.ty;
+			const half = 9 * v.k;
+			if (sx + half < 0 || sy + half < 0 || sx - half > this.w || sy - half > this.h) continue;
+			const px = half * 2, x = sx - half, y = sy - half, pad = Math.max(3, px * 0.06), band = 3.2 * v.k;
+			const dim = this.dim[i] === 1;
+			const c = this.cls[i];
+			ctx.globalAlpha = dim ? 0.15 : 1;
+			const f = Math.min(13, Math.max(9, px / 12));
+			ctx.font = `600 ${f}px "Inter Variable", ui-sans-serif, system-ui, sans-serif`;
+			ctx.fillStyle = T.fg;
+			const tw = px - pad * 2 - 6;
+			ctx.fillText(this.clip(this.hostOfI[i], tw), x + pad + 5, y + band + f * 0.95 + pad);
+			ctx.font = `400 ${f - 1}px "Inter Variable", ui-sans-serif, system-ui, sans-serif`;
+			ctx.fillStyle = T.muted;
+			let ly = y + band + f * 2.3 + pad;
+			const j = this.jobOf[i];
+			const line = (t: string) => { ctx.fillText(this.clip(t, tw), x + pad + 5, ly); ly += f * 1.35; };
+			line(c === 'busy' && j != null ? `#${j} ${this.jobNames.get(j) ?? ''}`.trim() : c === 'busy' ? 'working' : c === 'use' ? 'in use' : c);
+			const rate = this.rateOf[i];
+			if (!Number.isNaN(rate) && rate > 0) line(fmtRate(rate));
+			// bars: CPU then RAM
+			const bar = (label: string, val: number, by: number) => {
+				if (Number.isNaN(val)) return;
+				const bw = px - pad * 2 - 5, bx = x + pad + 5;
+				ctx.fillStyle = T.line;
+				ctx.fillRect(bx, by, bw, 4);
+				ctx.fillStyle = val > 85 ? T.warn : T.primary;
+				ctx.fillRect(bx, by, bw * Math.min(1, val / 100), 4);
+				if (px > 100) {
+					ctx.fillStyle = T.muted;
+					ctx.fillText(`${label} ${Math.round(val)} %`, bx, by - f * 0.7);
+				}
+			};
+			bar('CPU', this.cpu[i], y + px - pad - (px > 100 ? 26 : 14));
+			bar('RAM', this.ram[i], y + px - pad - 6);
+			if (px > 130) {
+				ctx.fillStyle = T.muted;
+				ctx.fillText(`${this.loss[i]} lost / 24 h`, x + pad + 5, y + px - pad - 38 - f);
+			}
+			// job stripe on the left edge
+			if (c === 'busy' && j != null) {
+				ctx.fillStyle = jobColor(T, this.jobIds.get(j) ?? -1);
+				ctx.fillRect(x + 2, y + 5, 3, px - 10);
+			}
+		}
+		ctx.globalAlpha = 1;
+	}
+	/** text cut to a pixel width with an ellipsis (current font) */
+	private clip(t: string, w: number): string {
+		if (w <= 8) return '';
+		if (this.ctx.measureText(t).width <= w) return t;
+		let lo = 0, hi = t.length;
+		while (lo < hi) {
+			const mid = (lo + hi + 1) >> 1;
+			if (this.ctx.measureText(t.slice(0, mid) + '…').width <= w) lo = mid;
+			else hi = mid - 1;
+		}
+		return lo > 0 ? t.slice(0, lo) + '…' : '';
+	}
+
+	/** corner map at near zoom: labs, and the visible window */
+	private drawMini() {
+		this.mini = null;
+		if (this.lod !== 'card' || this.w < 360) return;
+		const { ctx, tokens: T, view: v, scene: S } = this;
+		const mw = 132, s = Math.min(mw / S.w, 84 / S.h), mh = S.h * s, mwid = S.w * s;
+		const x = this.w - mwid - 10, y = this.padTop + 8;
+		this.mini = { x, y, w: mwid, h: mh, s };
+		ctx.globalAlpha = 0.92;
+		ctx.fillStyle = T.surface;
+		ctx.strokeStyle = T.line;
+		ctx.lineWidth = 1;
+		ctx.beginPath();
+		ctx.roundRect(x - 4, y - 4, mwid + 8, mh + 8, 6);
+		ctx.fill();
+		ctx.stroke();
+		ctx.globalAlpha = 1;
+		ctx.fillStyle = T.line;
+		for (const l of S.labs) ctx.fillRect(x + l.x * s, y + l.y * s, l.w * s, l.h * s);
+		ctx.strokeStyle = T.primary;
+		ctx.lineWidth = 1.5;
+		const vx = x + (-v.tx / v.k) * s, vy = y + (-v.ty / v.k) * s;
+		ctx.strokeRect(vx, vy, (this.w / v.k) * s, (this.h / v.k) * s);
 	}
 
 	private drawParticles(now: number) {
@@ -507,10 +844,15 @@ export class LiveEngine {
 		const i = this.shown.findIndex((s) => s.id === id);
 		return this.scene.standby(Math.max(0, i));
 	}
+	/** the head and standbys are hexagons */
 	private node(x: number, y: number, r: number, fill: string, stroke: string) {
 		const { ctx } = this;
 		ctx.beginPath();
-		ctx.arc(x, y, r, 0, TAU);
+		for (let i = 0; i < 6; i++) {
+			const a = (Math.PI / 3) * i - Math.PI / 2;
+			ctx[i ? 'lineTo' : 'moveTo'](x + Math.cos(a) * r, y + Math.sin(a) * r);
+		}
+		ctx.closePath();
 		ctx.fillStyle = fill;
 		ctx.fill();
 		ctx.strokeStyle = stroke;
@@ -523,34 +865,58 @@ export class LiveEngine {
 		ctx.font = '500 11px "Inter Variable", ui-sans-serif, system-ui, sans-serif';
 		ctx.textBaseline = 'middle';
 		const sx = (x: number) => x * v.k + v.tx, sy = (y: number) => y * v.k + v.ty;
-		if (v.k > 0.3) {
-			ctx.textAlign = 'left';
-			for (const l of S.labs) {
-				const asleep = this.huge || l.count > 0 ? l.count : 0;
-				ctx.fillStyle = T.muted;
-				const sleepers = this.huge ? ` · ${this.labAsleep(l.id)} asleep` : '';
-				ctx.fillText(`${l.name} · ${asleep}${this.huge ? ' PCs' : ''}${sleepers}`, sx(l.x + 10), sy(l.y + 12));
+		ctx.textAlign = 'left';
+		const W = this.w, H = this.h;
+		for (const l of S.labs) {
+			const px = l.w * v.k, py = 22 * v.k;
+			const x = sx(l.x), y = sy(l.y);
+			if (x > W || y > H || x + px < 0 || y + l.h * v.k < 0 || px < 28) continue;
+			const st = this.labStats.get(l.id) ?? { busy: 0, awake: 0, total: l.count, rate: 0, share: 0 };
+			const asleep = this.huge ? ` · ${this.labAsleep(l.id)} asleep` : '';
+			const cands = [
+				`${l.name}  ${st.busy}/${st.awake}/${st.total} busy/awake/total  ${st.rate > 0 ? fmtRate(st.rate) : '0 tasks/s'}  ${Math.round(st.share * 100)} % of work`,
+				`${l.name}  ${st.busy}/${st.awake}/${st.total}  ${st.rate > 0 ? fmtRate(st.rate) : ''}`.trim(),
+				`${l.name}  ${st.busy}/${st.awake}/${st.total}`,
+				l.name
+			];
+			if (this.huge) cands.unshift(`${l.name} · ${st.total} PCs${asleep} · ${st.rate > 0 ? fmtRate(st.rate) : '0'}`);
+			const room = px - 14;
+			const txt = cands.find((c) => ctx.measureText(c).width <= room) ?? this.clip(l.name, room);
+			if (!txt) continue;
+			const inStrip = py >= 15;
+			const ty = inStrip ? y + py / 2 : y + 8;
+			if (!inStrip) {
+				// zoomed far out: the label rides on a small pill so it never fights the PCs
+				const w = ctx.measureText(txt).width + 8;
+				ctx.globalAlpha = 0.85;
+				ctx.fillStyle = T.surface;
+				ctx.fillRect(x + 4, y + 1, w, 14);
+				ctx.globalAlpha = 1;
 			}
+			ctx.fillStyle = T.fg;
+			ctx.fillText(txt, x + (inStrip ? 8 : 8), ty);
 		}
 		// head caption, term counter (rolls on a failover) and standby names
 		const head = S.head;
-		ctx.textAlign = 'center';
-		const hx = sx(head.x), hy = sy(head.y + 16) + 12;
+		// the head's name and term sit to its left, so they never meet the lab strips below
+		ctx.textAlign = 'right';
+		const hx = sx(head.x) - 16 * v.k - 10, hy = sy(head.y);
 		ctx.fillStyle = this.lost ? T.bad : T.fg;
 		const hostOf = (id: string | null) => (id ? this.input?.nodes[id]?.host ?? id : null);
-		ctx.fillText(this.lost ? 'Head lost' : (hostOf(this.headId) ?? 'HEAD'), hx, hy);
+		ctx.fillText(this.lost ? 'Head lost' : (hostOf(this.headId) ?? 'HEAD'), hx, hy - 7);
 		if (this.epoch != null) {
 			ctx.fillStyle = T.muted;
 			const r = this.roll;
 			if (r) {
 				const u = Math.min(1, (now - r.t0) / 350);
 				ctx.globalAlpha = 1 - u;
-				ctx.fillText(`term ${r.from}`, hx, hy + 13 - u * 10);
+				ctx.fillText(`term ${r.from}`, hx, hy + 7 - u * 10);
 				ctx.globalAlpha = u;
-				ctx.fillText(`term ${this.epoch}`, hx, hy + 13 + (1 - u) * 10);
+				ctx.fillText(`term ${this.epoch}`, hx, hy + 7 + (1 - u) * 10);
 				ctx.globalAlpha = 1;
-			} else ctx.fillText(`term ${this.epoch}`, hx, hy + 13);
+			} else ctx.fillText(`term ${this.epoch}`, hx, hy + 7);
 		}
+		ctx.textAlign = 'center';
 		this.shown.forEach((s, i) => {
 			const p = S.standby(i);
 			ctx.fillStyle = T.muted;

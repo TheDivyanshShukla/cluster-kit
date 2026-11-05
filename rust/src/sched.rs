@@ -175,6 +175,9 @@ pub fn chunk_len(p: ChunkPolicy, fixed_chunk: u64, total: u64, remaining: u64, n
         }
         ChunkPolicy::Adaptive => fixed(),
     };
+    // a chunk size given with adaptive/guided is a cap: rates measured on earlier, faster jobs must not hand a slow
+    // job huge chunks (seen with SDK list jobs after fast ones)
+    let v = if fixed_chunk > 0 && p != ChunkPolicy::Fixed { v.min(fixed_chunk) } else { v };
     let v = if p == ChunkPolicy::Fixed { v } else { v.clamp(min, max.max(min)) };
     v.clamp(min.min(remaining).max(1), remaining)
 }
@@ -707,6 +710,19 @@ pub fn head_score(x: &HeadInputs, best: &HeadInputs, w: HeadWeights) -> (f64, [f
     let total: f64 = ws.iter().sum();
     let score = if total > 0.0 { 100.0 * parts.iter().zip(ws).map(|(p, w)| p * w).sum::<f64>() / total } else { 0.0 };
     (score, parts)
+}
+
+#[cfg(test)]
+mod chunk_cap_tests {
+    use super::*;
+
+    #[test]
+    fn chunk_is_a_cap_for_adaptive() {
+        let big = chunk_len(ChunkPolicy::Adaptive, 0, 1_000_000, 1_000_000, 100_000.0, 1_000.0, 4, 1, u64::MAX);
+        let capped = chunk_len(ChunkPolicy::Adaptive, 10, 1_000_000, 1_000_000, 100_000.0, 1_000.0, 4, 1, u64::MAX);
+        assert!(big > 10 && capped == 10);
+        assert_eq!(chunk_len(ChunkPolicy::Fixed, 10, 1_000, 1_000, 0.0, 0.0, 4, 1, u64::MAX), 10);
+    }
 }
 
 #[cfg(test)]

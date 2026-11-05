@@ -1,7 +1,10 @@
 <script lang="ts">
-	import { Crown, Eye, WifiOff } from '@lucide/svelte';
-	import { onMount } from 'svelte';
+	import { Crown, Eye, Maximize, Spline, WifiOff, ZoomIn, ZoomOut } from '@lucide/svelte';
+	import { onMount, untrack } from 'svelte';
+	import { api } from '#lib/api/client.ts';
 	import { jobColor } from '#lib/canvas/colors.ts';
+	import { decodeView, encodeView, HEAT_GRADIENT, isLayer, LAYER_LABEL, LAYERS, legendFor, type Layer } from '#lib/canvas/layers.ts';
+	import { params, patchQuery } from '#lib/urlstate.svelte.ts';
 	import { idsIn, hostIndex } from '#lib/canvas/effects.ts';
 	import { LiveEngine } from '#lib/canvas/engine.ts';
 	import { headAt, rewind, type NodeSnap } from '#lib/canvas/replay.ts';
@@ -11,6 +14,7 @@
 	import { runningJobs } from '#lib/jobs.ts';
 	import { live } from '#lib/live.svelte.ts';
 	import { count, rate } from '#lib/format.ts';
+	import { field } from '#lib/ui.ts';
 
 	interface Props {
 		/** selector text; PCs that do not match dim to 15 % */
@@ -20,10 +24,31 @@
 		replayEvents?: EventRow[];
 		/** the wall: no pan/zoom/hover, bigger legend */
 		wall?: boolean;
+		/** small canvas (Overview): no toolbar, one-line legend */
+		compact?: boolean;
+		/** layer, view, follow and selection live in the URL (the Live page) */
+		urlState?: boolean;
+		/** the PC to draw a halo around */
+		selected?: string | null;
 		onpick?: (id: string | null) => void;
 		onmatch?: (n: number, total: number) => void;
 	}
-	let { filter = '', replayAt = null, replayEvents = [], wall = false, onpick, onmatch }: Props = $props();
+	let { filter = '', replayAt = null, replayEvents = [], wall = false, compact = false, urlState = false, selected = null, onpick, onmatch }: Props = $props();
+
+	const bare = $derived(wall || compact);
+	// svelte-ignore state_referenced_locally
+	let layer = $state<Layer>(urlState && isLayer(params().get('layer')) ? (params().get('layer') as Layer) : 'status');
+	// svelte-ignore state_referenced_locally
+	let bundles = $state(urlState && params().get('flow') === '1');
+	// svelte-ignore state_referenced_locally
+	let followJob = $state<number | null>(urlState && Number(params().get('follow')) > 0 ? Number(params().get('follow')) : null);
+	let maxRate = $state(0);
+	let maxLoss = $state(0);
+	let lod = $state<'point' | 'square' | 'card'>('square');
+	let losses = $state<Record<string, number>>({});
+	let scores = $state<Record<string, number>>({});
+	let scoreErr = $state(false);
+	let bar = $state<HTMLDivElement>();
 
 	let wrap = $state<HTMLDivElement>();
 	let canvas = $state<HTMLCanvasElement>();
@@ -36,8 +61,9 @@
 	$effect(() => {
 		const e = engine, l = legend;
 		if (!e || !l) return;
-		const ro = new ResizeObserver(() => e.setPad(l.offsetHeight + 12));
+		const ro = new ResizeObserver(() => e.setPad(l.offsetHeight + 12, bar ? bar.offsetHeight + 10 : 4));
 		ro.observe(l);
+		if (bar) ro.observe(bar);
 		return () => ro.disconnect();
 	});
 
@@ -102,12 +128,103 @@
 		if (!e || frozen) return;
 		e.update({
 			nodes: live.nodes, labs: live.labs, workers: live.cluster?.workers ?? [], jobs: runningJobs(live.cluster),
-			ha: live.ha, filter: matcher, overrides, headId
+			ha: live.ha, filter: matcher, overrides, headId, losses, scores
 		});
 		counts = { ...e.counts };
+		maxRate = e.maxRate;
+		maxLoss = e.maxLoss;
+		lod = e.lod;
 		total = e.items.length;
 		onmatch?.(e.matched, e.items.length);
 	});
+	$effect(() => engine?.setLayer(layer));
+	$effect(() => engine?.setSelected(selected));
+	$effect(() => {
+		if (engine) engine.bundles = bundles;
+		if (engine) engine.dirty = true;
+	});
+	$effect(() => {
+		engine?.setFollow(followJob);
+	});
+
+	// layer data: losses in 24 h from node.lost events, head score from /ha/candidates
+	$effect(() => {
+		if (layer !== 'reliability') return;
+		let dead = false;
+		const load = async () => {
+			const idx = hostIndex(Object.values(live.nodes));
+			const out: Record<string, number> = {};
+			let before: number | null = null;
+			for (let p = 0; p < 15; p++) {
+				const r = await api.events(200, before);
+				for (const ev of r.events) if (ev.kind === 'node.lost' && ev.ts_ms > Date.now() - 864e5) for (const id of idsIn(ev, idx).slice(0, 1)) out[id] = (out[id] ?? 0) + 1;
+				before = r.next;
+				if (before == null || (r.events.at(-1)?.ts_ms ?? 0) < Date.now() - 864e5) break;
+			}
+			if (!dead) losses = out;
+		};
+		void load().catch(() => {});
+		const t = setInterval(() => void load().catch(() => {}), 60_000);
+		return () => ((dead = true), clearInterval(t));
+	});
+	$effect(() => {
+		if (layer !== 'fitness') return;
+		let dead = false;
+		const load = async () => {
+			try {
+				const r = await api.candidates();
+				if (!dead) (scores = Object.fromEntries(r.candidates.map((c) => [c.node_id, c.score])), (scoreErr = false));
+			} catch {
+				if (!dead) scoreErr = true;
+			}
+		};
+		void load();
+		const t = setInterval(() => void load(), 20_000);
+		return () => ((dead = true), clearInterval(t));
+	});
+
+	// URL state: layer, zoom + centre, follow, flow bundles
+	let restored = false;
+	let writeT: ReturnType<typeof setTimeout> | undefined;
+	function writeView() {
+		clearTimeout(writeT);
+		writeT = setTimeout(() => {
+			const e = engine;
+			if (!urlState || !e) return;
+			const c = e.centre();
+			patchQuery((p) => {
+				if (e.userView) p.set('view', encodeView(e.view.k, c.x, c.y));
+				else p.delete('view');
+				if (e.follow == null) p.delete('follow');
+				else p.set('follow', String(e.follow));
+			});
+			if (e.follow !== followJob) followJob = e.follow;
+		}, 300);
+	}
+	$effect(() => {
+		const e = engine;
+		if (!e) return;
+		e.onview = writeView;
+		return () => (e.onview = null);
+	});
+	$effect(() => {
+		const e = engine;
+		if (!e || !urlState || restored || total === 0) return;
+		restored = true;
+		const v = decodeView(params().get('view'));
+		if (v && followJob == null) e.setView(v.k, v.cx, v.cy);
+	});
+	$effect(() => {
+		if (!urlState) return;
+		const l = layer, b = bundles;
+		untrack(() => patchQuery((p) => {
+			if (l === 'status') p.delete('layer');
+			else p.set('layer', l);
+			if (b) p.set('flow', '1');
+			else p.delete('flow');
+		}));
+	});
+
 	// events in (oldest first so ripples keep order)
 	$effect(() => {
 		const e = engine;
@@ -133,6 +250,8 @@
 	function down(ev: PointerEvent) {
 		if (wall) return;
 		canvas!.setPointerCapture(ev.pointerId);
+		const m = engine?.miniAt(local(ev).x, local(ev).y);
+		if (m) return engine!.centerOn(m.x, m.y);
 		pts.set(ev.pointerId, local(ev));
 		moved = 0;
 		pinch = pts.size === 2 ? dist() : 0;
@@ -199,7 +318,9 @@
 		const job = engine.jobOf[i];
 		const lab = live.labs.find((l) => l.id === it.node.lab_id)?.name ?? 'unassigned';
 		const ev = live.events.find((e) => idsIn(e, hostsNow).includes(tip!.id));
-		return { host: it.node.host, lab, state: CLS_WORDS[cls], job: job == null ? null : `#${job} ${live.jobs[job]?.name ?? ''}`.trim(), rate: it.w && it.w.rate > 0 ? rate(it.w.rate) : null, last: ev ? ev.detail || ev.kind : null };
+		const m = engine.metricsOf(tip.id);
+		const extra = layer === 'load' && m?.cpu != null ? `CPU ${Math.round(m.cpu)} %` : layer === 'reliability' ? `${m?.losses ?? 0} losses in 24 h` : layer === 'fitness' && m?.score != null ? `Head score ${m.score.toFixed(0)}` : layer === 'throughput' && m?.rate != null ? rate(m.rate) : null;
+		return { extra, host: it.node.host, lab, state: CLS_WORDS[cls], job: job == null ? null : `#${job} ${live.jobs[job]?.name ?? ''}`.trim(), rate: it.w && it.w.rate > 0 ? rate(it.w.rate) : null, last: ev ? ev.detail || ev.kind : null };
 	});
 	const jobs = $derived([...runningJobs(live.cluster)].sort((a, b) => a.id - b.id).slice(0, 8));
 	const summary = $derived(`Live system: ${total} PCs, ${counts.busy} working, ${counts.asleep} asleep, ${counts.lost} lost.`);
@@ -212,6 +333,7 @@
 		waking: 'bg-warn/40 border-warn motion-safe:animate-pulse',
 		lost: 'bg-bad border-bad'
 	};
+	const lg = $derived(legendFor(layer, { rate: maxRate, losses: maxLoss }, rate));
 	const fs = $derived(wall ? 'text-[max(0.7rem,0.95vw)]' : 'text-[11px]');
 </script>
 
@@ -256,22 +378,67 @@
 			<p class="text-muted-foreground">{tipInfo.lab} · {tipInfo.state}</p>
 			{#if tipInfo.job}<p class="truncate">Job {tipInfo.job}</p>{/if}
 			{#if tipInfo.rate}<p class="num">{tipInfo.rate}</p>{/if}
+			{#if tipInfo.extra}<p class="num">{tipInfo.extra}</p>{/if}
 			{#if tipInfo.last}<p class="text-muted-foreground truncate">Last: {tipInfo.last}</p>{/if}
 		</div>
 	{/if}
 
-	<div bind:this={legend} class="bg-surface/90 border-line pointer-events-none absolute right-2 bottom-2 left-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border px-2.5 py-1.5 {fs} sm:right-auto sm:max-w-[min(100%-1rem,44rem)]" aria-label="Legend">
-		{#each CLASSES as c (c)}
-			{#if counts[c] > 0 || c === 'busy' || c === 'idle'}
-				<span class="text-muted-foreground inline-flex items-center gap-1.5"><span class="inline-block size-2.5 rounded-full border {sw[c]}" aria-hidden="true"></span>{CLS_WORDS[c]} <span class="num text-foreground">{count(counts[c])}</span></span>
-			{/if}
-		{/each}
-		<span class="text-muted-foreground inline-flex items-center gap-1"><Crown class="size-3" aria-hidden="true" />head</span>
-		<span class="text-muted-foreground inline-flex items-center gap-1"><Eye class="size-3" aria-hidden="true" />standby</span>
-		{#if tokens}
-			{#each jobs as j, i (j.id)}
-				<span class="text-muted-foreground inline-flex min-w-0 items-center gap-1.5"><span class="inline-block size-2.5 shrink-0 rounded-full" style="background:{jobColor(tokens, i)}" aria-hidden="true"></span><span class="max-w-32 truncate">#{j.id} {j.name}</span></span>
+	{#if !bare}
+		<div bind:this={bar} class="thin absolute top-2 right-2 left-2 flex items-center gap-1.5 overflow-x-auto pb-0.5">
+			<label class="sm:hidden">
+				<span class="sr-only">Layer</span>
+				<select class="{field} h-9 w-auto" bind:value={layer}>{#each LAYERS as l (l)}<option value={l}>{LAYER_LABEL[l]}</option>{/each}</select>
+			</label>
+			<div class="bg-surface/90 border-line max-sm:hidden inline-flex shrink-0 rounded-lg border p-0.5" role="group" aria-label="Layer">
+				{#each LAYERS as l (l)}
+					<button type="button" aria-pressed={layer === l} class="rounded-md px-2.5 py-1 text-xs whitespace-nowrap {layer === l ? 'bg-primary/15 text-foreground font-medium' : 'text-muted-foreground hover:text-foreground'}" onclick={() => (layer = l)}>{LAYER_LABEL[l]}</button>
+				{/each}
+			</div>
+			<div class="bg-surface/90 border-line ml-auto inline-flex shrink-0 items-center rounded-lg border p-0.5" role="group" aria-label="View">
+				<button type="button" class="hover:bg-raised grid size-8 place-items-center rounded-md" aria-label="Zoom in" onclick={() => engine?.zoomAt(engine.w / 2, engine.h / 2, 1.5)}><ZoomIn class="size-4" aria-hidden="true" /></button>
+				<button type="button" class="hover:bg-raised grid size-8 place-items-center rounded-md" aria-label="Zoom out" onclick={() => engine?.zoomAt(engine.w / 2, engine.h / 2, 1 / 1.5)}><ZoomOut class="size-4" aria-hidden="true" /></button>
+				<button type="button" class="hover:bg-raised inline-flex h-8 items-center gap-1 rounded-md px-2 text-xs" onclick={() => ((followJob = null), engine?.resetView())}><Maximize class="size-4" aria-hidden="true" /><span class="max-md:sr-only">Fit all</span></button>
+				<label class="max-md:hidden"><span class="sr-only">Fit lab</span>
+					<select class="hover:bg-raised h-8 rounded-md bg-transparent px-1 text-xs" onchange={(e) => { const v = Number(e.currentTarget.value); e.currentTarget.value = ''; if (v >= 0) engine?.fitLab(v); }}>
+						<option value="">Fit lab…</option>
+						{#each engine?.scene.labs ?? [] as l (l.id)}<option value={l.id}>{l.name}</option>{/each}
+					</select>
+				</label>
+				<label class="max-md:hidden"><span class="sr-only">Follow job</span>
+					<select class="hover:bg-raised h-8 max-w-28 rounded-md bg-transparent px-1 text-xs" value={followJob ?? ''} onchange={(e) => (followJob = e.currentTarget.value ? Number(e.currentTarget.value) : null)}>
+						<option value="">Follow job…</option>
+						{#each jobs as j (j.id)}<option value={j.id}>#{j.id} {j.name}</option>{/each}
+					</select>
+				</label>
+				<button type="button" aria-pressed={bundles} class="grid size-8 place-items-center rounded-md {bundles ? 'bg-primary/15 text-foreground' : 'hover:bg-raised'}" aria-label="Flow bundles" title="Flow bundles: one band per lab, width = its share of the work" onclick={() => (bundles = !bundles)}><Spline class="size-4" aria-hidden="true" /></button>
+			</div>
+		</div>
+	{/if}
+
+	<div bind:this={legend} class="bg-surface/90 border-line pointer-events-none absolute right-2 bottom-2 left-2 flex items-center gap-x-3 gap-y-1 rounded-lg border px-2.5 py-1.5 {fs} sm:right-auto sm:max-w-[min(100%-1rem,44rem)] {compact ? 'overflow-hidden whitespace-nowrap' : 'flex-wrap'}" aria-label="Legend">
+		{#if lg.kind === 'scale'}
+			<span class="text-muted-foreground inline-flex items-center gap-2">
+				<span class="num">{lg.lo}</span><span class="inline-block h-2.5 w-28 rounded-sm" style="background:{HEAT_GRADIENT}" aria-hidden="true"></span><span class="num">{lg.hi}</span> {lg.unit}
+				<span class="inline-flex items-center gap-1"><span class="bg-idle/25 border-idle inline-block size-2.5 rounded-sm border" aria-hidden="true"></span>unknown</span>
+				{#if layer === 'fitness' && scoreErr}<span class="text-warn">{lg.note}</span>{/if}
+			</span>
+		{/if}
+		{#if lg.kind === 'items' || lg.kind === 'scale'}
+			{#each CLASSES as c (c)}
+				{#if (counts[c] > 0 || (!compact && (c === 'busy' || c === 'idle'))) && !(lg.kind === 'scale' && c === 'cord')}
+					<span class="text-muted-foreground inline-flex items-center gap-1.5"><span class="inline-block size-2.5 rounded-[3px] border {sw[c]}" aria-hidden="true"></span>{CLS_WORDS[c]} <span class="num text-foreground">{count(counts[c])}</span></span>
+				{/if}
 			{/each}
 		{/if}
+		{#if !compact}
+			<span class="text-muted-foreground inline-flex items-center gap-1"><Crown class="size-3" aria-hidden="true" />head</span>
+			<span class="text-muted-foreground inline-flex items-center gap-1"><Eye class="size-3" aria-hidden="true" />standby</span>
+		{/if}
+		{#if tokens && !compact && (lg.kind === 'jobs' || layer === 'status')}
+			{#each jobs as j, i (j.id)}
+				<span class="text-muted-foreground inline-flex min-w-0 items-center gap-1.5"><span class="inline-block size-2.5 shrink-0 rounded-[3px]" style="background:{jobColor(tokens, i)}" aria-hidden="true"></span><span class="max-w-32 truncate">#{j.id} {j.name}</span></span>
+			{/each}
+		{/if}
+		{#if !compact && lod !== 'point' && !wall}<span class="text-muted-foreground max-md:hidden">ring = CPU busy · stripe = job</span>{/if}
 	</div>
 </div>

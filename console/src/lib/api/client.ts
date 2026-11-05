@@ -3,6 +3,12 @@
 import { z } from 'zod';
 import { LogList } from './logs';
 import {
+	Alert,
+	AlertList,
+	BreakdownReply,
+	DayReportReply,
+	ExperimentList,
+	ExperimentOne,
 	ApiErrorBody,
 	CapList,
 	CapRow,
@@ -64,6 +70,7 @@ const PoolOne = z.object({ pool: PoolRow });
 const CapOne = z.object({ cap: CapRow });
 const ReserveOne = z.object({ reserve: ReserveRow });
 const WindowOne = z.object({ window: WindowRow });
+const AlertOne = z.object({ alert: Alert });
 const ReservationOne = z.object({ reservation: ReservationRow });
 
 let onUnauthorized: (() => void) | null = null;
@@ -195,6 +202,13 @@ export const api = {
 		for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== '') p.set(k, String(v));
 		return call('GET', `/api/v1/logs?${p}`, LogList);
 	},
+	// research (wave 12)
+	breakdown: (id: number) => call('GET', `/api/v1/jobs/${id}/breakdown`, BreakdownReply),
+	alerts: (activeOnly = false) => call('GET', `/api/v1/alerts${activeOnly ? '?active=1' : ''}`, AlertList),
+	ackAlert: (id: number) => call('POST', `/api/v1/alerts/${id}/ack`, AlertOne),
+	experiments: () => call('GET', '/api/v1/experiments', ExperimentList),
+	experiment: (id: number) => call('GET', `/api/v1/experiments/${id}`, ExperimentOne),
+	report: (day: string) => call('GET', `/api/v1/report?day=${encodeURIComponent(day)}`, DayReportReply),
 	// legacy
 	stats: (detail = false) => call('GET', detail ? '/stats?detail=1' : '/stats', Stats)
 };
