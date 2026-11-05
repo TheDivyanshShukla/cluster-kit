@@ -10,10 +10,11 @@ labelled in docs/sim/REPORT.md. Only stdlib + matplotlib.
 """
 from __future__ import annotations
 
-import argparse, csv, json, math, os, statistics as st, subprocess, sys, tempfile
+import argparse, csv, json, os, statistics as st, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Iterable, TypeVar
+from typing import Any, Callable, TypeVar
+from collections.abc import Iterable
 
 T = TypeVar("T")
 U = TypeVar("U")
@@ -197,7 +198,7 @@ def e1() -> None:
         ax[0].errorbar(xs, med, yerr=[[m - l for m, l in zip(med, lo)], [h - m for m, h in zip(med, hi)]], marker="o", ms=4, lw=1.5, capsize=2, label=lab, color=C[i])
         ax[1].errorbar(xs, em, yerr=[[m - l for m, l in zip(em, elo)], [h - m for m, h in zip(em, ehi)]], marker="o", ms=4, lw=1.5, capsize=2, label=lab, color=C[i])
     ax[0].plot(ps, [nominal_rate(p) / 1e6 for p in ps], "k--", lw=1, label="ideal (sum of single PCs)")
-    ax[0].set_xscale("log", base=2); ax[0].set_yscale("log"); ax[0].set_xlabel("PCs"); ax[0].set_ylabel("throughput (MH/s SHA-256)"); ax[0].legend(fontsize=8); ax[0].set_title("E1 throughput, median and range of %d runs" % SEEDS)
+    ax[0].set_xscale("log", base=2); ax[0].set_yscale("log"); ax[0].set_xlabel("PCs"); ax[0].set_ylabel("throughput (MH/s SHA-256)"); ax[0].legend(fontsize=8); ax[0].set_title(f"E1 throughput, median and range of {SEEDS} runs")
     ax[1].axhline(100, color="k", ls="--", lw=1); ax[1].set_xscale("log", base=2); ax[1].set_xlabel("PCs"); ax[1].set_ylabel("efficiency (% of ideal)"); ax[1].set_ylim(60, 105); ax[1].set_title("E1 efficiency")
     save(fig, "fig_e1_scaling")
     RESULTS["e1"] = summ

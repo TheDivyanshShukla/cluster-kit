@@ -181,7 +181,7 @@ def plot(out: Path, label: str, names: dict, addrs: list, scale: list, summary: 
 
     a = ax[1][1]
     ks = list(range(6, 21))
-    series = {f"head alone (measured)": summary[addrs[0]]["median"],
+    series = {"head alone (measured)": summary[addrs[0]]["median"],
               f"all {len(scale)} PCs (measured)": summary[scale[-1]]["median"]}
     for lbl, rate in series.items():
         a.plot(ks, [16 ** k / rate for k in ks], "o-", ms=3, label=lbl)

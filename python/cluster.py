@@ -17,6 +17,11 @@ If a PC loses power, the stale rules are removed the next time it starts.
 from __future__ import annotations
 
 import argparse
+from types import FrameType
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from distributed import Client
 import atexit
 import csv
 import ipaddress
@@ -103,7 +108,7 @@ def tcp_ok(ip: str, port: int, timeout: float = 2.0) -> bool:
 _cleanup_lock = threading.Lock()
 _cleanup_done = False
 _procs: list[subprocess.Popen] = []
-_firewall: "Firewall | None" = None
+_firewall: Firewall | None = None
 _client = None  # head's monitoring client, closed before the scheduler stops
 
 
@@ -143,7 +148,7 @@ def install_exit_handlers() -> None:
 
     stopping = False
 
-    def to_interrupt(signum, _frame):
+    def to_interrupt(signum: int, _frame: FrameType | None) -> None:
         # Interrupt only once: a second Ctrl+C / SIGTERM (uv forwards them too) must not
         # abort run_cleanup halfway and orphan the scheduler and workers.
         nonlocal stopping
@@ -298,7 +303,7 @@ class Firewall:
             self.sh.close()
 
 
-def setup_firewall(args, rules: list[tuple[str, str]], local_ip: str, role: str | None = None,
+def setup_firewall(args: argparse.Namespace, rules: list[tuple[str, str]], local_ip: str, role: str | None = None,
                    exes: tuple[str, ...] = ()) -> None:
     global _firewall
     _firewall = Firewall(not args.no_firewall, rules, subnet_of(local_ip), role or args.cmd, exes)
@@ -364,7 +369,7 @@ def worker_cmd(head_ip: str, my_ip: str, procs: int) -> list[str]:
             "--death-timeout", "60", "--no-dashboard"]
 
 
-def cmd_head(args) -> None:
+def cmd_head(args: argparse.Namespace) -> None:
     my_ip = primary_ip()
     setup_firewall(args, [("tcp", f"{SCHED_PORT}:{DASH_PORT}"), ("tcp", "9000:9200")], my_ip)
 
@@ -411,7 +416,7 @@ def cmd_head(args) -> None:
     stop.set()
 
 
-def cmd_worker(args) -> None:
+def cmd_worker(args: argparse.Namespace) -> None:
     head_ip = args.head or None
     first_ip = ip_toward(head_ip) if head_ip else primary_ip()
     setup_firewall(args, [("tcp", "9000:9200"), ("udp", str(DISC_PORT))], first_ip)
@@ -428,7 +433,7 @@ def cmd_worker(args) -> None:
         time.sleep(3)
 
 
-def _connect(addr: str):
+def _connect(addr: str) -> Client:
     from distributed import Client
     try:
         return Client(addr, timeout=10)
@@ -436,7 +441,7 @@ def _connect(addr: str):
         sys.exit(f"Cannot reach scheduler at {addr}. Is `cluster.py head` running?")
 
 
-def host_table(client) -> tuple[list[str], dict[str, list[str]]]:
+def host_table(client: Client) -> tuple[list[str], dict[str, list[str]]]:
     hosts: dict[str, list[str]] = {}
     for addr, w in client.scheduler_info(n_workers=-1)["workers"].items():
         hosts.setdefault(w["host"], []).append(addr)
@@ -445,7 +450,7 @@ def host_table(client) -> tuple[list[str], dict[str, list[str]]]:
     return order, hosts
 
 
-def cmd_status(args) -> None:
+def cmd_status(args: argparse.Namespace) -> None:
     client = _connect(args.scheduler)
     order, hosts = host_table(client)
     info = client.scheduler_info(n_workers=-1)["workers"]
@@ -469,7 +474,7 @@ def monte_carlo(n: int, seed: int) -> int:
     return hit
 
 
-def cmd_bench(args) -> None:
+def cmd_bench(args: argparse.Namespace) -> None:
     t_all = time.perf_counter()
     client = _connect(args.scheduler)
     order, hosts = host_table(client)
@@ -544,7 +549,7 @@ def plot(summary: list[dict], max_nodes: int) -> None:
     fig.savefig("scaling.png", dpi=150)
 
 
-def cmd_fwrun(args) -> None:
+def cmd_fwrun(args: argparse.Namespace) -> None:
     """Open ports, run another engine's program (e.g. the Rust `ck`), close ports when it exits."""
     cmd = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not cmd:
@@ -556,7 +561,7 @@ def cmd_fwrun(args) -> None:
     sys.exit(spawn(cmd).wait())
 
 
-def cmd_fw_clean(args) -> None:
+def cmd_fw_clean(args: argparse.Namespace) -> None:
     global _firewall
     _firewall = Firewall(True, [], "0.0.0.0/0", "clean")
     if _firewall.backend:
@@ -575,7 +580,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="4-PC Dask cluster toolkit")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    def add(name: str, **kw) -> argparse.ArgumentParser:
+    def add(name: str, **kw: Any) -> argparse.ArgumentParser:
         return sub.add_parser(name, parents=[common], **kw)
 
     h = add("head", help="run scheduler + beacon (+ local worker)")

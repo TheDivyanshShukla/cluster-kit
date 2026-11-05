@@ -1,0 +1,18 @@
+# Python lint for the whole repo: every function fully type-hinted (user, 2026-11-05).
+# Run: uvx ruff@latest check .        Fix what can be fixed: uvx ruff@latest check . --fix --unsafe-fixes
+target-version = "py39"
+line-length = 140
+extend-exclude = ["vision", "rust", "console", "local", "docs/paper/figs.py", "docs/paper/build_docx.py"]
+
+[lint]
+select = [
+  "ANN",   # flake8-annotations: every argument and return typed
+  "FA",    # future annotations so modern syntax works on 3.9
+  "UP",    # pyupgrade: list[int] over List[int], X | None over Optional[X]
+  "F",     # pyflakes
+  "E9",    # syntax errors
+]
+ignore = ["ANN401"]  # Any is allowed where a value is truly dynamic (JSON, pickled user objects)
+
+[lint.per-file-ignores]
+"python/tests/**" = ["ANN201", "ANN001"]  # unittest methods and fixtures
