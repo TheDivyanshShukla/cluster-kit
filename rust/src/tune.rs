@@ -107,6 +107,12 @@ pub const KNOBS: &[Knob] = &[
     k("net_probe_every_s", "Network", 3600.0, 10.0, 604_800.0, "s", Head, "How often idle PCs get their link speed measured again."),
     k("blob_auto_kb", "Network", 64.0, 1.0, 1_048_576.0, "KB", Both, "SDK: arguments and results above this size travel as blobs."),
     k("head_uplink_mbps_cap", "Network", 0.0, 0.0, 1_000_000.0, "Mbit/s", Head, "Head uplink used in estimates; 0 = learned from parallel transfers."),
+    // retention and backups (src/store.rs maintenance, docs/OPERATIONS.md section 6)
+    k("events_keep_days", "Retention", 30.0, 1.0, 36_500.0, "days", Head, "Events (audit trail) older than this are deleted."),
+    k("parts_keep_days", "Retention", 0.0, 0.0, 36_500.0, "days", Head, "Result parts of jobs finished longer ago than this are deleted (the job row stays); 0 = keep forever."),
+    k("backup_every_h", "Retention", 0.0, 0.0, 8760.0, "h", Head, "The head saves a copy of head.db to ck-data/backups this often; 0 = off."),
+    k("backup_keep", "Retention", 7.0, 1.0, 1000.0, "files", Head, "Scheduled backups kept; the oldest are deleted."),
+    k("warm_idle_s", "SDK", 120.0, 0.0, 3600.0, "s", Agent, "Idle seconds before a PC's warm Python worker exits; 0 = warm runner off."),
     // logging (src/log.rs, docs/LOGGING.md)
     k("log_level", "Logging", 3.0, 0.0, 4.0, "level", Both, "What is written to ck-data/logs: 0 off, 1 error, 2 warn, 3 info, 4 debug."),
     k("log_chunks", "Logging", 0.0, 0.0, 1.0, "0/1", Both, "1 = also log every chunk dispatch and result (debug lines; a lot of output on big jobs)."),

@@ -197,7 +197,7 @@ class B(unittest.TestCase):
         self.assertIn("PAYLOAD_BLOB", b["cmd"])
         self.assertNotIn("\nPAYLOAD = ", b["cmd"])
         self.assertGreaterEqual(len(b["blobs"]), 2)  # code + DATA
-        self.assertLess(len(b["cmd"]), 8000)
+        self.assertLess(len(b["cmd"]), 16000)  # the runner is about 13 KB (warm worker included)
         n = self.head.puts
         ck.map(bigfns.lookup, list(range(8)), local="never", batch=False)
         self.assertEqual(self.head.puts, n)  # code and data are not sent again

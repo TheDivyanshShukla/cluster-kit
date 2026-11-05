@@ -90,7 +90,15 @@ export const EventList = z.object({ events: z.array(EventRow), next: z.number().
 export const UserList = z.object({ users: z.array(z.object({ name: z.string(), role: Role, created_ms: z.number() })) });
 
 export const NodeState = z.enum(['pending', 'active', 'cordoned', 'draining', 'maintenance', 'retired']);
-export const NodeRow = z.object({
+/** contract: node `power` may be a plain state or {state, since_ms}; either way NodeRow gets `power` + `power_since_ms` */
+const normNode = (v: unknown) => {
+	const n = v as Record<string, unknown> | null;
+	const p = n?.power;
+	if (!n || typeof p !== 'object' || p === null) return v;
+	const o = p as Record<string, unknown>;
+	return { ...n, power: o.state ?? 'awake', power_since_ms: o.since_ms ?? null };
+};
+export const NodeRow = z.preprocess(normNode, z.object({
 	node_id: z.string(),
 	host: z.string(),
 	addr: z.string(),
@@ -110,8 +118,10 @@ export const NodeRow = z.object({
 	calib_mhs: z.number().nullable().default(null),
 	presence: z.enum(['busy', 'idle']).catch('idle'),
 	/** NET-06: asleep = the head put it to sleep; waking = magic packet sent, not back yet */
-	power: z.enum(['awake', 'asleep', 'waking']).catch('awake')
-});
+	power: z.enum(['awake', 'asleep', 'waking']).catch('awake'),
+	/** when the PC entered that power state (epoch ms); null if the head does not know */
+	power_since_ms: z.number().nullish()
+}));
 export const NodeOne = z.object({ node: NodeRow });
 export const NodesChanged = z.object({ nodes: z.array(NodeRow) });
 export type NodeState = z.infer<typeof NodeState>;
@@ -222,7 +232,9 @@ export const HaStatus = z.object({
 	standbys: z.array(z.object({ node_id: z.string(), acked_seq: z.number().int(), lag: z.number().int() })),
 	membership: z.number().int(),
 	connected: z.number().int(),
-	dispatching: z.boolean()
+	dispatching: z.boolean(),
+	/** who is primary now and since when (epoch-start ms) */
+	head: z.object({ node_id: z.string(), addr: z.string().default(''), since_ms: z.number().nullable().default(null) }).nullable().default(null)
 });
 export type HaStatus = z.infer<typeof HaStatus>;
 
@@ -236,7 +248,18 @@ export const PowerSettings = z.object({
 	keep_awake: z.number().int(),
 	wake_on_demand: z.boolean()
 });
-export const PowerReply = z.object({ power: PowerSettings, asleep: z.array(z.string()).default([]) });
+export const LabPower = z.object({ lab: z.string(), watts: z.number(), awake: z.number().int().default(0), asleep: z.number().int().default(0), waking: z.number().int().default(0) });
+export type LabPower = z.infer<typeof LabPower>;
+export const PowerReply = z.object({ power: PowerSettings, asleep: z.array(z.string()).default([]), labs: z.array(LabPower).default([]) });
+
+/** SSE `changed`: a list was written, refetch it. SSE `log`: batched log lines. */
+export const WHAT = ['reserves', 'bookings', 'timetable', 'candidates', 'pools', 'caps', 'labels', 'windows'] as const;
+export type What = (typeof WHAT)[number];
+export const Changed = z.object({ what: z.enum(WHAT) });
+export const LogBatch = z.object({ lines: z.array(z.looseObject({ ts_ms: z.number(), level: z.enum(['error', 'warn', 'info', 'debug']), kind: z.string() })) });
+
+/** POST /api/v1/sim reply: the JSON `ck sim` writes (rust/src/sim.rs); its shape is normalised by lib/sim.ts */
+export const SimReply = z.record(z.string(), z.unknown());
 /** GET/PUT /api/v1/ha/settings (HA-10) */
 export const HaSettings = z.object({ target_standbys: z.number().int(), selector: z.string() });
 export const HaSettingsReply = z.object({ settings: HaSettings });

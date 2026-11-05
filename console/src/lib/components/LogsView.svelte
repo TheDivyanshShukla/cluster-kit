@@ -9,6 +9,7 @@
 	import ListToolbar from '#lib/components/ListToolbar.svelte';
 	import Panel from '#lib/components/Panel.svelte';
 	import { atLeast } from '#lib/jobs.ts';
+	import { live } from '#lib/live.svelte.ts';
 	import { Listing } from '#lib/listing.svelte.ts';
 	import { KIND_GROUPS, kindGroup, rangeLabel, rangesOf, RANGES, type Spec } from '#lib/listing.ts';
 	import { roleNow } from '#lib/session.svelte.ts';
@@ -28,11 +29,30 @@
 	let now = $state(Date.now());
 	let capped = $state(false);
 
+	let fetched = $state<LogLine[]>([]);
+	// SSE `log` lines newer than the fetched page are merged in; a 60 s refetch is the backup
+	const merged = $derived.by(() => {
+		void live.logRev;
+		const newest = fetched.reduce((m, l) => Math.max(m, l.ts_ms), 0);
+		const sig = (l: Record<string, unknown>) => JSON.stringify(l);
+		const have = new Set(fetched.map(sig));
+		const extra = (live.logTail as LogLine[]).filter((l) => l.ts_ms >= newest - 2000 && !have.has(sig(l)));
+		return fetched.concat(extra.slice().reverse());
+	});
 	async function load() {
 		try {
 			const r = await api.logs({ since_ms: Date.now() - 24 * 3_600_000, limit });
-			const seen = new Map<string, number>();
-			rows0 = r.logs
+			fetched = r.logs;
+			error = null;
+		} catch (e) {
+			error = e instanceof ApiError ? e.message : 'Could not load logs.';
+		}
+		loading = false;
+	}
+	$effect(() => {
+		const seen = new Map<string, number>();
+		{
+			rows0 = merged
 				.slice()
 				.sort((a, b) => b.ts_ms - a.ts_ms)
 				.map((line) => {
@@ -41,19 +61,15 @@
 					seen.set(base, n);
 					return { key: `${base}|${n}`, line, text: logSummary(line) };
 				});
-			capped = r.logs.length >= limit;
-			error = null;
-		} catch (e) {
-			error = e instanceof ApiError ? e.message : 'Could not load logs.';
+			capped = fetched.length >= limit;
 		}
-		loading = false;
 		now = Date.now();
-	}
+	});
 	$effect(() => {
 		if (!allowed) return;
 		void limit;
 		void load();
-		const t = setInterval(load, 4000);
+		const t = setInterval(load, 60_000);
 		return () => clearInterval(t);
 	});
 	const more = () => capped && limit < 5000 && (limit = Math.min(5000, limit * 2));

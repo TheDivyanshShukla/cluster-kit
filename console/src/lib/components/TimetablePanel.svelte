@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { live } from '#lib/live.svelte.ts';
 	import { CalendarClock, Plus, Trash2 } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import type { WindowRow } from '#lib/api/schema.ts';
@@ -17,8 +18,10 @@
 	const load = () => api.windows().then((r) => ((rows = r.windows), (error = ''))).catch((e) => (error = e instanceof ApiError ? e.message : 'Could not load the timetable.'));
 	// active_now flips with the clock, so re-read every 30 s
 	$effect(() => {
+		void live.rev.timetable;
+		void live.rev.windows;
 		void load();
-		const t = setInterval(load, 30_000);
+		const t = setInterval(load, 60_000);
 		return () => clearInterval(t);
 	});
 

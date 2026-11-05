@@ -231,7 +231,7 @@ fn fmt_local(ms: i64, offset_min: i64) -> String {
 }
 
 fn usage_admin() -> ! {
-    die("usage: ck admin nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | net [probe] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | heads | tune [KEY VALUE|default] | alerts [ack ID] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
+    die("usage: ck admin backup [PATH] | nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | net [probe] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | heads | tune [KEY VALUE|default] | alerts [ack ID] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
 }
 
 fn send(o: &Opts, method: &str, path: &str, body: Value) -> Value {
@@ -268,6 +268,16 @@ fn set_state(o: &Opts, state: &str, ids: &[String]) {
 pub fn admin(o: &Opts) {
     let rest = &o.rest;
     match rest.first().map(String::as_str) {
+        Some("backup") => {
+            // local: reads CK_DATA/head.db, safe while the head runs
+            let src = crate::store::default_path();
+            let dest = rest.get(1).map(std::path::PathBuf::from).unwrap_or_else(|| {
+                let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                src.parent().map(|d| d.join("backups")).unwrap_or_default().join(format!("head-{t}.db"))
+            });
+            crate::store::backup(&src, &dest).unwrap_or_else(|x| die(&format!("backup: {x}")));
+            println!("backup written: {}", dest.display());
+        }
         Some("nodes") => {
             println!("{:<24} {:<12} {:<7} {:<15} {:<14} HOST", "NODE", "STATE", "LINK", "ADDR", "SEAT");
             call(o, "GET", "/api/v1/nodes")["nodes"].as_array().into_iter().flatten().for_each(|n| println!("{}", node_line(n)));

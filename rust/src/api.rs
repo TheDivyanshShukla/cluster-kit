@@ -232,7 +232,11 @@ pub fn job_spec(v: &Value, who: &Who) -> Result<JobSpec, String> {
         _ => return Err("blobs must be a list of sha256 hex strings".into()),
     };
     let blob_mode = str_field(v, "blob_mode").unwrap_or("").to_string();
-    Ok(JobSpec { blobs, blob_mode, max_pcs, placement, mem_mb, name, kind: k, from, end, chunk, arg, only, submitter: who.name.clone(), selector, priority, policy, reducer, items })
+    let preempt = match v.get("preempt") {
+        None | Some(Value::Null) => false,
+        Some(x) => x.as_bool().ok_or("preempt must be true or false")?,
+    };
+    Ok(JobSpec { preempt, blobs, blob_mode, max_pcs, placement, mem_mb, name, kind: k, from, end, chunk, arg, only, submitter: who.name.clone(), selector, priority, policy, reducer, items })
 }
 
 /// Fill in the estimated finish of a running job (SCH-03).
@@ -273,6 +277,11 @@ pub fn route(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
     let out = route_in(ctx, auth, r);
     if r.path.starts_with("/api/") {
         let status = match &out { Out::Plain { status, .. } => *status, Out::Sse => 200 };
+        if r.method != "GET" && status < 300 {
+            for what in changed_what(&r.path) {
+                ctx.bus.publish("changed", &json!({"what": what}).to_string());
+            }
+        }
         let lvl = if r.method != "GET" { crate::log::Level::Info } else if status >= 400 { crate::log::Level::Warn } else { crate::log::Level::Debug };
         if crate::log::enabled(lvl) {
             let user = USER.with(|u| u.borrow().clone());
@@ -280,6 +289,21 @@ pub fn route(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
         }
     }
     out
+}
+
+/// SSE `changed` (wave 14): which lists a successful write touched, so the console refetches them.
+fn changed_what(path: &str) -> &'static [&'static str] {
+    let p: Vec<&str> = path.trim_matches('/').split('/').skip(2).collect();
+    match p.as_slice() {
+        ["reserves", ..] => &["reserves"],
+        ["reservations", ..] => &["bookings", "timetable"],
+        ["windows", ..] => &["windows", "timetable"],
+        ["pools", ..] => &["pools"],
+        ["caps", ..] => &["caps"],
+        ["nodes", _, "labels"] => &["labels"],
+        ["ha", "settings"] => &["candidates"],
+        _ => &[],
+    }
 }
 
 fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
@@ -322,6 +346,7 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
                    "needs_bootstrap": !auth.open && ctx.store.users().is_empty()}),
         ),
         ("GET", ["ha"]) => json_out(200, ha_json(ctx)),
+        ("POST", ["sim"]) => post_sim(who.as_ref(), r),
         ("POST", ["ha", "switchover"]) => {
             let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
             let Some(to) = v["to"].as_str() else { return bad("give {\"to\": STANDBY_NODE_ID}") };
@@ -514,7 +539,14 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
             Some(b) => json_out(200, json!({"breakdown": b})),
             None => fail(404, "not_found", "no such job, or it ran before time accounting existed"),
         },
-        ("GET", ["alerts"]) => json_out(200, json!({"alerts": ctx.store.alerts(r.query.get("active").is_some_and(|v| v == "1"), 500)})),
+        ("GET", ["alerts"]) => {
+            // T55: 1,000 open alerts used to show as 500 with no hint. ?limit= (default 500, max 5000); "truncated" says there is more.
+            let limit = r.query.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(500).clamp(1, 5000);
+            let mut a = ctx.store.alerts(r.query.get("active").is_some_and(|v| v == "1"), limit + 1);
+            let truncated = a.len() > limit;
+            a.truncate(limit);
+            json_out(200, json!({"alerts": a, "truncated": truncated}))
+        }
         ("POST", ["alerts", id, "ack"]) => match id.parse().ok().and_then(|id| ctx.store.alert_ack(id, me)) {
             Some(a) => {
                 ctx.bus.publish("alert", &serde_json::to_string(&a).unwrap_or_default());
@@ -613,6 +645,7 @@ fn node_json(ctx: &Ctx, n: &NodeRow, online: bool, org: &Org) -> Value {
     v["pools"] = json!(org.pools.get(&n.node_id).cloned().unwrap_or_default());
     v["class"] = json!(select::class_of(&n.inventory));
     v["power"] = json!(crate::head::power_state(ctx, &n.node_id));
+    v["power_since_ms"] = json!(crate::head::power_since(ctx, &n.node_id));
     v
 }
 
@@ -637,13 +670,58 @@ fn power_settings(ctx: &Ctx) -> crate::jobs::PowerSettings {
     ctx.store.meta("power").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
+/// POST /api/v1/sim (researcher): run a `ck sim` scenario on its own thread; one run at a time.
+fn post_sim(who: Option<&Who>, r: &Req) -> Out {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if who.is_some_and(|w| w.role < Role::Researcher) {
+        return fail(403, "forbidden", "needs the researcher role");
+    }
+    let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
+    if BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return fail(409, "busy", "a simulation is already running; try again when it ends");
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = thread::Builder::new().name("sim".into()).spawn(move || {
+        let _ = tx.send(std::panic::catch_unwind(|| crate::sim::run_api(&v)));
+        BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+    if spawned.is_err() {
+        BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+        return fail(503, "unavailable", "cannot start the simulation thread");
+    }
+    match rx.recv() {
+        Ok(Ok(Ok(v))) => json_out(200, v),
+        Ok(Ok(Err(e))) => bad(&e),
+        _ => fail(500, "internal", "the simulation crashed"),
+    }
+}
+
 fn ha_settings(ctx: &Ctx) -> crate::jobs::HaSettings {
     ctx.store.meta("ha_settings").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 fn power_json(ctx: &Ctx) -> Value {
     let asleep: Vec<String> = ctx.store.meta("asleep").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-    json!({"power": power_settings(ctx), "asleep": asleep})
+    json!({"power": power_settings(ctx), "asleep": asleep, "labs": lab_power(ctx)})
+}
+
+/// Per lab: estimated watts from the same model day-mode sim uses (sim.rs W_*), and PC counts by power state.
+/// A PC that is awake but not connected is not counted (its draw is unknown).
+fn lab_power(ctx: &Ctx) -> Vec<Value> {
+    use crate::sim::{W_BOOT, W_BUSY, W_IDLE, W_INTERACTIVE, W_SLEEP};
+    let (load, nodes) = (crate::head::load_by_node(ctx), ctx.store.nodes());
+    ctx.store.labs().iter().map(|l| {
+        let (mut w, mut c) = (0.0, [0u32; 3]);
+        for n in nodes.iter().filter(|n| n.lab_id == Some(l.id)) {
+            match (crate::head::power_state(ctx, &n.node_id), load.get(&n.node_id)) {
+                ("asleep", _) => { c[1] += 1; w += W_SLEEP }
+                ("waking", _) => { c[2] += 1; w += W_BOOT }
+                (_, Some(&(busy, user))) => { c[0] += 1; w += if user { W_INTERACTIVE } else if busy { W_BUSY } else { W_IDLE } }
+                _ => {}
+            }
+        }
+        json!({"lab": l.name, "watts": w, "awake": c[0], "asleep": c[1], "waking": c[2]})
+    }).collect()
 }
 
 fn node_power(ctx: &Ctx, r: &Req, actor: &str) -> Out {
@@ -1176,7 +1254,30 @@ pub fn ha_json(ctx: &Ctx) -> Value {
     let s = ctx.repl.status.lock().unwrap().clone();
     json!({"role": s.role, "epoch": s.epoch, "last_seq": s.last_seq, "durable_seq": crate::repl::durable_seq(ctx),
            "standbys": s.standbys.iter().map(|(n, a, l)| json!({"node_id": n, "acked_seq": a, "lag": l})).collect::<Vec<_>>(),
-           "membership": s.membership, "connected": s.connected, "dispatching": s.dispatching})
+           "membership": s.membership, "connected": s.connected, "dispatching": s.dispatching, "mixed": s.mixed, "head": head_json(&s)})
+}
+
+/// Who is primary now and since when (epoch start). A standby reports the primary it follows (node_id unknown there).
+/// ponytail: the first epoch seen counts from process start, a later one from the moment this process saw it change.
+fn head_json(s: &crate::repl::Status) -> Value {
+    static SINCE: std::sync::Mutex<Option<(u64, i64)>> = std::sync::Mutex::new(None);
+    static ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let since = {
+        let mut g = SINCE.lock().unwrap();
+        match *g {
+            Some((e, t)) if e == s.epoch => t,
+            prev => {
+                let t = if prev.is_none() { now_ms() - (head::now() * 1000.0) as i64 } else { now_ms() };
+                *g = Some((s.epoch, t));
+                t
+            }
+        }
+    };
+    if s.role == "standby" {
+        return json!({"node_id": Value::Null, "addr": s.primary, "since_ms": since});
+    }
+    let addr = ADDR.get_or_init(|| format!("{}:{}", crate::proto::local_ip().map_or("127.0.0.1".into(), |i| i.to_string()), crate::proto::port()));
+    json!({"node_id": crate::identity::node_id(), "addr": addr, "since_ms": since})
 }
 
 /// What makes an `ha` SSE event worth sending: role, epoch and the standby set (not the counters).
@@ -1464,6 +1565,102 @@ fn create_user(ctx: &Ctx, r: &Req, actor: &str) -> Out {
     }
 }
 
+// ---- SSE `log` tap (wave 14). No hook in log.rs: while any viewer is connected, one shared poller reads what the
+// logger appended to the files since the last poll (offsets per file), cuts a batch of <= 200 lines every 500 ms, and
+// every stream sends the batches it has not seen. No viewer = nobody polls = no cost. The lines were scrubbed by log.rs.
+
+struct Tail {
+    off: HashMap<std::path::PathBuf, u64>,
+    last: Option<Instant>,
+    seq: u64,
+    batches: std::collections::VecDeque<(u64, Arc<String>)>,
+}
+
+static TAIL: std::sync::Mutex<Option<Tail>> = std::sync::Mutex::new(None);
+const LOG_BATCH: usize = 200;
+
+fn tail_poll(t: &mut Tail) {
+    if t.last.is_some_and(|l| l.elapsed() < Duration::from_millis(450)) {
+        return; // another stream polled just now
+    }
+    let stale = t.last.map_or(true, |l| l.elapsed() > Duration::from_secs(5)); // nobody watched: skip the backlog
+    t.last = Some(Instant::now());
+    let Ok(rd) = std::fs::read_dir(crate::log::logs_dir()) else { return };
+    let mut lines: Vec<(i64, String)> = vec![];
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "jsonl") {
+            continue;
+        }
+        let Ok(len) = e.metadata().map(|m| m.len()) else { continue };
+        let off = t.off.entry(p.clone()).or_insert(if stale { len } else { 0 });
+        if stale {
+            *off = len;
+            continue;
+        }
+        if len < *off {
+            *off = 0; // truncated or replaced
+        }
+        if len == *off {
+            continue;
+        }
+        let Ok(mut f) = std::fs::File::open(&p) else { continue };
+        use std::io::{Seek, SeekFrom};
+        let _ = f.seek(SeekFrom::Start(*off));
+        let mut buf = vec![];
+        let _ = f.take(len - *off).read_to_end(&mut buf);
+        // only whole lines: a half-written one waits for the next poll
+        let end = buf.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        *off += end as u64;
+        for l in String::from_utf8_lossy(&buf[..end]).lines().filter(|l| !l.is_empty()) {
+            let ts = serde_json::from_str::<Value>(l).ok().and_then(|v| v["ts_ms"].as_i64()).unwrap_or(0);
+            lines.push((ts, l.to_string()));
+        }
+    }
+    t.off.retain(|p, _| p.exists());
+    if lines.is_empty() {
+        return;
+    }
+    lines.sort_by_key(|l| l.0);
+    let skip = lines.len().saturating_sub(LOG_BATCH);
+    let body = lines[skip..].iter().map(|l| l.1.as_str()).collect::<Vec<_>>().join(",");
+    t.seq += 1;
+    let seq = t.seq;
+    t.batches.push_back((seq, Arc::new(format!("{{\"lines\":[{body}]}}"))));
+    while t.batches.len() > 8 {
+        t.batches.pop_front();
+    }
+}
+
+fn log_seq() -> u64 {
+    TAIL.lock().unwrap().as_ref().map_or(0, |t| t.seq)
+}
+
+/// The next batch after `seen`, polling the files first (at most every ~500 ms across all streams).
+fn log_batch_after(seen: u64) -> Option<(u64, Arc<String>)> {
+    let mut g = TAIL.lock().unwrap();
+    let t = g.get_or_insert_with(|| Tail { off: HashMap::new(), last: None, seq: 0, batches: Default::default() });
+    tail_poll(t);
+    t.batches.iter().find(|b| b.0 > seen).map(|b| (b.0, b.1.clone()))
+}
+
+/// Changes whenever the ranking of head candidates changes; recomputed at most every 5 s however many viewers.
+fn cand_gen(ctx: &Ctx) -> u64 {
+    static G: std::sync::Mutex<Option<(Instant, String, u64)>> = std::sync::Mutex::new(None);
+    let mut g = G.lock().unwrap();
+    if g.as_ref().is_some_and(|x| x.0.elapsed() < Duration::from_secs(5)) {
+        return g.as_ref().map_or(0, |x| x.2);
+    }
+    let sig = crate::head::candidates(ctx).iter().map(|c| format!("{}{}", c["node_id"].as_str().unwrap_or(""), c["eligible"])).collect::<Vec<_>>().join(",");
+    let n = match g.take() {
+        Some((_, old, n)) if old == sig => n,
+        Some((_, _, n)) => n + 1,
+        None => 1,
+    };
+    *g = Some((Instant::now(), sig, n));
+    n
+}
+
 /// Blocking `Read` over the event bus: emits `cluster` every second, forwards bus messages, `: ping` every 15 s.
 /// Returns EOF when the bus is gone; tiny_http drops it (ending the response) when the client hangs up.
 pub struct Sse<F: FnMut() -> String> {
@@ -1476,15 +1673,23 @@ pub struct Sse<F: FnMut() -> String> {
     /// returns the `ha` event data when the role, epoch or standby set changed since the last call
     ha: Option<Box<dyn FnMut() -> Option<String> + Send>>,
     ha_due: Option<String>,
+    /// every 500 ms: extra (event, data) frames (wave 14: `log` batches, `changed` candidates)
+    extra: Option<Box<dyn FnMut() -> Vec<(&'static str, String)> + Send>>,
+    extra_due: std::collections::VecDeque<(&'static str, String)>,
+    next_extra: Instant,
 }
 
 impl<F: FnMut() -> String> Sse<F> {
     pub fn new(rx: Receiver<(String, String)>, cluster: F) -> Self {
         let now = Instant::now();
-        Sse { rx, cluster, buf: vec![], pos: 0, next_cluster: now, next_ping: now + Duration::from_secs(15), ha: None, ha_due: None }
+        Sse { rx, cluster, buf: vec![], pos: 0, next_cluster: now, next_ping: now + Duration::from_secs(15), ha: None, ha_due: None, extra: None, extra_due: Default::default(), next_extra: now + Duration::from_millis(500) }
     }
     fn with_ha(mut self, f: impl FnMut() -> Option<String> + Send + 'static) -> Self {
         self.ha = Some(Box::new(f));
+        self
+    }
+    fn with_extra(mut self, f: impl FnMut() -> Vec<(&'static str, String)> + Send + 'static) -> Self {
+        self.extra = Some(Box::new(f));
         self
     }
     fn frame(&mut self, event: &str, data: &str) {
@@ -1520,6 +1725,13 @@ impl<F: FnMut() -> String> Read for Sse<F> {
             let now = Instant::now();
             if let Some(d) = self.ha_due.take() {
                 self.frame("ha", &d);
+            } else if let Some((e, d)) = self.extra_due.pop_front() {
+                self.frame(e, &d);
+            } else if now >= self.next_extra {
+                self.next_extra = now + Duration::from_millis(500);
+                if let Some(f) = self.extra.as_mut() {
+                    self.extra_due.extend(f());
+                }
             } else if now >= self.next_cluster {
                 self.next_cluster = now + Duration::from_secs(1);
                 let j = (self.cluster)();
@@ -1531,7 +1743,7 @@ impl<F: FnMut() -> String> Read for Sse<F> {
                 pad_chunk(&mut self.buf);
                 self.pos = 0;
             } else {
-                match self.rx.recv_timeout(self.next_cluster.min(self.next_ping).saturating_duration_since(now)) {
+                match self.rx.recv_timeout(self.next_cluster.min(self.next_ping).min(self.next_extra).saturating_duration_since(now)) {
                     Ok((ev, data)) => self.frame(&ev, &data),
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return Ok(0),
@@ -1656,7 +1868,20 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
             }
             let c = ctx.clone();
             let (c2, mut last) = (ctx.clone(), String::new());
-            let sse = Sse::new(ctx.bus.subscribe(), move || cluster_cached(&c).to_string()).with_ha(move || {
+            let (c3, mut seen_log, mut seen_cand) = (ctx.clone(), log_seq(), cand_gen(ctx));
+            let sse = Sse::new(ctx.bus.subscribe(), move || cluster_cached(&c).to_string()).with_extra(move || {
+                let mut out = vec![];
+                if let Some((seq, batch)) = log_batch_after(seen_log) {
+                    seen_log = seq;
+                    out.push(("log", batch.to_string()));
+                }
+                let g = cand_gen(&c3);
+                if g != seen_cand {
+                    seen_cand = g;
+                    out.push(("changed", r#"{"what":"candidates"}"#.into()));
+                }
+                out
+            }).with_ha(move || {
                 let sig = ha_sig(&c2);
                 (sig != last).then(|| {
                     last = sig;
@@ -1776,6 +2001,25 @@ mod tests {
             assert!(hit.is_some_and(|c| c.2.starts_with("ck ") || c.2.starts_with("no CLI needed: ")), "{m} {p} has no CLI command or console-only reason");
         }
         assert_eq!(crate::jobcli::CLI_MAP.len(), users::ROUTES.len(), "stale CLI_MAP entry");
+    }
+
+    #[test]
+    fn wave14_contracts() {
+        let (c, a) = (ctx(), Auth::new(false));
+        let (vw, rs) = (tok(&c, &a, "vw", "viewer"), tok(&c, &a, "rs", "researcher"));
+        let (_, v) = call(&c, &a, &vw, "GET", "/api/v1/ha", "");
+        assert!(v["head"]["since_ms"].as_i64().unwrap() > 0 && v["head"]["addr"].as_str().unwrap().contains(':'), "{v}");
+        let (s, v) = call(&c, &a, &vw, "GET", "/api/v1/power", "");
+        assert_eq!((s, v["labs"].is_array()), (200, true));
+        assert_eq!(call(&c, &a, &vw, "POST", "/api/v1/sim", "{}").0, 403);
+        let (s, v) = call(&c, &a, &rs, "POST", "/api/v1/sim", r#"{"nodes":[{"count":4,"rate":1e5}],"job":{"n":1e6}}"#);
+        assert_eq!((s, v["summary"]["finished"].as_bool()), (200, Some(true)), "{v}");
+        assert_eq!(call(&c, &a, &rs, "POST", "/api/v1/sim", r#"{"nodes":[{"count":30000}]}"#).0, 400);
+        let rx = c.bus.subscribe();
+        let op = tok(&c, &a, "op", "operator");
+        assert_eq!(call(&c, &a, &op, "POST", "/api/v1/reserves", r#"{"selector":"","keep_n":0,"keep_pct":10}"#).0, 200);
+        assert_eq!(rx.try_iter().filter(|e| e.0 == "changed" && e.1.contains("reserves")).count(), 1);
+        assert_eq!(changed_what("/api/v1/nodes/pc1/labels"), &["labels"]);
     }
 
     #[test]

@@ -23,7 +23,21 @@ jobs:
       - name: chaos
         if: matrix.os == 'ubuntu-latest'
         working-directory: .
+        env:
+          CK_POWER_DRY: "1"
         run: bash scripts/chaos.sh
+  console:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun test
+      - run: bun run build
   python:
     strategy:
       fail-fast: false

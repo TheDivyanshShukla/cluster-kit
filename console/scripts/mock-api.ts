@@ -73,7 +73,7 @@ const workers = Array.from({ length: 30 }, (_, i) => {
 
 // ---- fleet: node registry, labs, join codes
 type NState = 'pending' | 'active' | 'cordoned' | 'draining' | 'maintenance' | 'retired';
-type Node = { node_id: string; host: string; addr: string; inventory: unknown; first_seen_ms: number; last_seen_ms: number; state: NState; state_reason: string; state_by: string; lab_id: number | null; x: number | null; y: number | null; online: boolean; calib_mhs: number | null; presence: 'busy' | 'idle'; labels: Record<string, string>; pools: string[]; class: string; power: 'awake' | 'asleep' | 'waking' };
+type Node = { node_id: string; host: string; addr: string; inventory: unknown; first_seen_ms: number; last_seen_ms: number; state: NState; state_reason: string; state_by: string; lab_id: number | null; x: number | null; y: number | null; online: boolean; calib_mhs: number | null; presence: 'busy' | 'idle'; labels: Record<string, string>; pools: string[]; class: string; power: 'awake' | 'asleep' | 'waking'; power_since_ms?: number };
 const labs: { id: number; name: string; w: number; h: number; created_ms: number }[] = [
 	{ id: 1, name: 'Lab A', w: 6, h: 4, created_ms: ago(8e8) },
 	{ id: 2, name: 'Lab B', w: 5, h: 3, created_ms: ago(7e8) }
@@ -166,13 +166,17 @@ function matchIds(q: string): string[] {
 	return typeof f === 'string' ? [] : [...nodes.values()].filter(f).map((n) => n.node_id);
 }
 const sendAll = (name: string, data: unknown) => { for (const s of subs) s(name, data); };
-const setNode = (id: string, patch: Partial<Node>) => { const n = nodes.get(id)!; Object.assign(n, patch); sendAll('node', n); };
+const changed = (what: string) => sendAll('changed', { what });
+// contract: the node's `power` is {state, since_ms} on the wire
+const wire = (n: Node) => ({ ...n, power: { state: n.power, since_ms: n.power_since_ms ?? null }, power_since_ms: undefined });
+const setNode = (id: string, patch: Partial<Node>) => { const n = nodes.get(id)!; if (patch.power && patch.power !== n.power) patch = { ...patch, power_since_ms: now() }; Object.assign(n, patch); sendAll('node', wire(n)); };
 const takes = (id: string) => { const n = nodes.get(id)!; return n.online && (n.state === 'active' || n.state === 'draining'); };
 // states change over time: pc-05 drains then cordons, pc-30 (unplaced) drops off, pc-12 comes back from maintenance
 setTimeout(() => setNode('n005', { state: 'draining', state_reason: 'disk check', state_by: 'admin' }), 12_000);
 setTimeout(() => setNode('n005', { state: 'cordoned' }), 28_000);
 setTimeout(() => { setNode('n030', { online: false }); logEvent('node.lost', '', 'pc-30 lost'); }, 20_000);
 Object.assign(nodes.get('n004')!, { online: false, power: 'asleep' }); // an asleep PC from the start
+[...nodes.values()].forEach((n, i) => (n.power_since_ms = now() - (2 + (i % 9)) * 600_000 - i * 37_000));
 Object.assign(nodes.get('n012')!, { state: 'maintenance', state_reason: 'RAM swap', state_by: 'admin' });
 
 type Ev = { id: number; ts_ms: number; kind: string; actor: string; detail: string };
@@ -183,7 +187,11 @@ const subs = new Set<(name: string, data: unknown) => void>();
 type LogLine = Record<string, unknown> & { ts_ms: number; level: 'error' | 'warn' | 'info' | 'debug'; role: string; node: string; kind: string };
 const logLines: LogLine[] = [];
 const LV = { error: 0, warn: 1, info: 2, debug: 3 } as const;
-const pushLog = (l: LogLine) => { logLines.push(l); if (logLines.length > 40_000) logLines.splice(0, 5_000); };
+let logLive = false; // after the seeded history: new lines also go out as SSE `log`, batched every 500 ms, at most 200 per batch
+let logBatch: LogLine[] = [];
+const pushLog = (l: LogLine) => { logLines.push(l); if (logLines.length > 40_000) logLines.splice(0, 5_000); if (logLive) logBatch.push(l); };
+setInterval(() => { if (logBatch.length) { sendAll('log', { lines: logBatch.slice(-200) }); logBatch = []; } }, 500);
+setTimeout(() => (logLive = true), 100);
 
 const EV_KINDS: [string, string, (n: number) => string][] = [
 	['node.join', '', (n) => `pc-${String(1 + (n % 30)).padStart(2, '0')} joined`],
@@ -291,13 +299,15 @@ let haCfg = { target_standbys: 2, selector: '!virtual' };
 const ha = { head: 'n001', role: 'primary' as 'primary' | 'standby' | 'candidate', epoch: 3, standbys: [{ node_id: 'n018', lag: 0 }, { node_id: 'n022', lag: 0 }] };
 const hostOf = (id: string) => nodes.get(id)?.host ?? id;
 const pushHa = () => sendAll('ha', haState());
+const headSince = { ms: now() - 3 * 3_600_000 - 14 * 60_000 };
 const haState = () => {
 	const connected = workers.filter((w) => nodes.get(w.node_id!)!.online).length;
 	const wob = (id: string) => (id === 'n022' && Math.floor(now() / 1000) % 5 === 0 ? 2 : 0); // a little lag now and then
 	const sb = ha.role === 'candidate' ? [] : ha.standbys.map((s) => ({ node_id: s.node_id, lag: Math.max(s.lag, wob(s.node_id)) }));
 	return {
 		role: ha.role, epoch: ha.epoch, last_seq: haSeq, durable_seq: haSeq - Math.max(0, ...sb.map((s) => s.lag)),
-		standbys: sb.map((s) => ({ ...s, acked_seq: haSeq - s.lag })), membership: nodes.size, connected, dispatching: ha.role === 'primary'
+		standbys: sb.map((s) => ({ ...s, acked_seq: haSeq - s.lag })), membership: nodes.size, connected, dispatching: ha.role === 'primary',
+		head: ha.role === 'candidate' ? null : { node_id: ha.head, addr: nodes.get(ha.head)?.addr ?? '', since_ms: headSince.ms }
 	};
 };
 function recruit() {
@@ -321,6 +331,7 @@ function failover(after: number, first?: string) {
 			if (head) ha.head = head.node_id;
 			ha.role = 'primary';
 			ha.epoch++;
+			headSince.ms = now();
 			logEvent('ha.promote', '', `${head ? hostOf(head.node_id) : 'a standby'} is the head, term ${ha.epoch}`);
 			pushHa();
 			setTimeout(recruit, 6_000);
@@ -449,6 +460,60 @@ function candidates() {
 	}).sort((a, b) => b.score - a.score);
 }
 
+// watts per lab from the same model sim.rs uses: idle 25 W, busy 65 W, sleep 2 W, boot 65 W
+const labWatts = () => labs.map((l) => {
+	const ns = [...nodes.values()].filter((n) => n.lab_id === l.id);
+	const c = { awake: 0, asleep: 0, waking: 0 };
+	let watts = 0;
+	for (const n of ns) { c[n.power]++; watts += n.power === 'asleep' ? 2 : n.power === 'waking' ? 65 : n.presence === 'busy' ? 65 : 25; }
+	return { lab: l.name, watts, ...c };
+});
+// ---- POST /api/v1/sim: a plausible stand-in for rust/src/sim.rs (same JSON as `ck sim` writes: summary + timeline)
+let simBusy = false;
+function rng(seed: number) { let s = seed >>> 0 || 1; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32); }
+function simJob(b: any, pcs: number) {
+	const r = rng(b.seed ?? 1);
+	const rate = b.nodes.reduce((a: number, g: any) => a + (g.count ?? 1) * (g.rate ?? 1e6) * (1 - (g.jitter ?? 0) / 4), 0);
+	const n = b.job.n, ideal = n / rate;
+	const fails = b.nodes.reduce((a: number, g: any) => a + (g.mtbf_s > 0 ? Math.round(((g.count ?? 1) * ideal) / g.mtbf_s) : 0), 0);
+	const headFail = b.head_failure?.at_s != null && b.head_failure.at_s < ideal ? (b.architecture === 'single' ? (b.head_failure.manual_restart_s ?? 100) : (b.head_failure.recovery_s ?? 6)) : 0;
+	const slow = 1 + 0.015 + (b.architecture === 'single' ? 0.02 : 0) + Math.min(0.08, pcs / 150_000) + fails * 2e-5;
+	const end = ideal * slow + headFail, sample = b.sample_s ?? Math.max(1, end / 200);
+	const tl: number[][] = [];
+	for (let t = 0, done = 0; t <= end + sample; t += sample) {
+		const ramp = Math.min(1, t / Math.max(sample * 2, 1)), stall = headFail && t > b.head_failure.at_s && t < b.head_failure.at_s + headFail ? 0 : 1;
+		const up = Math.round(pcs * (1 - 0.01 * r()) * (stall ? 1 : 0.97));
+		const rt = Math.min(rate * ramp * stall * (0.97 + 0.03 * r()), (n - done) / sample);
+		done += rt * sample;
+		tl.push([+t.toFixed(3), Math.round(done), Math.round(rt), Math.round(up * (done >= n ? 0 : 0.96 + 0.04 * r())), up, Math.min(1, 0.05 + pcs / 60_000 + 0.02 * r())]);
+		if (done >= n) break;
+	}
+	return {
+		summary: { finished: true, makespan_s: end, end_s: end, ideal_s: ideal, efficiency_pct: 100 * ideal / end, n, done: n, tasks: Math.round(n / 5e5), head_utilisation_pct: Math.min(100, 5 + pcs / 600), node_failures: fails, recovered_work: fails * 4_000_000, duplicate_work: 0, throughput_per_s: n / end, tasks_per_s: Math.round(n / 5e5) / end },
+		series: tl
+	};
+}
+function simDay(b: any, pcs: number) {
+	const hours = b.day.hours ?? 24, step = 300, eco = !!b.eco?.enabled, pw = { idle: 25, busy: 65, sleep: 2, ...b.power };
+	const lines = ['t_s,asleep,booting,awake_idle,busy,class,power_w'];
+	let wh = 0, wakes = 0, prev = 0;
+	for (let t = 0; t <= hours * 3600; t += step) {
+		const h = (t / 3600) % 24, work = h >= 1 && h < 9 ? 0.85 : 0.1, cls = h >= 9 && h < 17 ? Math.min(pcs, 60) : 0;
+		const busy = Math.round(pcs * work), idle0 = pcs - busy - cls;
+		const asleep = eco ? Math.round(idle0 * (h >= 17 || h < 8 ? 0.9 : 0.5)) : 0, booting = eco && Math.abs(asleep - prev) > pcs * 0.2 ? Math.round(pcs * 0.05) : 0;
+		if (asleep < prev) wakes += prev - asleep;
+		prev = asleep;
+		const idle = Math.max(0, idle0 - asleep - booting), w = busy * pw.busy + idle * pw.idle + asleep * pw.sleep + booting * 65 + cls * 45;
+		wh += (w * step) / 3600;
+		lines.push([t, asleep, booting, idle, busy, cls, Math.round(w)].join(','));
+	}
+	const ch = (x: number) => +(wh * x / 1000).toFixed(2);
+	return {
+		kwh: ch(1), kwh_busy: ch(0.55), kwh_idle: ch(eco ? 0.3 : 0.45), kwh_sleep: ch(eco ? 0.05 : 0), kwh_boot: ch(eco ? 0.04 : 0), kwh_class: ch(0.06), node_failures: 0, head_failures: 0, lost_work: 0, wakes, class_delay_pc_s: 0, class_delay_max_s: eco ? 45 : 0, hours,
+		jobs: (b.jobs ?? []).map((j: any) => ({ name: j.name, arrive_s: (j.arrive_h ?? 0) * 3600, started_s: (j.arrive_h ?? 0) * 3600 + 30, finished_s: (j.arrive_h ?? 0) * 3600 + 5400, wait_s: 30, makespan_s: 5430, run_s: 5400, pc_seconds: pcs * 5400, peak_pcs: pcs, done: j.work, left: 0, marginal_busy_kwh: 3.2 })),
+		_timeline: lines.join('\n') + '\n'
+	};
+}
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
 	new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
 const err = (status: number, code: string, message: string) => json({ error: { code, message } }, status);
@@ -585,11 +650,11 @@ async function handle(req: Request): Promise<Response> {
 			failover(0, b.to);
 			return json({ to: nodes.get(b.to)?.addr ?? b.to }, 202);
 		}
-	if (p === '/api/v1/nodes' && m === 'GET') return json({ nodes: [...nodes.values()] });
+	if (p === '/api/v1/nodes' && m === 'GET') return json({ nodes: [...nodes.values()].map(wire) });
 	const nm = /^\/api\/v1\/nodes\/([^/]+)(\/place)?$/.exec(p);
 	if (nm && m === 'GET' && !nm[2]) {
 		const n = nodes.get(nm[1]);
-		return n ? json({ node: n }) : err(404, 'not_found', 'No such PC.');
+		return n ? json({ node: wire(n) }) : err(404, 'not_found', 'No such PC.');
 	}
 	if (p === '/api/v1/nodes/power' && m === 'POST') {
 		if ((d = need('operator'))) return d;
@@ -615,7 +680,7 @@ async function handle(req: Request): Promise<Response> {
 			powerCfg = { mode: b.mode, idle_min: b.idle_min, keep_awake: b.keep_awake, wake_on_demand: !!b.wake_on_demand };
 			logEvent('power.settings', me.name, `${powerCfg.mode}, idle ${powerCfg.idle_min} min`);
 		}
-		return json({ power: powerCfg, asleep: [...nodes.values()].filter((n) => n.power === 'asleep').map((n) => n.node_id) });
+		return json({ power: powerCfg, asleep: [...nodes.values()].filter((n) => n.power === 'asleep').map((n) => n.node_id), labs: labWatts() });
 	}
 	if (p === '/api/v1/ha/settings') {
 		if (m === 'PUT') {
@@ -865,6 +930,21 @@ async function handle(req: Request): Promise<Response> {
 		const { rows, next } = page(events, url);
 		return json({ events: rows, next });
 	}
+	if (p === '/api/v1/sim' && m === 'POST') {
+		if ((d = need('researcher'))) return d;
+		const b = await body();
+		const day = b && typeof b === 'object' && 'day' in b;
+		const groups = (day ? b.pcs : b.nodes) ?? [];
+		const pcs = groups.reduce((a: number, g: any) => a + (g.count ?? 1), 0);
+		if (!Array.isArray(groups) || (!day && !(b.job?.n > 0))) return err(400, 'invalid_request', 'Give nodes and a job size.');
+		if (pcs > 20_000) return err(400, 'invalid_request', 'At most 20000 nodes per run.');
+		if (day && (b.day.hours ?? 24) > 48) return err(400, 'invalid_request', 'At most 48 simulated hours per run.');
+		if (simBusy) return err(409, 'conflict', 'Another simulation is running.');
+		simBusy = true;
+		await new Promise((r) => setTimeout(r, 400 + Math.min(1500, pcs / 10)));
+		simBusy = false;
+		return json(day ? simDay(b, pcs) : simJob(b, pcs));
+	}
 	if (p === '/api/v1/stream') {
 		const enc = new TextEncoder();
 		let send: (n: string, d: unknown) => void;
@@ -888,5 +968,12 @@ async function handle(req: Request): Promise<Response> {
 	return err(404, 'not_found', `No route ${m} ${p}.`);
 }
 
-Bun.serve({ port: PORT, hostname: '127.0.0.1', idleTimeout: 0, fetch: handle });
+// SSE `changed` after each successful write of a list (contract)
+const WRITES: [RegExp, string[]][] = [[/\/reserves/, ['reserves', 'candidates']], [/\/caps/, ['caps']], [/\/windows/, ['windows', 'timetable']], [/\/reservations/, ['bookings']], [/\/pools/, ['pools']], [/\/labels$/, ['labels']], [/\/ha\/settings/, ['candidates']]];
+async function serve(req: Request) {
+	const res = await handle(req);
+	if (req.method !== 'GET' && res.status < 300) for (const [re, whats] of WRITES) if (re.test(new URL(req.url).pathname)) whats.forEach(changed);
+	return res;
+}
+Bun.serve({ port: PORT, hostname: '127.0.0.1', idleTimeout: 0, fetch: serve });
 console.log(`mock ck head on http://127.0.0.1:${PORT} (auth: ${MODE})`);

@@ -6,7 +6,7 @@
 	import { history } from '#lib/canvas/history.ts';
 	import NodeActions from '#lib/components/NodeActions.svelte';
 	import NodeStateChip from '#lib/components/NodeStateChip.svelte';
-	import { ago, bytes, count, pct, rate } from '#lib/format.ts';
+	import { ago, bytes, count, duration, pct, rate } from '#lib/format.ts';
 	import { live } from '#lib/live.svelte.ts';
 
 	// The canvas side panel for one PC: Info, Activity (30 minute sparkline), Events, Actions.
@@ -74,6 +74,7 @@
 				<dt class="text-muted-foreground">Agent</dt><dd class="num">{node.inventory?.ck_version ?? '—'}</dd>
 				<dt class="text-muted-foreground">Calibration</dt><dd class="num">{node.calib_mhs != null ? `${node.calib_mhs.toFixed(2)} MH/s` : '—'}</dd>
 				<dt class="text-muted-foreground">Now</dt><dd class="num">{worker ? `${pct(worker.cpu)} CPU · ${rate(worker.rate)}` : 'not connected'}</dd>
+				{#if node.power !== 'awake' || node.power_since_ms}<dt class="text-muted-foreground">Power</dt><dd class="num">{node.power}{node.power_since_ms ? ` for ${duration(Date.now() - node.power_since_ms)}` : ''}</dd>{/if}
 				<dt class="text-muted-foreground">Last seen</dt><dd class="num">{ago(node.last_seen_ms)}</dd>
 				{#if node.pools.length}<dt class="text-muted-foreground">Pools</dt><dd class="min-w-0 break-words">{node.pools.join(', ')}</dd>{/if}
 				{#if Object.keys(node.labels).length}<dt class="text-muted-foreground">Labels</dt><dd class="min-w-0 break-words font-mono text-xs">{Object.entries(node.labels).map(([k, v]) => `${k}=${v}`).join(' ')}</dd>{/if}

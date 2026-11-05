@@ -31,6 +31,12 @@ export function duration(ms: number | null | undefined): string {
 	return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} m`;
 }
 
+/** 1,840 W stays watts below 10 kW, then kW. */
+export function watts(w: number | null | undefined): string {
+	if (w == null || !Number.isFinite(w)) return dash;
+	return w < 10_000 ? `${Math.round(w).toLocaleString('en')} W` : `${(w / 1000).toLocaleString('en', { maximumFractionDigits: 1 })} kW`;
+}
+
 export function ago(ms: number | null | undefined, now = Date.now()): string {
 	if (ms == null) return dash;
 	const d = duration(Math.max(0, now - ms));

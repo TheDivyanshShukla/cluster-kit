@@ -19,6 +19,85 @@ pub fn default_path() -> PathBuf {
     PathBuf::from(std::env::var("CK_DATA").unwrap_or_else(|_| "ck-data".into())).join("head.db")
 }
 
+/// Retention (wave 14): delete old events and, if `parts_days` > 0, parts of long-finished jobs, in batches of 2,000
+/// rows on its own connection so dispatch never waits long. Returns (events, parts) deleted.
+pub fn prune(path: &Path, events_days: u64, parts_days: u64, now_ms: i64) -> Result<(u64, u64), String> {
+    let c = Connection::open(path).map_err(e)?;
+    c.busy_timeout(std::time::Duration::from_millis(5000)).map_err(e)?;
+    let day = 86_400_000i64;
+    let batch = |sql: &str, cut: i64| -> Result<u64, String> {
+        let mut total = 0u64;
+        loop {
+            let n = c.execute(sql, [cut]).map_err(e)? as u64;
+            total += n;
+            if n < 2000 { return Ok(total); }
+            std::thread::sleep(std::time::Duration::from_millis(50)); // let the head write between batches
+        }
+    };
+    let ev = batch("DELETE FROM events WHERE id IN (SELECT id FROM events WHERE ts_ms<? ORDER BY id LIMIT 2000)", now_ms - events_days as i64 * day)?;
+    let parts = if parts_days == 0 { 0 } else {
+        batch("DELETE FROM parts WHERE rowid IN (SELECT parts.rowid FROM parts JOIN jobs ON jobs.id=parts.job_id WHERE jobs.finished_ms IS NOT NULL AND jobs.finished_ms<? LIMIT 2000)", now_ms - parts_days as i64 * day)?
+    };
+    Ok((ev, parts))
+}
+
+/// A consistent copy of the database (VACUUM INTO), safe while the head runs. `dest` must not exist.
+pub fn backup(path: &Path, dest: &Path) -> Result<(), String> {
+    if dest.exists() { return Err(format!("{} already exists", dest.display())); }
+    if let Some(d) = dest.parent().filter(|d| !d.as_os_str().is_empty()) { std::fs::create_dir_all(d).map_err(|x| format!("create {}: {x}", d.display()))?; }
+    let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(e)?;
+    c.busy_timeout(std::time::Duration::from_millis(30_000)).map_err(e)?;
+    let tmp = dest.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    c.execute("VACUUM INTO ?", [tmp.to_string_lossy().as_ref()]).map_err(e)?;
+    std::fs::rename(&tmp, dest).map_err(|x| x.to_string())
+}
+
+/// Scheduled backup: when the newest `head-*.db` in `dir` is older than `every_h`, write a new one, then keep `keep` files.
+pub fn scheduled_backup(path: &Path, dir: &Path, every_h: u64, keep: usize, now_s: u64) -> Result<Option<PathBuf>, String> {
+    let mut files: Vec<(u64, PathBuf)> = std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|f| {
+        let n = f.file_name().to_string_lossy().into_owned();
+        Some((n.strip_prefix("head-")?.strip_suffix(".db")?.parse().ok()?, f.path()))
+    }).collect();
+    files.sort();
+    if files.last().is_some_and(|(t, _)| now_s < t + every_h * 3600) { return Ok(None); }
+    let dest = dir.join(format!("head-{now_s}.db"));
+    backup(path, &dest)?;
+    files.push((now_s, dest.clone()));
+    for (_, f) in files.iter().take(files.len().saturating_sub(keep.max(1))) { let _ = std::fs::remove_file(f); }
+    Ok(Some(dest))
+}
+
+/// Background thread of a running head: retention every 10 minutes, backups when `backup_every_h` > 0.
+pub fn maintenance_thread() {
+    std::thread::spawn(|| {
+        let path = default_path();
+        let mut last_prune = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        std::thread::sleep(std::time::Duration::from_secs(30)); // after the head's own startup and migrations
+        loop {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+            if last_prune.elapsed().as_secs() >= 600 {
+                last_prune = std::time::Instant::now();
+                match prune(&path, crate::tune::n("events_keep_days"), crate::tune::n("parts_keep_days"), now) {
+                    Ok((0, 0)) => {}
+                    Ok((ev, parts)) => crate::say!("store.prune", "retention: deleted {ev} events, {parts} parts"),
+                    Err(x) => crate::say!("store.prune", "retention failed: {x}"),
+                }
+            }
+            let h = crate::tune::n("backup_every_h");
+            if h > 0 {
+                let dir = path.parent().map(|d| d.join("backups")).unwrap_or_else(|| PathBuf::from("backups"));
+                match scheduled_backup(&path, &dir, h, crate::tune::n("backup_keep") as usize, (now / 1000) as u64) {
+                    Ok(Some(f)) => crate::say!("store.backup", "backup written: {}", f.display()),
+                    Ok(None) => {}
+                    Err(x) => crate::say!("store.backup", "backup failed: {x}"),
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
+}
+
 /// Append-only: entry N moves user_version from N to N+1. Never edit an applied entry.
 const MIGRATIONS: &[&str] = &["
 CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, kind INTEGER NOT NULL, from_n INTEGER NOT NULL,

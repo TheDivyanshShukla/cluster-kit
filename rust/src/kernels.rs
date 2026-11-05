@@ -322,29 +322,67 @@ fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, stdin: Option<&
     let attempt = env::var("CK_ATTEMPT").unwrap_or_else(|_| "1".into());
     c.env("CK_JOB", job.to_string()).env("CK_TASK", format!("{job}:{a}-{b}")).env("CK_ATTEMPT", attempt)
         .env("CK_THREADS", pieces.to_string()).env("CK_START", a.to_string()).env("CK_END", b.to_string()).env("CK_SCRATCH", &scratch);
+    let warm = crate::tune::n("warm_idle_s");
+    c.env("CK_WARM_IDLE_S", warm.to_string());
+    if warm == 0 { c.env("CK_WARM", "off"); }
     c.envs(crate::blobs::env_for(job)); // wave 13: CK_BLOBS, CK_BLOB_<i>
-    let out = match stdin {
-        None => c.output(),
-        Some(items) => c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().and_then(|mut ch| {
-            let mut si = ch.stdin.take().unwrap();
-            let items = items.to_vec();
-            // a thread, so a program that fills its output pipe before reading all input cannot deadlock us
-            std::thread::spawn(move || { let _ = si.write_all(&items); }); // a closed pipe (program ignored stdin) is fine
-            ch.wait_with_output()
-        }),
-    };
+    let cap = out_max();
+    let out = run_capped(&mut c, stdin, cap);
     let _ = fs::remove_dir_all(&scratch);
-    let o = out.map_err(|e| (false, format!("could not start the program: {e}")))?;
-    match o.status.code() {
-        Some(0) if o.stdout.len() > out_max() => Err((false, format!("output over the {} MiB limit", out_max() >> 20))),
-        Some(0) => Ok(o.stdout),
+    let (code, stdout, stderr, over) = out.map_err(|e| (false, format!("could not start the program: {e}")))?;
+    if over {
+        return Err((false, format!("output over the {} MiB limit (program stopped)", cap >> 20)));
+    }
+    match code {
+        Some(0) => Ok(stdout),
         code => {
-            let err = String::from_utf8_lossy(&o.stderr);
+            let err = String::from_utf8_lossy(&stderr);
             let last: String = err.trim().lines().last().unwrap_or("").chars().take(300).collect();
             let what = code.map_or("killed by a signal".to_string(), |c| format!("exit {c}"));
             Err((code == Some(75), format!("{what}: {last}")))
         }
     }
+}
+
+/// Run `c`, reading stdout as it comes: past `cap` bytes the child is killed (a program printing 1 GB never sits in
+/// RAM). Returns (exit code, stdout, last 64 KiB of stderr, over-cap).
+fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize) -> std::io::Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
+    use std::io::Read;
+    c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut ch = c.spawn()?;
+    if let Some(items) = stdin {
+        let mut si = ch.stdin.take().unwrap();
+        let items = items.to_vec();
+        // a thread, so a program that fills its output pipe before reading all input cannot deadlock us
+        std::thread::spawn(move || { let _ = si.write_all(&items); }); // a closed pipe (program ignored stdin) is fine
+    }
+    let mut se = ch.stderr.take().unwrap();
+    let err_t = std::thread::spawn(move || {
+        let (mut tail, mut buf) = (Vec::<u8>::new(), [0u8; 8192]);
+        while let Ok(n) = se.read(&mut buf) {
+            if n == 0 { break; }
+            tail.extend_from_slice(&buf[..n]);
+            if tail.len() > 131072 { tail.drain(..tail.len() - 65536); }
+        }
+        tail
+    });
+    let mut so = ch.stdout.take().unwrap();
+    let (mut out, mut buf, mut over) = (Vec::new(), vec![0u8; 65536], false);
+    loop {
+        let n = so.read(&mut buf).unwrap_or(0);
+        if n == 0 { break; }
+        if out.len() + n > cap { over = true; break; }
+        out.extend_from_slice(&buf[..n]);
+    }
+    if over {
+        let _ = ch.kill();
+        drop(so);
+        let _ = ch.wait();
+        return Ok((None, Vec::new(), Vec::new(), true)); // stderr thread is left to finish on its own
+    }
+    let status = ch.wait()?;
+    let tail = err_t.join().unwrap_or_default();
+    Ok((status.code(), out, tail, false))
 }
 
 #[cfg(test)]
@@ -364,6 +402,20 @@ mod tests {
         }
         let (mask, want) = prefix_words(&[6, 0xb, 8, 6]);
         assert_eq!((mask[0], want[0], mask[1]), (0xffff_0000, 0x6b86_0000, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_output_cap_stops_the_program() {
+        let t = Instant::now();
+        let mut c = Command::new("sh");
+        c.args(["-c", "yes | head -c 1000000000"]);
+        let (_, out, _, over) = run_capped(&mut c, None, 1 << 20).unwrap();
+        assert!(over && out.is_empty() && t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+        let mut c = Command::new("sh");
+        c.args(["-c", "cat; echo e >&2; exit 3"]);
+        let (code, out, err, over) = run_capped(&mut c, Some(b"hi"), 1 << 20).unwrap();
+        assert_eq!((code, out, err, over), (Some(3), b"hi".to_vec(), b"e\n".to_vec(), false));
     }
 
     #[test]

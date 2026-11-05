@@ -32,6 +32,7 @@ pub struct Job {
     pub started: Instant,
     pub selector: Selector,       // which nodes may run it (ORG-04)
     pub priority: u8,
+    pub user: String, // submitter (SCH-04 fair share)
     pub policy: sched::ChunkPolicy, // SCH-06
     pub max_pcs: u32,               // wave 10b: at most this many PCs hold its chunks; 0 = no limit
     pub placement: String,          // spread | pack | fastest | efficient
@@ -437,7 +438,7 @@ fn node_views(st: &State) -> Vec<NodeView> {
             node_id: w.hello.as_ref().map_or_else(|| w.addr.clone(), |h| h.node_id.clone()),
             attrs: w.attrs.clone(),
             takes_tasks: can_work(w),
-            job: w.inflight.first().map(|t| t.0),
+            job: w.inflight.last().map(|t| t.0), // the job it was fed last: where the PC is being steered
             inflight: w.inflight.len(),
         })
         .collect()
@@ -505,7 +506,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         let jv: Vec<JobView> = st
             .jobs
             .values()
-            .map(|j| JobView { id: j.id, priority: j.priority, selector: j.selector.clone(), has_work: j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) })
+            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: j.selector.clone(), has_work: j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) })
             .collect();
         sched::pick_job(wid, &views, &jv, &st.policy.reserves)?
     };
@@ -783,7 +784,7 @@ fn start_job(ctx: &Ctx, st: &mut State, id: u64) {
     }
     st.jobs.insert(id, Job {
         id, kind: spec.kind, arg: spec.arg, next: spec.end, end: spec.end, chunk, total, left, todo: left,
-        requeue: todo.into_iter().rev().collect(), only: spec.only, started: Instant::now(), selector, priority: spec.priority, policy,
+        requeue: todo.into_iter().rev().collect(), only: spec.only, started: Instant::now(), selector, priority: spec.priority, user: spec.submitter.clone(), policy,
         max_pcs: spec.max_pcs, placement: spec.placement, mem_mb: spec.mem_mb, blobs: spec.blobs, blob_mode: spec.blob_mode, shared, shards, item_sha,
     });
     let p = paused_now(st);
@@ -1682,8 +1683,39 @@ fn submit_with(ctx: &Ctx, mut spec: JobSpec, sub: Option<mpsc::Sender<(u8, Vec<u
         st.subs.entry(row.id).or_default().push(tx);
     }
     start_job(ctx, &mut st, row.id);
+    let sends = if spec.preempt { preempt_lower(&mut st, row.id) } else { vec![] };
     drop(st);
+    flush(sends);
     Ok(ctx.store.job(row.id).unwrap_or(row))
+}
+
+/// SCH-09 `preempt: true`: take back every outstanding chunk of jobs with a lower priority than job `id` at once. The
+/// ranges go back on their job's queue (CANCEL_RANGE tells the PC to drop that chunk); a result that still arrives is
+/// stored once and subtracted from the queue like a lost speculative race, so every number is credited exactly once.
+fn preempt_lower(st: &mut State, id: u64) -> Sends {
+    let Some(pri) = st.jobs.get(&id).map(|j| j.priority) else { return vec![] };
+    let mut sends = vec![];
+    let mut back: Vec<(u64, u64, u64)> = vec![];
+    for w in st.workers.values_mut() {
+        let lower: Vec<_> = w.inflight.iter().filter(|t| st.jobs.get(&t.0).is_some_and(|j| j.priority > pri)).copied().collect();
+        for t in lower {
+            w.inflight.retain(|x| *x != t);
+            w.sent.remove(&t);
+            if w.staged == Some(t) {
+                w.staged = None;
+            } else {
+                sends.extend(w.out.clone().map(|o| (o, CANCEL_RANGE, pack(&[t.0, t.1, t.2]))));
+            }
+            back.push(t);
+        }
+    }
+    for (j, a, b) in back {
+        if let Some(j) = st.jobs.get_mut(&j) {
+            j.requeue.push((a, b));
+            j.requeue.sort_by(|x, y| y.cmp(x)); // lowest last
+        }
+    }
+    sends
 }
 
 /// Cancel a queued or running job. Chunks already running on workers are told to stop.
@@ -1833,6 +1865,7 @@ struct Pw {
     loaded: bool,
     asleep: BTreeSet<String>,
     waking: HashMap<String, Instant>,
+    since: HashMap<String, i64>,          // epoch ms a PC entered its current asleep / waking state (wave 14)
     idle: HashMap<String, Instant>,       // since when a PC has had nothing to do
     tried: HashMap<String, Instant>,      // PCs asked to start a standby (or that failed): not asked again for a while
     last_recruit: Option<Instant>,
@@ -1879,10 +1912,22 @@ pub fn power_state(ctx: &Ctx, node_id: &str) -> &'static str {
     }
 }
 
+/// When the PC entered its current power state (epoch ms); None if this head has not seen it change.
+pub fn power_since(ctx: &Ctx, node_id: &str) -> Option<i64> {
+    pw_ctx(ctx).since.get(node_id).copied()
+}
+
+/// Connected PCs by node id: (has chunks in flight, someone is at the PC). For the lab power estimate.
+pub fn load_by_node(ctx: &Ctx) -> HashMap<String, (bool, bool)> {
+    let st = ctx.sh.0.lock().unwrap();
+    st.workers.values().filter_map(|w| Some((w.hello.as_ref()?.node_id.clone(), (!w.inflight.is_empty(), w.presence == "busy")))).collect()
+}
+
 /// serve_worker: a PC connected, so it is awake.
 fn power_arrived(ctx: &Ctx, node_id: &str) {
     let mut g = pw_ctx(ctx);
     let was = g.waking.remove(node_id).is_some() | g.asleep.remove(node_id);
+    g.since.insert(node_id.to_string(), now_ms());
     if was {
         save_asleep(ctx, &g);
         drop(g);
@@ -1947,6 +1992,7 @@ fn sleep_nodes(ctx: &Ctx, ids: &[String], actor: &str) -> Result<Vec<String>, St
     for id in &ids {
         g.asleep.insert(id.clone());
         g.waking.remove(id);
+        g.since.insert(id.clone(), now_ms());
         g.idle.remove(id);
     }
     save_asleep(ctx, &g);
@@ -1988,7 +2034,11 @@ fn wake_nodes(ctx: &Ctx, ids: &[String], actor: &str) -> Result<Vec<String>, Str
         if let Some(o) = helper.and_then(|p| p.out.as_ref()) {
             ctrl_to(o, serde_json::json!({"wol": macs}));
         }
-        pw_ctx(ctx).waking.insert(id.clone(), Instant::now());
+        {
+            let mut g = pw_ctx(ctx);
+            g.waking.insert(id.clone(), Instant::now());
+            g.since.insert(id.clone(), now_ms());
+        }
         event(ctx, "power.wake", actor, &format!("node {id}: Wake-on-LAN sent ({} MAC)", macs.len()));
         done.push(id);
     }
@@ -2439,6 +2489,24 @@ mod tests {
             assert!(st.workers.get(&2).is_none() && take(&mut st, 2).is_none());
         }
         let _ = (j1, j2);
+    }
+
+    #[test]
+    fn preempt_takes_back_lower_priority_chunks_once() {
+        let c = ctx();
+        let lo = submit(&c, JobSpec { priority: 4, ..spec(100) }).unwrap();
+        {
+            let mut st = c.sh.0.lock().unwrap();
+            st.workers.insert(1, Worker { addr: "a".into(), state: "active".into(), ..Default::default() });
+            let (id, a, b, ..) = take(&mut st, 1).unwrap();
+            st.workers.get_mut(&1).unwrap().inflight.push((id, a, b));
+        }
+        let hi = submit(&c, JobSpec { priority: 0, preempt: true, ..spec(100) }).unwrap();
+        let mut st = c.sh.0.lock().unwrap();
+        assert!(st.workers[&1].inflight.is_empty(), "outstanding low-priority chunk was taken back");
+        assert_eq!(st.jobs[&lo.id].requeue.len(), 1 + 0, "and queued again, once");
+        let t = take(&mut st, 1).unwrap();
+        assert_eq!(t.0, hi.id, "the urgent job now owns the PC");
     }
 
     #[test]

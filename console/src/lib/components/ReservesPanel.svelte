@@ -24,9 +24,11 @@
 
 	const load = () => api.reserves().then((r) => ((rows = r.reserves), (error = ''))).catch((e) => (error = e instanceof ApiError ? e.message : 'Could not load reserves.'));
 	// "held" changes as jobs start and stop, so re-read every few seconds
+	// SSE `changed` refetches at once; "held" also moves as jobs start and stop, so a slow poll stays as the backup
 	$effect(() => {
+		void live.rev.reserves;
 		void load();
-		const t = setInterval(load, 5000);
+		const t = setInterval(load, 60_000);
 		return () => clearInterval(t);
 	});
 

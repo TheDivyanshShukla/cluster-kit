@@ -4,7 +4,7 @@
 import { api, ApiError } from './api/client';
 import { runningJobs } from './jobs';
 import { failoverStep, noFailover, primaryAddr, type Failover } from './ha';
-import { Alert, Cluster, EventRow, HaStatus, JobRow, NodeRow, type HaSettings, type LabRow, type PowerSettings } from './api/schema';
+import { Alert, Changed, Cluster, LogBatch, WHAT, type What, EventRow, HaStatus, JobRow, NodeRow, type HaSettings, type LabPower, type LabRow, type PowerSettings } from './api/schema';
 
 export const live = $state({
 	cluster: null as Cluster | null,
@@ -35,8 +35,16 @@ export const live = $state({
 	wakeSince: {} as Record<string, number>,
 	powerCfg: null as PowerSettings | null,
 	/** every alert seen: read at start, then `alert` events (merged by id). Active ones have `active` set. */
-	alerts: [] as Alert[]
+	alerts: [] as Alert[],
+	/** SSE `changed`: a counter per list that goes up after each write of it; panels refetch when theirs moves */
+	rev: Object.fromEntries(WHAT.map((w) => [w, 0])) as Record<What, number>,
+	/** SSE `log`: newest log lines first, bounded; the Logs view merges them over its fetched page */
+	logTail: [] as Record<string, unknown>[],
+	logRev: 0,
+	/** GET /api/v1/power `labs`: watts per lab (same model as sim and eco) */
+	labPower: [] as LabPower[]
 });
+const TAIL_MAX = 500;
 const putAlert = (a: Alert) => (live.alerts = [a, ...live.alerts.filter((x) => x.id !== a.id)].sort((x, y) => y.last_ms - x.last_ms));
 
 function noteWake(n: NodeRow) {
@@ -56,7 +64,9 @@ export async function loadHaCfg() {
 }
 export async function loadPowerCfg() {
 	try {
-		live.powerCfg = (await api.power()).power;
+		const r = await api.power();
+		live.powerCfg = r.power;
+		live.labPower = r.labs;
 	} catch {
 		live.powerCfg = null;
 	}
@@ -166,9 +176,19 @@ function connect() {
 		live.nodes[n.node_id] = n;
 		noteWake(n);
 	});
+	listen('changed', (v) => Changed.safeParse(v), ({ what }) => {
+		live.rev[what]++;
+		if (what === 'labels') void loadFleet();
+		if (what === 'candidates') void loadHaCfg();
+	});
+	listen('log', (v) => LogBatch.safeParse(v), ({ lines }) => {
+		live.logTail = [...lines.slice().reverse(), ...live.logTail].slice(0, TAIL_MAX);
+		live.logRev++;
+	});
 	listen('alert', (v) => Alert.safeParse(v), putAlert);
 	listen('event', (v) => EventRow.safeParse(v), (ev) => {
 		live.events = [ev, ...live.events.filter((x) => x.id !== ev.id)].slice(0, 100);
+		if (ev.kind.startsWith('power.') && live.powerCfg) void loadPowerCfg();
 		if (ev.kind === 'ha.recruit') {
 			void loadHa();
 			void loadHaCfg();

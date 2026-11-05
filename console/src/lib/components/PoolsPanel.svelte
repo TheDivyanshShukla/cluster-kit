@@ -25,7 +25,7 @@
 		pools = r.pools;
 		error = '';
 	}).catch((e) => (error = e instanceof ApiError ? e.message : 'Could not load pools.'));
-	$effect(() => void load());
+	$effect(() => (void live.rev.pools, void live.rev.labels, void load()));
 
 	async function save(n: string, members: string[], note = '') {
 		busy = true;

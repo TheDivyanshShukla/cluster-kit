@@ -84,7 +84,16 @@ pub struct Status {
     /// The primary's "ip:port" as a standby sees it; empty on a primary.
     #[serde(default)]
     pub primary: String,
+    /// Mixed versions: one line per peer that lacks a capability (see CAPS), e.g. no signed beacons. Empty when all match.
+    #[serde(default)]
+    pub mixed: Vec<String>,
 }
+
+/// What this build supports, sent in HELLO_S (standby -> primary) and in the primary's hello entry. A peer that sends none is
+/// an older build. Bit 0: signed fence beacons (a forged beacon cannot make it follow or stop). Bit 1: blob copies to standbys.
+pub const CAP_SIGNED: u64 = 1;
+pub const CAP_BLOBS: u64 = 2;
+pub const CAPS: u64 = CAP_SIGNED | CAP_BLOBS;
 
 struct Link {
     id: u64,
@@ -92,6 +101,7 @@ struct Link {
     peer: String,
     tx: mpsc::Sender<Entry>,
     acked: u64,
+    caps: u64,
 }
 
 #[derive(Default)]
@@ -140,6 +150,7 @@ fn sync_status(ctx: &Ctx, g: &Inner) {
     s.epoch = g.epoch;
     s.last_seq = g.last;
     s.standbys = g.links.iter().map(|l| (l.node.clone(), l.acked, g.last.saturating_sub(l.acked))).collect();
+    s.mixed = g.links.iter().filter(|l| l.caps & CAP_SIGNED == 0).map(|l| format!("standby {} ({}) runs an older version without signed beacons: upgrade it", l.node, l.peer)).collect();
     s.membership = g.members.len();
     lag_log(&s.standbys, g.connected, g.members.len());
     s.connected = g.connected;
@@ -385,7 +396,14 @@ pub fn hello_s_payload(h: &Hello, seq: u64, epoch: u64) -> Vec<u8> {
     p.extend_from_slice(&j);
     p.extend_from_slice(&seq.to_le_bytes());
     p.extend_from_slice(&epoch.to_le_bytes());
+    p.extend_from_slice(&CAPS.to_le_bytes());
     p
+}
+
+/// The capability bits a standby sent (0 = an older build).
+pub fn parse_caps(p: &[u8]) -> u64 {
+    let Some(n) = p.get(0..4).and_then(|b| b.try_into().ok()).map(|b| u32::from_le_bytes(b) as usize) else { return 0 };
+    u64_at(p, 20 + n).unwrap_or(0)
 }
 
 /// (hello, last applied seq, standby epoch if sent)
@@ -403,7 +421,7 @@ fn position(g: &Inner, lid: u64) -> (usize, Vec<String>) {
 
 fn hello_entry(g: &Inner, lid: u64, mode: &str) -> Entry {
     let (pri, peers) = position(g, lid);
-    Entry { seq: 0, epoch: g.epoch, kind: "hello".into(), data: json!({"priority": pri, "peers": peers, "mode": mode, "last_seq": g.last}) }
+    Entry { seq: 0, epoch: g.epoch, kind: "hello".into(), data: json!({"priority": pri, "peers": peers, "mode": mode, "last_seq": g.last, "caps": CAPS}) }
 }
 
 fn put_entry(w: &mut impl Write, tx: &mut Half, e: &Entry) -> io::Result<()> {
@@ -490,6 +508,10 @@ fn send_snapshot(w: &mut impl Write, htx: &mut Half, file: &Path, epoch: u64, se
 /// `sk`: the link key in a secured fleet (see Half), None with CK_FLEET=open.
 pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>) -> std::io::Result<()> {
     let (h, seq, ep) = parse_hello_s(hello).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad HELLO_S"))?;
+    let caps = parse_caps(hello);
+    if caps & CAP_SIGNED == 0 {
+        crate::warnl!("ha.mixed_versions", "standby {} runs an older version (no signed beacons). It works, but a forged beacon can still steer it; upgrade it (docs/OPERATIONS.md, rolling upgrades)", h.node_id);
+    }
     let peer = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     s.set_nodelay(true)?;
     s.set_read_timeout(Some(proto::lost_after()))?;
@@ -501,7 +523,7 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
         let replay: Vec<Entry> = if snapshot { vec![] } else { g.ring.iter().filter(|e| e.seq > seq).cloned().collect() };
         g.next_link += 1;
         let lid = g.next_link;
-        g.links.push(Link { id: lid, node: h.node_id.clone(), peer, tx, acked: if snapshot { 0 } else { seq } });
+        g.links.push(Link { id: lid, node: h.node_id.clone(), peer, tx, acked: if snapshot { 0 } else { seq }, caps });
         g.ring_until = Some(Instant::now() + Duration::from_secs(120));
         sync_status(ctx, &g);
         let first = hello_entry(&g, lid, if snapshot { "snapshot" } else { "replay" });
@@ -540,7 +562,15 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
                 put_entry(&mut w, &mut htx, e)?;
             }
             let mut shown = (position(&init(ctx), lid), 0u8).0;
+            let (mut offered, mut last_offer) = (HashSet::new(), None::<Instant>);
             loop {
+                // blobs the primary stores reach this standby over the blob port, so a takeover can serve them (every 5 s)
+                if caps & CAP_BLOBS != 0 && last_offer.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+                    last_offer = Some(Instant::now());
+                    for o in crate::blobs::offers(ctx, &mut offered, 8) {
+                        put_entry(&mut w, &mut htx, &Entry { seq: 0, epoch, kind: "blob".into(), data: o })?;
+                    }
+                }
                 match rx.recv_timeout(Duration::from_secs(1)) {
                     Ok(e) => put_entry(&mut w, &mut htx, &e)?,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -740,6 +770,7 @@ struct Sb {
     peers: Vec<String>,
     last_heard: Instant,
     epoch: Arc<AtomicU64>,
+    old_primary: bool,
 }
 
 fn invalid(m: &str) -> io::Error {
@@ -815,7 +846,19 @@ fn session(store: &mut Store, path: &Path, mut s: TcpStream, sb: &mut Sb) -> io:
                     sb.epoch.store(e.epoch, SeqCst);
                     let _ = store.set_meta("epoch", &e.epoch.to_string());
                 }
-                if e.kind == "hello" {
+                if e.kind == "blob" {
+                    if let Ok(a) = s.peer_addr() {
+                        crate::blobs::standby_take(&e.data, &a.ip().to_string());
+                    }
+                } else if e.kind == "hello" {
+                    let old = e.data.get("caps").and_then(|x| x.as_u64()).unwrap_or(0) & CAP_SIGNED == 0;
+                    if old != sb.old_primary {
+                        sb.old_primary = old;
+                        if old {
+                            crate::warnl!("ha.mixed_versions", "the primary runs an older version (no signed beacons): upgrade it after the standbys (docs/OPERATIONS.md, rolling upgrades)");
+                        }
+                        set_sb(|t| t.mixed = if old { vec![format!("primary {} runs an older version without signed beacons", t.primary)] } else { vec![] });
+                    }
                     sb.priority = e.data.get("priority").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                     sb.peers = e.data.get("peers").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
                     if e.data.get("mode").and_then(|x| x.as_str()) == Some("replay") {
@@ -887,7 +930,7 @@ pub fn run_standby(o: &crate::Opts) {
         std::thread::spawn(move || watch_beacons(e, h, c, s));
     }
     set_sb(|t| { t.role = "standby".into(); t.epoch = epoch.load(SeqCst); t.last_seq = num(store.meta("last_seq")); t.primary = head.lock().unwrap().clone() });
-    let mut sb = Sb { handover: false, priority: 0, peers: vec![], last_heard: Instant::now(), epoch: epoch.clone() };
+    let mut sb = Sb { handover: false, priority: 0, peers: vec![], last_heard: Instant::now(), epoch: epoch.clone(), old_primary: false };
     let mut backoff = Duration::from_millis(200);
     crate::say!("standby.follow", "standby: following {}", head.lock().unwrap());
     loop {
@@ -902,6 +945,8 @@ pub fn run_standby(o: &crate::Opts) {
             let _ = store.set_meta("epoch", &e.to_string());
             let _ = store.set_meta("candidate", "1");
             set_sb(|t| { t.role = "candidate".into(); t.epoch = e; t.connected = 0 });
+            let (added, missing) = crate::blobs::adopt(&store);
+            crate::say!("ha.blobs", "takeover: {added} copied blob(s) registered, {missing} missing");
             if sb.handover {
                 crate::say!("ha.promote", "standby: planned handover, promoting at epoch {e}");
             } else {
@@ -1031,6 +1076,9 @@ mod tests {
         let p = hello_s_payload(&h, 7, 3);
         assert_eq!(parse_hello_s(&p), Some((h, 7, Some(3))));
         assert!(parse_hello_s(&p[..5]).is_none());
+        assert_eq!(parse_caps(&p), CAPS);
+        assert_eq!(parse_caps(&p[..p.len() - 8]), 0, "an older standby sends no capabilities");
+        assert_eq!(parse_hello_s(&p[..p.len() - 8]), Some((Hello { node_id: "n1".into(), host: "h".into(), ..Default::default() }, 7, Some(3))), "and an older primary still reads the rest");
         assert_eq!(unhex(&hex(&[0, 255, 16])), vec![0, 255, 16]);
     }
 
@@ -1064,7 +1112,7 @@ mod tests {
         let client = TcpStream::connect(addr).unwrap();
         let (srv, _) = l.accept().unwrap();
         let killer = client.try_clone().unwrap();
-        let mut sb = Sb { handover: false, priority: 0, peers: vec![], last_heard: Instant::now(), epoch: Arc::new(AtomicU64::new(0)) };
+        let mut sb = Sb { handover: false, priority: 0, peers: vec![], last_heard: Instant::now(), epoch: Arc::new(AtomicU64::new(0)), old_primary: false };
         let ok = std::thread::scope(|sc| {
             sc.spawn(|| {
                 let mut srv = srv;

@@ -34,6 +34,8 @@ pub struct JobView {
     pub selector: Selector,
     /// has ranges left to hand out
     pub has_work: bool,
+    /// submitter (SCH-04: PCs at equal priority split by user first, then by job)
+    pub user: String,
 }
 
 #[derive(Clone, Debug)]
@@ -70,12 +72,23 @@ pub fn pick_job(wid: u64, nodes: &[NodeView], jobs: &[JobView], reserves: &[Rese
         return None;
     }
     let assigned = |id: u64| nodes.iter().filter(|o| o.wid != wid && o.job == Some(id)).count();
+    let user_of = |id: u64| jobs.iter().find(|j| j.id == id).map_or("", |j| j.user.as_str());
+    // SCH-04: nodes (other than this one) working for a user
+    let by_user = |u: &str| nodes.iter().filter(|o| o.wid != wid && o.job.is_some_and(|c| user_of(c) == u)).count();
+    let key = |j: &JobView| (j.priority, by_user(&j.user), assigned(j.id), j.id);
     let elig: Vec<&JobView> = jobs.iter().filter(|j| j.has_work && j.selector.matches(&n.attrs)).collect();
-    let best = elig.iter().min_by_key(|j| (j.priority, assigned(j.id), j.id))?;
+    let best = elig.iter().min_by_key(|j| key(j))?;
     let Some(cur) = n.job.and_then(|c| elig.iter().find(|j| j.id == c)) else { return Some(best.id) };
-    if best.priority >= cur.priority {
-        return Some(cur.id); // sticky: only a strictly higher priority job pulls it away
+    if best.id == cur.id {
+        return Some(cur.id);
     }
+    if best.priority == cur.priority {
+        // equal priority: move at this chunk boundary only if it makes the split strictly more even (user, then job)
+        let (kb, kc) = (key(best), key(cur));
+        let same_user = best.user == cur.user;
+        return Some(if kb.1 < kc.1 || (same_user && kb.2 < kc.2) { best.id } else { cur.id });
+    }
+    // SCH-09: a strictly higher priority job pulls this node away at its chunk boundary, up to its fair share
     // ponytail: fair share = ceil(matching nodes / has-work jobs of that priority); ignores overlap between selectors
     let share = nodes.iter().filter(|o| o.takes_tasks && best.selector.matches(&o.attrs)).count();
     let same = jobs.iter().filter(|j| j.has_work && j.priority == best.priority).count().max(1);
@@ -318,7 +331,7 @@ mod tests {
         }
     }
     fn job(id: u64, priority: u8, sel: &str) -> JobView {
-        JobView { id, priority, selector: parse(sel).unwrap(), has_work: true }
+        JobView { id, priority, selector: parse(sel).unwrap(), has_work: true, user: format!("u{id}") }
     }
     fn res(sel: &str, n: u32, pct: u32) -> ReserveView {
         ReserveView { selector: parse(sel).unwrap(), keep_n: n, keep_pct: pct }
@@ -348,6 +361,28 @@ mod tests {
     }
 
     #[test]
+    fn users_split_equally_not_by_job_count() {
+        // ann runs jobs 1 and 2, bob job 3, all priority 2: PCs split 6/6 by user, ann's two jobs share her 6
+        let mut jobs = vec![job(1, 2, ""), job(2, 2, ""), job(3, 2, "")];
+        jobs[0].user = "ann".into();
+        jobs[1].user = "ann".into();
+        jobs[2].user = "bob".into();
+        let mut nodes: Vec<_> = (1..=12).map(|i| nv(i, &[])).collect();
+        settle(&mut nodes, &jobs, &[]);
+        assert_eq!(count(&nodes, 3), 6);
+        assert_eq!((count(&nodes, 1), count(&nodes, 2)), (3, 3));
+        // bob arrives late: ann holds every node, and they rebalance at chunk boundaries
+        let mut nodes: Vec<_> = (1..=8).map(|i| nv(i, &[])).collect();
+        settle(&mut nodes, &jobs[..1], &[]);
+        assert_eq!(count(&nodes, 1), 8);
+        let two = [jobs[0].clone(), jobs[2].clone()];
+        settle(&mut nodes, &two, &[]);
+        assert_eq!((count(&nodes, 1), count(&nodes, 3)), (4, 4));
+        settle(&mut nodes, &two, &[]); // stable
+        assert_eq!((count(&nodes, 1), count(&nodes, 3)), (4, 4));
+    }
+
+    #[test]
     fn urgent_takes_free_nodes_first() {
         let mut nodes: Vec<_> = (1..=4).map(|i| nv(i, &[])).collect();
         settle(&mut nodes, &[job(1, 2, ""), job(2, 0, "")], &[]);
@@ -365,10 +400,12 @@ mod tests {
             n.job = Some(1);
             n.inflight = 2;
         }
-        // equal priority newcomer: nobody moves, even though job 2 has 0 nodes
+        // equal priority newcomer of another user (SCH-04): the nodes even out at their chunk boundaries, 2 and 2
         let jobs = [job(1, 2, ""), job(2, 2, "")];
-        for n in &nodes {
-            assert_eq!(pick_job(n.wid, &nodes, &jobs, &[]), Some(1));
+        settle(&mut nodes, &jobs, &[]);
+        assert_eq!((count(&nodes, 1), count(&nodes, 2)), (2, 2));
+        for n in &mut nodes {
+            n.job = Some(1);
         }
         // lower priority newcomer: nobody moves
         for n in &nodes {

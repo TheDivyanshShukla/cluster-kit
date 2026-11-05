@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { live } from '#lib/live.svelte.ts';
 	import { Plus, Trash2 } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import type { CapRow } from '#lib/api/schema.ts';
@@ -15,7 +16,7 @@
 	let busy = $state(false);
 
 	const load = () => api.caps().then((r) => ((caps = r.caps), (error = ''))).catch((e) => (error = e instanceof ApiError ? e.message : 'Could not load caps.'));
-	$effect(() => void load());
+	$effect(() => (void live.rev.caps, void load()));
 
 	async function add(e: SubmitEvent) {
 		e.preventDefault();

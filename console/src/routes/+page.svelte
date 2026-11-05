@@ -11,6 +11,7 @@
 	import PriorityChip from '#lib/components/PriorityChip.svelte';
 	import ProgressBar from '#lib/components/ProgressBar.svelte';
 	import StateChip from '#lib/components/StateChip.svelte';
+	import { eventLabel } from '#lib/events.ts';
 	import { live } from '#lib/live.svelte.ts';
 	import { ago, count, datetime, duration, rate } from '#lib/format.ts';
 	import { elapsedMs, etaMs, jobRate, mergeRows, progress, runningJobs } from '#lib/jobs.ts';
@@ -92,7 +93,7 @@
 					{#each recentEvents as e (e.id)}
 						<li class="py-2">
 							<p class="flex items-baseline justify-between gap-2">
-								<span class="font-mono text-xs font-medium">{e.kind}</span>
+								<span class="text-xs font-medium" title={e.kind}>{eventLabel(e.kind)}</span>
 								<span class="text-muted-foreground shrink-0 text-xs" title={datetime(e.ts_ms)}>{ago(e.ts_ms, now)}</span>
 							</p>
 							<p class="text-muted-foreground mt-0.5 break-words text-[13px]">{e.actor ? `${e.actor}: ` : ''}{e.detail}</p>

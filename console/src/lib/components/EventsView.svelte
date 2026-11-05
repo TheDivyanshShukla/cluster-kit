@@ -11,6 +11,7 @@
 	import { datetime } from '#lib/format.ts';
 	import { mergeRows } from '#lib/jobs.ts';
 	import { Listing } from '#lib/listing.svelte.ts';
+	import { eventLabel } from '#lib/events.ts';
 	import { KIND_GROUPS, kindGroup, rangeLabel, rangesOf, RANGES, type Spec } from '#lib/listing.ts';
 	import { setQuery } from '#lib/urlstate.svelte.ts';
 	import { isPhone, vp } from '#lib/viewport.svelte.ts';
@@ -50,7 +51,7 @@
 			{ key: 'actor', label: 'Actor', get: (e) => e.actor || 'system' },
 			{ key: 'range', label: 'When', get: (e) => rangesOf(e.ts_ms, now), single: true, order: RANGES.map((r) => r.key), text: rangeLabel }
 		],
-		text: (e) => [e.kind, e.actor, e.detail, e.id],
+		text: (e) => [e.kind, eventLabel(e.kind), e.actor, e.detail, e.id],
 		sorters: { ts: (e) => e.ts_ms, kind: (e) => e.kind, actor: (e) => e.actor },
 		base: (a, b) => b.id - a.id
 	};
@@ -83,7 +84,7 @@
 		<DataTable label="Events" rows={res.rows} {cols} rowH={36} rowKey={(e) => e.id} sort={l.state.sort} dir={l.state.dir} onsort={(c) => l.sortBy(c)} active={(e) => e.id === focus} onrow={open} onend={older} pill={!l.state.sort}>
 			{#snippet cell(e, c)}
 				{#if c.key === 'ts'}<span class="num text-muted-foreground whitespace-nowrap">{datetime(e.ts_ms)}</span>
-				{:else if c.key === 'kind'}<span class="block truncate font-mono text-xs"><Hl text={e.kind} q={l.state.q} /></span>
+				{:else if c.key === 'kind'}<span class="block truncate text-xs" title={e.kind}><Hl text={eventLabel(e.kind)} q={l.state.q} /></span>
 				{:else if c.key === 'actor'}<span class="block truncate"><Hl text={e.actor || '—'} q={l.state.q} /></span>
 				{:else}<span class="block truncate" title={e.detail}><Hl text={e.detail} q={l.state.q} /></span>
 				{/if}
@@ -107,7 +108,7 @@
 	{#if cur}
 		<dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-[13px]">
 			<dt class="text-muted-foreground">Time</dt><dd class="num">{datetime(cur.ts_ms)}</dd>
-			<dt class="text-muted-foreground">Kind</dt><dd class="font-mono text-xs">{cur.kind}</dd>
+			<dt class="text-muted-foreground">Kind</dt><dd class="text-xs">{eventLabel(cur.kind)} <span class="text-muted-foreground font-mono">{cur.kind}</span></dd>
 			<dt class="text-muted-foreground">Actor</dt><dd>{cur.actor || 'system'}</dd>
 			<dt class="text-muted-foreground">Detail</dt><dd class="break-words">{cur.detail}</dd>
 			<dt class="text-muted-foreground">Id</dt><dd class="num">{cur.id}</dd>

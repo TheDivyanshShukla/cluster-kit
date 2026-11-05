@@ -1,7 +1,7 @@
 <script lang="ts">
 	import '../app.css';
 	import { page } from '$app/state';
-	import { Bell, CalendarClock, CircleAlert, FileText, FlaskConical, Gauge, Search, ListChecks, Radio, LogOut, Map as MapIcon, Moon, MonitorPlay, Server, Settings, SlidersHorizontal, Sun, User as UserIcon, Users, WifiOff } from '@lucide/svelte';
+	import { Bell, CalendarClock, CircleAlert, FileText, FlaskConical, Gauge, Sigma, Search, ListChecks, Radio, LogOut, Map as MapIcon, Moon, MonitorPlay, Server, Settings, SlidersHorizontal, Sun, User as UserIcon, Users, WifiOff } from '@lucide/svelte';
 	import type { LayoutProps } from './$types';
 	import AuthForm from '#lib/components/AuthForm.svelte';
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
@@ -34,6 +34,7 @@
 			{ href: '/policies', label: 'Policies', icon: SlidersHorizontal, show: true },
 			{ href: '/events', label: 'Events', icon: CalendarClock, show: true },
 			{ href: '/experiments', label: 'Experiments', icon: FlaskConical, show: true },
+			{ href: '/sim', label: 'Simulation', icon: Sigma, show: atLeast(roleNow(), 'researcher') },
 			{ href: '/alerts', label: 'Alerts', icon: Bell, show: true },
 			{ href: '/report', label: 'Report', icon: FileText, show: true },
 			{ href: '/wall', label: 'Wall mode', icon: MonitorPlay, show: true },

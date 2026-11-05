@@ -3,7 +3,7 @@
 	import { api } from '#lib/api/client.ts';
 	import LiveCanvas from '#lib/components/LiveCanvas.svelte';
 	import HeadTopology from '#lib/components/HeadTopology.svelte';
-	import { count, duration, rate } from '#lib/format.ts';
+	import { count, duration, rate, watts } from '#lib/format.ts';
 	import { progress, runningJobs } from '#lib/jobs.ts';
 	import { failoverView } from '#lib/ha.ts';
 	import { live, loadPowerCfg, tickFailover } from '#lib/live.svelte.ts';
@@ -89,6 +89,7 @@
 			<span class="text-ok flex items-center gap-[0.6vw]"><Sun class="size-[1.8vw] min-h-5 min-w-5" aria-hidden="true" /><span class="num">{pw.awake}</span> awake</span>
 			<span class="text-warn flex items-center gap-[0.6vw]"><Sunrise class="size-[1.8vw] min-h-5 min-w-5" aria-hidden="true" /><span class="num">{pw.waking}</span> waking</span>
 		{/if}
+		{#if live.labPower.length}<span class="text-muted-foreground num" title={live.labPower.map((l) => `${l.lab} ${watts(l.watts)}`).join(', ')}>{watts(live.labPower.reduce((a, l) => a + l.watts, 0))} drawn</span>{/if}
 	</div>
 
 	{#if fo?.kind === 'down'}

@@ -73,7 +73,19 @@ Test the failover on one machine any time with `scripts/chaos.sh`. It prints PAS
 
 - **Everything is in `ck-data/head.db`** (SQLite). The standbys each hold a full copy that is replicated continuously, so losing the head PC loses nothing.
 - **Saving the setup:** `ck admin config-export > setup.json` saves labs, the map, labels, pools, caps and reserves, but not users or jobs. `ck admin config-import setup.json` restores it, and `CK_DRY_RUN=1` shows the changes first.
+- **Backup now:** `ck admin backup [PATH]` writes a consistent copy of `head.db` (SQLite `VACUUM INTO`, safe while the head runs; run it on the head PC with the same `CK_DATA`). With no PATH it writes `ck-data/backups/head-<unix-seconds>.db`.
+- **Scheduled backups:** set `backup_every_h` (default 0 = off) and `backup_keep` (default 7); the head writes `ck-data/backups/head-<unix-seconds>.db` on that schedule and deletes the oldest beyond `backup_keep`. Copy that folder off the PC (another disk or share) yourself; a backup next to the database does not survive a dead disk.
+- **Restore:** stop the head, replace `ck-data/head.db` with the backup (delete `head.db-wal` and `head.db-shm` next to it), start the head. Standbys with a newer copy will resync from it; if one refuses, delete its `ck-data/head.db` so it takes a full copy.
+- **Retention:** a background thread on the head deletes events older than `events_keep_days` (default 30) and, if `parts_keep_days` > 0, result parts of jobs finished longer ago than that (the job row and its summary stay; default 0 = keep parts forever). Deletes run in batches of 2,000 rows every 10 minutes. Standbys are not pruned by the head; they keep their copy until pruned themselves when promoted.
 - **Moving the head on purpose:** on Settings, an admin clicks Make head on a standby, or runs `ck admin switchover <node-id>`. The head waits until that standby has every change, hands over, and becomes its standby. Work pauses for about 4 s, and nothing is lost.
+
+## 7. Rolling upgrade
+
+1. Upgrade the standbys one at a time; wait until `ck admin ha` (or Settings, Heads) shows each one synced.
+2. `ck admin switchover <upgraded-standby-node-id>`.
+3. Upgrade the old head; it rejoins as a standby.
+4. Upgrade the agents a lab at a time; each reconnects to whichever head answers.
+5. Until every head runs the new build, the ha status lists the old ones under `mixed` and the log has `ha.mixed_versions`. That is harmless, but unsigned fence beacons are still accepted, so finish the upgrade the same day.
 
 
 ## Logs

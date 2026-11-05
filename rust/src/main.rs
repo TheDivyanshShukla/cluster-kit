@@ -193,9 +193,10 @@ fn main() {
             repl::run_standby(&o); // returns when this PC must take over
             log::set_role("head");
             crate::say!("ha.promote", "standby: promoted, now the head");
+            store::maintenance_thread();
             head::run(&o)
         }
-        "head" => head::run(&o),
+        "head" => { store::maintenance_thread(); head::run(&o) }
         "worker" | "agent" => agent::run(&o),
         "run" => client::run(&o),
         "ping" => client::ping(&o),

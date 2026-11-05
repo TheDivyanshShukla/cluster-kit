@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Crown, Eye, Maximize, Spline, WifiOff, ZoomIn, ZoomOut } from '@lucide/svelte';
+	import { ChevronDown, Crown, Eye, Maximize, Spline, WifiOff, ZoomIn, ZoomOut } from '@lucide/svelte';
 	import { onMount, untrack } from 'svelte';
 	import { api } from '#lib/api/client.ts';
 	import { jobColor } from '#lib/canvas/colors.ts';
@@ -58,6 +58,9 @@
 	let tip = $state<{ id: string; x: number; y: number } | null>(null);
 	let tokens = $state.raw<LiveEngine['tokens']>();
 	let legend = $state<HTMLDivElement>();
+	// the legend can be folded away so it never hides a lab; closed by default on a phone
+	let legendOpen = $state(typeof matchMedia !== 'function' || !matchMedia('(max-width: 639px)').matches);
+	const showLegend = $derived(compact || wall || legendOpen);
 	$effect(() => {
 		const e = engine, l = legend;
 		if (!e || !l) return;
@@ -415,7 +418,9 @@
 		</div>
 	{/if}
 
-	<div bind:this={legend} class="bg-surface/90 border-line pointer-events-none absolute right-2 bottom-2 left-2 flex items-center gap-x-3 gap-y-1 rounded-lg border px-2.5 py-1.5 {fs} sm:right-auto sm:max-w-[min(100%-1rem,44rem)] {compact ? 'overflow-hidden whitespace-nowrap' : 'flex-wrap'}" aria-label="Legend">
+	<div bind:this={legend} class="bg-surface/90 border-line pointer-events-none absolute bottom-2 left-2 {showLegend ? 'right-2' : ''} flex items-center gap-x-3 gap-y-1 rounded-lg border px-2.5 py-1.5 {fs} {showLegend ? 'sm:right-auto sm:max-w-[min(100%-1rem,44rem)]' : 'right-auto left-2'} flex-wrap" aria-label="Legend">
+		{#if !compact && !wall}<button type="button" class="pointer-events-auto text-muted-foreground hover:text-foreground inline-flex min-h-6 items-center gap-1" aria-expanded={legendOpen} onclick={() => (legendOpen = !legendOpen)} title={legendOpen ? 'Hide the legend' : 'Show the legend'}><ChevronDown class="size-3.5 transition-transform {legendOpen ? '' : '-rotate-90'}" aria-hidden="true" />Legend</button>{/if}
+		{#if showLegend}
 		{#if lg.kind === 'scale'}
 			<span class="text-muted-foreground inline-flex items-center gap-2">
 				<span class="num">{lg.lo}</span><span class="inline-block h-2.5 w-28 rounded-sm" style="background:{HEAT_GRADIENT}" aria-hidden="true"></span><span class="num">{lg.hi}</span> {lg.unit}
@@ -440,5 +445,6 @@
 			{/each}
 		{/if}
 		{#if !compact && lod !== 'point' && !wall}<span class="text-muted-foreground max-md:hidden">ring = CPU busy · stripe = job</span>{/if}
+		{/if}
 	</div>
 </div>

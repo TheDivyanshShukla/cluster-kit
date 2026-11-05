@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { live } from '#lib/live.svelte.ts';
 	import { CalendarPlus, Plus, Trash2 } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import type { ReservationRow } from '#lib/api/schema.ts';
@@ -17,8 +18,9 @@
 
 	const load = () => api.reservations().then((r) => ((rows = sortBookings(r.reservations)), (error = ''))).catch((e) => (error = e instanceof ApiError ? e.message : 'Could not load bookings.'));
 	$effect(() => {
+		void live.rev.bookings;
 		void load();
-		const t = setInterval(load, 30_000);
+		const t = setInterval(load, 60_000);
 		return () => clearInterval(t);
 	});
 

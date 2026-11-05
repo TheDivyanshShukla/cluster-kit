@@ -4,6 +4,7 @@
 	import { Tween } from 'svelte/motion';
 	import { fly } from 'svelte/transition';
 	import MakeHeadDialog from '#lib/components/MakeHeadDialog.svelte';
+	import { duration } from '#lib/format.ts';
 	import { hasQuorum } from '#lib/ha.ts';
 	import { atLeast } from '#lib/jobs.ts';
 	import { live, loadHaCfg } from '#lib/live.svelte.ts';
@@ -15,6 +16,7 @@
 	let { size = 'full' }: { size?: 'mini' | 'full' | 'wall' } = $props();
 
 	const h = $derived(live.ha);
+	const headHost = $derived(h?.head ? (live.nodes[h.head.node_id]?.host ?? h.head.node_id) : '');
 	const stage = $derived(stageOf(h?.role, live.handover != null));
 	const views = $derived(standbyViews(h?.standbys ?? [], live.nodes, live.labs));
 	const reduce = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -83,9 +85,9 @@
 			{#if lostK}<X class="text-bad absolute -inset-0.5 size-6" strokeWidth={3} aria-hidden="true" />{/if}
 		</span>
 		<span class="min-w-0">
-			<span class="block font-semibold tracking-tight {lostK ? 'text-bad' : kind === 'handover' ? 'text-primary' : ''}">{lostK ? 'Head lost' : kind === 'handover' ? 'Handing over' : 'HEAD'}</span>
+			<span class="block font-semibold tracking-tight {lostK ? 'text-bad' : kind === 'handover' ? 'text-primary' : ''}">{lostK ? 'Head lost' : kind === 'handover' ? 'Handing over' : 'HEAD'}{#if kind === 'ok' && h?.head}<span class="text-muted-foreground ml-1.5 font-normal" title={h.head.addr}>{headHost}</span>{/if}</span>
 			<span class="text-muted-foreground num block {compact ? 'truncate' : ''}">
-				{h?.role === 'standby' ? 'this console is on a standby' : `${h?.connected ?? 0}/${h?.membership ?? 0} PCs`}
+				{h?.role === 'standby' ? 'this console is on a standby' : `${h?.connected ?? 0}/${h?.membership ?? 0} PCs`}{#if kind === 'ok' && h?.head?.since_ms}{` · up ${duration(Date.now() - h.head.since_ms)}`}{/if}
 			</span>
 		</span>
 		{#if h && !compact && h.role !== 'standby'}

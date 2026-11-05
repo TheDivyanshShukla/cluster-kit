@@ -87,6 +87,9 @@ pub struct JobSpec {
     /// "auto" (default, ""), "direct" (every PC fetches from the head) or "peer" (PCs serve each other inside a /24).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub blob_mode: String,
+    /// Wave 14 (SCH-09): at submission, take back the outstanding chunks of lower-priority jobs at once (requeued).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preempt: bool,
 }
 
 pub const PLACEMENTS: &[&str] = &["spread", "pack", "fastest", "efficient"];
@@ -116,6 +119,7 @@ impl Default for JobSpec {
             mem_mb: 0,
             blobs: vec![],
             blob_mode: String::new(),
+            preempt: false,
         }
     }
 }

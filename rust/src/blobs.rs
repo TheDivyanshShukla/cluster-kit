@@ -6,7 +6,7 @@
 //!                     its CTRL "fetch" and to the serving PC in its CTRL "allow": that is the admission, so a PC that was
 //!                     never told gets K_DENY, in an open fleet as well as in a secured one. Peers never hold each other's node keys.
 //!   server -> client  sealed K_INFO (size u64, piece size u64); from here every frame both ways is sealed with the ticket key
-//!   client -> server  K_REQ piece index u64 -> K_DATA piece bytes (or K_ERR); also K_PING, K_PROBE_DOWN n, K_PROBE_UP n.
+//!   client -> server  K_REQ piece index u64 -> K_DATA piece bytes (or K_NOPE: a blob still downloading, piece not there yet; or K_ERR); also K_PING, K_PROBE_DOWN n, K_PROBE_UP n.
 //! The server serves only the sha its ticket names, read from <CK_DATA>/cache/<sha> or <CK_DATA>/blobs/<sha>: it never
 //! takes a path from the network. A PC serves at most `blob_peer_fanout` peers at once (K_BUSY beyond that).
 
@@ -39,6 +39,7 @@ const K_ACK: u8 = 8;
 const K_BUSY: u8 = 9;
 const K_DENY: u8 = 10;
 const K_ERR: u8 = 11;
+const K_NOPE: u8 = 12; // this piece is not here yet (a download in progress serves the pieces it has)
 const PROBE: &str = "*probe*";
 const TICK_S: f64 = 0.3; // staging loop period: each distribution round pays about one
 
@@ -228,6 +229,22 @@ pub fn allow(id: &str, key: &[u8], sha: &str, head: bool) {
     g.insert(id.into(), Ticket { sha: sha.into(), key: key.to_vec(), exp: Instant::now() + Duration::from_secs(900), uses: 8, head });
 }
 
+// ------------------------------------------------- downloads in progress --
+/// A blob this process is still downloading: its verified pieces are served to peers (swarm-style) before the whole blob is done.
+struct Part {
+    path: PathBuf,
+    size: u64,
+    piece: u64,
+    have: Arc<Mutex<Vec<bool>>>,
+}
+static PARTS: LazyLock<Mutex<HashMap<String, Arc<Part>>>> = LazyLock::new(Default::default);
+struct PartGuard(String);
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        PARTS.lock().unwrap().remove(&self.0);
+    }
+}
+
 // ------------------------------------------------------------ rate limit --
 fn limit_mbps() -> f64 {
     std::env::var("CK_NET_LIMIT_MBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
@@ -337,27 +354,44 @@ fn handle(s: TcpStream) -> io::Result<()> {
     let _g = Active::new(!t.head);
     let (mut tx, mut rx) = (FrameMac::new(&t.key), FrameMac::new(&t.key));
     let probe = t.sha == PROBE;
-    let file = if probe { None } else { Some(find(&t.sha).ok_or_else(|| other("not cached"))?) };
-    let (size, piece) = match &file {
-        Some(p) => {
+    let part = if probe { None } else { PARTS.lock().unwrap().get(&t.sha).cloned() };
+    let file = if probe { None } else { find(&t.sha) };
+    if !probe && file.is_none() && part.is_none() {
+        return Err(other("not cached"));
+    }
+    let (size, piece) = match (&file, &part) {
+        (Some(p), _) => {
             let piece = read_idx(&PathBuf::from(format!("{}.idx", p.display()))).map(|x| x.0).unwrap_or_else(piece_bytes);
             (p.metadata()?.len(), piece)
         }
-        None => (0, piece_bytes()),
+        (None, Some(pa)) => (pa.size, pa.piece),
+        _ => (0, piece_bytes()),
     };
     send_sealed(&mut w, &mut tx, K_INFO, &proto::pack(&[size, piece]))?;
     let mut pace = Pace::new();
-    let mut f = file.as_ref().map(File::open).transpose()?;
     loop {
         let (k, p) = recv_sealed(&mut r, &mut rx)?;
         match k {
             K_PING => send_sealed(&mut w, &mut tx, K_PING, &p)?,
             K_REQ => {
-                let (Some(f), Ok(i)) = (f.as_mut(), proto::u64_at(&p, 0)) else { return send_sealed(&mut w, &mut tx, K_ERR, b"bad request") };
+                let (false, Ok(i)) = (probe, proto::u64_at(&p, 0)) else { return send_sealed(&mut w, &mut tx, K_ERR, b"bad request") };
                 let off = i.saturating_mul(piece);
                 if size == 0 || off >= size {
                     return send_sealed(&mut w, &mut tx, K_ERR, b"no such piece");
                 }
+                // the whole blob, or (still downloading) a piece that is verified and written
+                let path = match find(&t.sha) {
+                    Some(p) => p,
+                    None => match &part {
+                        Some(pa) if pa.have.lock().unwrap().get(i as usize) == Some(&true) => pa.path.clone(),
+                        _ => {
+                            send_sealed(&mut w, &mut tx, K_NOPE, &[])?;
+                            continue;
+                        }
+                    },
+                };
+                // the download may have just finished (renamed): then the whole blob is there
+                let mut f = File::open(&path).or_else(|_| File::open(find(&t.sha).ok_or_else(|| other("gone"))?))?;
                 let mut buf = vec![0u8; piece.min(size - off) as usize];
                 f.seek(SeekFrom::Start(off))?;
                 f.read_exact(&mut buf)?;
@@ -410,6 +444,7 @@ pub struct Meta {
 #[derive(Debug)]
 pub struct Got {
     pub bytes: u64,
+    pub peer_bytes: u64, // of `bytes`, what came from peers rather than the head
     pub from: String,
     pub ms: f64,
 }
@@ -450,24 +485,31 @@ fn read_piece(f: &mut File, m: &Meta, i: usize) -> io::Result<Vec<u8>> {
     Ok(b)
 }
 
-fn pull(f: &mut File, m: &Meta, have: &mut [bool], src: &Source) -> io::Result<u64> {
+/// Take the pieces `src` has: all of them from the head or a finished peer, the ones it holds so far from a peer that is still
+/// downloading (K_NOPE for the rest). `start` rotates the order so fetchers of one blob hold different pieces and can trade.
+fn pull(f: &mut File, m: &Meta, have: &mut [bool], shared: &Mutex<Vec<bool>>, start: usize, src: &Source) -> io::Result<u64> {
     let ((mut r, mut w, mut tx, mut rx), size, piece) = open_conn(src)?;
     if size != m.size || piece != m.piece {
         return Err(other("the source holds a different blob"));
     }
     let mut got = 0;
-    for i in 0..have.len() {
+    for j in 0..have.len() {
+        let i = (start + j) % have.len();
         if have[i] {
             continue;
         }
         send_sealed(&mut w, &mut tx, K_REQ, &proto::pack(&[i as u64]))?;
         let (k, d) = recv_sealed(&mut r, &mut rx)?;
+        if k == K_NOPE {
+            continue;
+        }
         if k != K_DATA || d.len() != piece_range(m, i).1 || <[u8; 32]>::from(Sha256::digest(&d)) != m.hashes[i] {
             return Err(other(format!("piece {i} from {} is wrong", src.addr)));
         }
         f.seek(SeekFrom::Start(piece_range(m, i).0))?;
         f.write_all(&d)?;
         have[i] = true;
+        shared.lock().unwrap()[i] = true;
         got += d.len() as u64;
     }
     Ok(got)
@@ -485,7 +527,7 @@ pub fn fetch(dir: &Path, m: &Meta, srcs: &[Source]) -> io::Result<Got> {
     let fin = dir.join(&m.sha);
     if fin.metadata().is_ok_and(|x| x.len() == m.size) {
         touch(&fin);
-        return Ok(Got { bytes: 0, from: "cache".into(), ms: 0.0 });
+        return Ok(Got { bytes: 0, peer_bytes: 0, from: "cache".into(), ms: 0.0 });
     }
     let part = dir.join(format!("{}.part", m.sha));
     let existed = part.metadata().is_ok_and(|x| x.len() == m.size);
@@ -501,20 +543,47 @@ pub fn fetch(dir: &Path, m: &Meta, srcs: &[Source]) -> io::Result<Got> {
             *h = <[u8; 32]>::from(Sha256::digest(read_piece(&mut f, m, i)?)) == m.hashes[i];
         }
     }
-    let (mut bytes, mut from, mut last) = (0, String::new(), other("no source"));
-    for s in srcs {
-        match pull(&mut f, m, &mut have, s) {
-            Ok(b) => {
-                (bytes, from) = (b, if s.head { "head" } else { "peer" }.to_string());
-                last = other("");
+    // from here peers may take the verified pieces while this download runs
+    let shared = Arc::new(Mutex::new(have.clone()));
+    // (one fetch per sha runs at a time in a process: INFLIGHT above)
+    PARTS.lock().unwrap().entry(m.sha.clone()).or_insert_with(|| Arc::new(Part { path: part.clone(), size: m.size, piece: m.piece, have: shared.clone() }));
+    let _unreg = PartGuard(m.sha.clone());
+    let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as usize) % n.max(1);
+    let (mut bytes, mut peer_bytes, mut last) = (0, 0, other("no source"));
+    let (mut dead, mut stall) = (vec![false; srcs.len()], Instant::now());
+    // sources in order, round after round: a peer still downloading answers only for the pieces it has, so ask again until the
+    // blob is whole; a source that errors is dropped; no new piece for 20 s fails the fetch (the head then serves it itself)
+    while !have.iter().all(|h| *h) {
+        let before = have.iter().filter(|h| **h).count();
+        for (k, s) in srcs.iter().enumerate() {
+            if dead[k] {
+                continue;
+            }
+            match pull(&mut f, m, &mut have, &shared, start, s) {
+                Ok(b) => {
+                    bytes += b;
+                    if !s.head {
+                        peer_bytes += b;
+                    }
+                }
+                Err(e) => (dead[k], last) = (true, e),
+            }
+            if have.iter().all(|h| *h) {
                 break;
             }
-            Err(e) => last = e,
         }
+        if have.iter().all(|h| *h) {
+            break;
+        }
+        if have.iter().filter(|h| **h).count() > before {
+            stall = Instant::now();
+        }
+        if dead.iter().all(|d| *d) || stall.elapsed() > Duration::from_secs(20) {
+            return Err(if dead.iter().all(|d| *d) { last } else { other("peers have not got the missing pieces yet; gave up") });
+        }
+        thread::sleep(Duration::from_millis(150));
     }
-    if !have.iter().all(|h| *h) {
-        return Err(last);
-    }
+    let from = if peer_bytes * 2 > bytes { "peer" } else { "head" }.to_string();
     f.flush()?;
     f.seek(SeekFrom::Start(0))?;
     let (sha, _, _) = hash_stream(&mut f, None, m.piece, u64::MAX)?;
@@ -524,7 +593,7 @@ pub fn fetch(dir: &Path, m: &Meta, srcs: &[Source]) -> io::Result<Got> {
     }
     write_idx(&dir.join(format!("{}.idx", m.sha)), m.piece, &m.hashes)?;
     fs::rename(&part, &fin)?;
-    Ok(Got { bytes, from, ms: t0.elapsed().as_secs_f64() * 1000.0 })
+    Ok(Got { bytes, peer_bytes, from, ms: t0.elapsed().as_secs_f64() * 1000.0 })
 }
 
 /// Link probe against the head's blob port: (download Mbit/s, upload Mbit/s, round trip ms).
@@ -634,9 +703,9 @@ pub fn agent_ctrl(v: &Value, w: &Arc<Mutex<Out>>) {
             match fetch(&cache_dir(), &m, &srcs) {
                 Ok(g) => {
                     let gone = evict(&cache_dir(), (crate::tune::get("blob_cache_gb") * 1073741824.0) as u64, &[sha.clone()]);
-                    info_log("blob.fetch", json!({"sha": sha, "bytes": g.bytes, "source": g.from, "ms": g.ms, "evicted": gone.len()}));
+                    info_log("blob.fetch", json!({"sha": sha, "bytes": g.bytes, "peer_bytes": g.peer_bytes, "source": g.from, "ms": g.ms, "evicted": gone.len()}));
                     FETCHING.lock().unwrap().remove(&sha);
-                    report_have(&w, json!({"fetched": {"sha": sha, "bytes": g.bytes, "from": g.from, "ms": g.ms}}));
+                    report_have(&w, json!({"fetched": {"sha": sha, "bytes": g.bytes, "peer_bytes": g.peer_bytes, "from": g.from, "ms": g.ms}}));
                 }
                 Err(e) => {
                     crate::warnl!("blob.fetch_failed", "blob {}: {e}", &sha[..12]);
@@ -965,6 +1034,12 @@ fn observe_uplink(ctx: &Ctx) {
     *w = Some((now, total));
 }
 
+/// A PC that has been downloading `sha` for a moment serves the pieces it has (see Part). Only downloads that started at least
+/// half a second ago count, and a fetcher picks holders already there: a chain, not a loop (a rare loop times out and goes to the head).
+fn partial_holder(w: &crate::head::Worker, sha: &str) -> bool {
+    w.fetching.get(sha).and_then(|f| f.since).is_some_and(|t| t.elapsed() >= Duration::from_millis(500))
+}
+
 /// Is this connected PC one the blob logic applies to (a real agent that speaks blobs)?
 fn real(w: &crate::head::Worker) -> bool {
     w.hello.is_some() && w.blob_rep // virtual agents too: they share their process's cache and blob port
@@ -1015,7 +1090,7 @@ pub fn on_ctrl(ctx: &Ctx, st: &mut State, wid: u64, v: &Value) {
         }
     }
     if let Some(f) = v.get("fetched") {
-        info_log("blob.fetch", json!({"node": w.hello.as_ref().map(|h| h.node_id.clone()), "sha": f["sha"], "bytes": f["bytes"], "source": f["from"], "ms": f["ms"]}));
+        info_log("blob.fetch", json!({"node": w.hello.as_ref().map(|h| h.node_id.clone()), "sha": f["sha"], "bytes": f["bytes"], "source": f["from"], "peer_bytes": f["peer_bytes"], "ms": f["ms"]}));
     }
     if let Some(f) = v.get("fetch_failed") {
         if let Some(sha) = f["sha"].as_str() {
@@ -1082,11 +1157,12 @@ pub fn stage_tick(ctx: &Ctx) {
             let holders: Vec<Hold> = st
                 .workers
                 .iter()
-                .filter(|(_, w)| real(w) && w.blob_port > 0 && w.have.contains(&sha))
+                .filter(|(_, w)| real(w) && w.blob_port > 0 && (w.have.contains(&sha) || partial_holder(w, &sha)))
                 .map(|(id, w)| Hold { id: *id, lab: lab(w), active: st.workers.values().filter(|o| o.fetching.values().any(|f| f.peer == Some(*id))).count() })
                 .collect();
             let mut seeding: HashMap<String, usize> = HashMap::new();
-            for w in st.workers.values().filter(|w| w.fetching.get(&sha).is_some_and(|f| f.peer.is_none())) {
+            // head seeds that already serve their pieces are holders now: not counted twice
+            for w in st.workers.values().filter(|w| w.fetching.get(&sha).is_some_and(|f| f.peer.is_none()) && !partial_holder(w, &sha)) {
                 *seeding.entry(lab(w)).or_default() += 1;
             }
             let peer = match mode.as_str() {
@@ -1190,6 +1266,71 @@ pub fn gc_store(ctx: &Ctx) -> usize {
         n += 1;
     }
     n
+}
+
+// ------------------------------------------------------- standby replication --
+/// Primary side: a REPL "blob" offer (size, piece hashes, a head ticket) for each blob in `rows` not in `offered` yet, at most
+/// `max` per call. The standby pulls it over the blob port, verified piece by piece and then by sha256.
+pub fn offers(ctx: &Ctx, offered: &mut HashSet<String>, max: usize) -> Vec<Value> {
+    let port = BOUND.load(Relaxed);
+    if port == 0 {
+        return vec![];
+    }
+    let mut out = vec![];
+    for (sha, ..) in ctx.store.blob_rows() {
+        if out.len() >= max {
+            break;
+        }
+        let Some(m) = (!offered.contains(&sha)).then(|| meta_of(ctx, &sha)).flatten() else { continue };
+        let (id, key) = new_ticket();
+        allow(&id, &key, &sha, true);
+        offered.insert(sha.clone());
+        out.push(json!({"sha": sha, "size": m.size, "piece": m.piece, "pieces": m.hashes.iter().map(|h| hex(h)).collect::<Vec<_>>(), "port": port, "id": id, "key": hex(&key)}));
+    }
+    out
+}
+
+static TAKING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// Standby side: fetch an offered blob from the primary into this PC's blob store (CK_DATA/blobs), in the background.
+/// The database row is added by `adopt` when this PC takes over (the files are what matters until then).
+pub fn standby_take(o: &Value, primary_ip: &str) {
+    let hashes: Option<Vec<[u8; 32]>> = o["pieces"].as_array().and_then(|a| a.iter().map(|h| unhex(h.as_str()?)?.try_into().ok()).collect());
+    let (Some(sha), Some(hashes), Some(size), Some(piece), Some(port), Some(id), Some(key)) =
+        (o["sha"].as_str().filter(|s| valid_sha(s)), hashes, o["size"].as_u64(), o["piece"].as_u64().filter(|p| *p > 0), o["port"].as_u64(), o["id"].as_str(), o["key"].as_str().and_then(unhex))
+    else {
+        return;
+    };
+    let dir = store_dir();
+    if dir.join(sha).metadata().is_ok_and(|m| m.len() == size) || !TAKING.lock().unwrap().insert(sha.into()) {
+        return;
+    }
+    let (sha, m, src) = (sha.to_string(), Meta { sha: sha.into(), size, piece, hashes }, Source { addr: format!("{primary_ip}:{port}"), id: id.into(), key, head: true });
+    thread::spawn(move || {
+        match fetch(&dir, &m, &[src]) {
+            Ok(g) => info_log("blob.standby_copy", json!({"sha": sha, "bytes": g.bytes, "ms": g.ms})),
+            Err(e) => crate::warnl!("blob.standby_copy_failed", "standby: blob {}: {e}", &sha[..12]),
+        }
+        TAKING.lock().unwrap().remove(&sha);
+    });
+}
+
+/// At takeover: blobs the standby copied get their database rows (they were never in the change log); logs the blobs the
+/// database names that never arrived. Returns (rows added, blobs missing).
+pub fn adopt(st: &crate::store::Store) -> (usize, usize) {
+    let d = store_dir();
+    let mut added = 0;
+    for (sha, size, _) in scan(&d) {
+        if st.blob_size(&sha).is_none() && d.join(format!("{sha}.idx")).is_file() {
+            st.put_blob(&sha, size, now_ms());
+            added += 1;
+        }
+    }
+    let missing = st.blob_rows().iter().filter(|r| !d.join(&r.0).is_file()).count();
+    if missing > 0 {
+        crate::warnl!("blob.standby_missing", "takeover: {missing} blob(s) the database lists were not copied to this PC yet; jobs that need them wait for a re-upload");
+    }
+    (added, missing)
 }
 
 #[cfg(test)]
@@ -1357,6 +1498,31 @@ mod tests {
         let e = fetch(&root.join("c3"), &m, &[Source { id, key, ..src.clone() }]).unwrap_err().to_string();
         assert!(e.contains("busy"), "{e}");
         ACTIVE_PEER.store(0, Relaxed);
+        // a peer that is still downloading serves the pieces it has (K_NOPE for the rest); the fetcher asks again until whole
+        let b2: Vec<u8> = data(2_000_000).iter().map(|x| x ^ 0x5a).collect();
+        let (sha2, size2, _) = ingest(&mut &b2[..], &root.join("scratch"), 1 << 30).unwrap();
+        let (piece2, hashes2) = read_idx(&root.join("scratch").join(format!("{sha2}.idx"))).unwrap();
+        let m3 = Meta { sha: sha2.clone(), size: size2, piece: piece2, hashes: hashes2 };
+        let pdir = root.join("peer");
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(pdir.join(format!("{sha2}.part")), &b2).unwrap();
+        let n3 = size2.div_ceil(piece2) as usize;
+        let shared = Arc::new(Mutex::new((0..n3).map(|i| i % 2 == 0).collect::<Vec<_>>()));
+        PARTS.lock().unwrap().insert(sha2.clone(), Arc::new(Part { path: pdir.join(format!("{sha2}.part")), size: size2, piece: piece2, have: shared.clone() }));
+        let (id, key) = new_ticket();
+        allow(&id, &key, &sha2, false);
+        let src3 = Source { addr: format!("127.0.0.1:{port}"), id, key, head: false };
+        let sh = shared.clone();
+        let t = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            sh.lock().unwrap().fill(true); // the peer's own download moved on
+        });
+        let g = fetch(&root.join("c5"), &m3, &[src3]).unwrap();
+        t.join().unwrap();
+        assert_eq!((g.bytes, g.peer_bytes, g.from.as_str()), (size2, size2, "peer"));
+        assert!(g.ms >= 150.0, "had to wait for the missing pieces: {}", g.ms);
+        assert_eq!(fs::read(root.join("c5").join(&sha2)).unwrap(), b2);
+        PARTS.lock().unwrap().remove(&sha2);
         // probe
         let (id, key) = new_ticket();
         allow(&id, &key, PROBE, true);

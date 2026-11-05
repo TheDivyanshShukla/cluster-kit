@@ -14,7 +14,7 @@ export function rewind(current: Record<string, NodeSnap>, events: Pick<EventRow,
 			const s = get(id);
 			if (!s) continue;
 			if (e.kind === 'node.lost') Object.assign(s, { online: true, power: 'awake' });
-			else if (e.kind === 'node.join') Object.assign(s, { online: false, power: 'awake' });
+			else if ((e.kind === 'node.join' || e.kind === 'node.joined')) Object.assign(s, { online: false, power: 'awake' });
 			else if (e.kind === 'power.sleep') Object.assign(s, { online: true, power: 'awake' });
 			else if (e.kind === 'power.wake') Object.assign(s, { online: false, power: 'asleep' });
 			else if (e.kind === 'node.approve') s.state = 'pending';
@@ -28,6 +28,6 @@ export function rewind(current: Record<string, NodeSnap>, events: Pick<EventRow,
 
 /** Host named by the last `ha.promote` at or before t (null when none is known before t). */
 export function headAt(events: Pick<EventRow, 'ts_ms' | 'kind' | 'detail' | 'actor' | 'id'>[], t: number, hosts: HostIndex): string | null {
-	const p = events.filter((e) => e.kind === 'ha.promote' && e.ts_ms <= t).sort((a, b) => b.ts_ms - a.ts_ms || b.id - a.id)[0];
+	const p = events.filter((e) => (e.kind === 'ha.promote' || e.kind === 'ha.promoted') && e.ts_ms <= t).sort((a, b) => b.ts_ms - a.ts_ms || b.id - a.id)[0];
 	return p ? (idsIn(p, hosts)[0] ?? null) : null;
 }

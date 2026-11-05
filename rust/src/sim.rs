@@ -447,6 +447,57 @@ pub fn simulate(s: &Scn) -> Out {
     Out { finished: m.finish.is_some(), end_s, ideal_s, n: s.n, done: m.done, pending: m.pending, inflight: m.inflight, tasks: m.tasks, failures: m.failures, recovered: m.recovered, head_util: (m.head_busy / end_s.max(1e-9)).min(1.0), timeline: tl }
 }
 
+/// The power model (watts per PC) shared by day mode defaults and GET /api/v1/power `labs`.
+pub const W_IDLE: f64 = 25.0;
+pub const W_BUSY: f64 = 65.0;
+pub const W_SLEEP: f64 = 2.0;
+pub const W_BOOT: f64 = 65.0;
+pub const W_INTERACTIVE: f64 = 45.0;
+
+pub const API_MAX_NODES: f64 = 20_000.0;
+pub const API_MAX_HOURS: f64 = 48.0;
+
+/// POST /api/v1/sim: run a `ck sim` scenario and return what `ck sim` writes: {"summary", "series"} (series = the
+/// timeline.csv text). Err = the reason (400). Caps: nodes <= 20,000, simulated hours <= 48; a day run is also bounded
+/// to 3e8 PC-ticks so one request cannot spin for minutes. ponytail: the job-level run is bounded by max_s only.
+pub fn run_api(v: &Value) -> Result<Value, String> {
+    if !v.is_object() {
+        return Err("the body must be a scenario object".into());
+    }
+    let day = v.get("day").is_some();
+    let count = |k: &str| v[k].as_array().map_or(1.0, |a| a.iter().map(|g| f(g, "count", 1.0).max(0.0)).sum::<f64>());
+    let nodes = count(if day { "pcs" } else { "nodes" });
+    if nodes > API_MAX_NODES {
+        return Err(format!("at most {} nodes per run (this has {nodes})", API_MAX_NODES as u64));
+    }
+    if day {
+        let (h, dt) = (f(&v["day"], "hours", 24.0), f(&v["day"], "tick_s", 10.0).max(0.5));
+        if h > API_MAX_HOURS {
+            return Err(format!("at most {} simulated hours per run (day.hours is {h})", API_MAX_HOURS as u64));
+        }
+        if nodes * h * 3600.0 / dt > 3e8 {
+            return Err("too many PC-ticks: raise day.tick_s or lower the PCs or hours".into());
+        }
+        let mut r = day_fn(v);
+        let series = r["_timeline"].take();
+        return Ok(json!({"summary": r, "series": series}));
+    }
+    let s = Scn::parse(&v.to_string())?;
+    if s.max_s > API_MAX_HOURS * 3600.0 {
+        return Err(format!("max_s is over {} hours", API_MAX_HOURS as u64));
+    }
+    let r = simulate(&s);
+    let mut csv = String::from("t_s,done,rate_per_s,busy_nodes,connected_nodes,head_busy_frac\n");
+    for r in &r.timeline {
+        csv += &format!("{:.3},{},{:.1},{},{},{:.4}\n", r[0], r[1], r[2], r[3], r[4], r[5]);
+    }
+    Ok(json!({"summary": r.summary(), "series": csv}))
+}
+
+fn day_fn(v: &Value) -> Value {
+    day(v)
+}
+
 pub fn run(o: &Opts) {
     let path = o.rest.first().unwrap_or_else(|| die("usage: ck sim SCENARIO.json [--out DIR]"));
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(&format!("{path}: {e}")));
@@ -534,7 +585,7 @@ pub fn day(v: &Value) -> Value {
     let (hours, dt, sample, eff, chunk_s) = (f(d, "hours", 24.0), f(d, "tick_s", 10.0).max(0.5), f(d, "sample_s", 300.0), f(d, "efficiency", 0.97), f(d, "chunk_s", 1.0));
     let mut rng = Rng(f(d, "seed", 1.0) as u64);
     let p = &v["power"];
-    let (idle_w, busy_w, sleep_w, boot_w, int_w, wake_s) = (f(p, "idle_w", 25.0), f(p, "busy_w", 65.0), f(p, "sleep_w", 2.0), f(p, "boot_w", 65.0), f(p, "interactive_w", 45.0), f(p, "wake_s", 45.0));
+    let (idle_w, busy_w, sleep_w, boot_w, int_w, wake_s) = (f(p, "idle_w", W_IDLE), f(p, "busy_w", W_BUSY), f(p, "sleep_w", W_SLEEP), f(p, "boot_w", W_BOOT), f(p, "interactive_w", W_INTERACTIVE), f(p, "wake_s", 45.0));
     let e = &v["eco"];
     let (eco, idle_sleep, prewake, keep) = (e["enabled"].as_bool().unwrap_or(false), f(e, "idle_sleep_s", 600.0), f(e, "prewake_s", 120.0), f(e, "keep_awake", 0.0) as usize);
     let h = &v["head"];
@@ -769,6 +820,15 @@ mod tests {
     }
     fn base() -> Value {
         json!({"nodes": [{"count": 10, "rate": 1e5, "jitter": 0.2}], "job": {"n": 1e7}})
+    }
+
+    #[test]
+    fn api_caps_and_reply() {
+        let r = run_api(&base()).unwrap();
+        assert!(r["summary"]["finished"].as_bool().unwrap() && r["series"].as_str().unwrap().starts_with("t_s,"));
+        assert!(run_api(&json!({"nodes": [{"count": 20001}], "job": {"n": 1e6}})).unwrap_err().contains("20000"));
+        assert!(run_api(&json!({"day": {"hours": 49}, "pcs": [{"count": 2}]})).unwrap_err().contains("48"));
+        assert!(run_api(&json!({"day": {"hours": 1, "tick_s": 10}, "pcs": [{"count": 3, "rate": 1e6}]})).unwrap()["summary"]["kwh"].is_number());
     }
 
     #[test]

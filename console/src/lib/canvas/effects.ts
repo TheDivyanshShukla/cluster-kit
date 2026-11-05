@@ -1,5 +1,6 @@
 // Event to canvas effect. Pure: the engine adds the timing. Hosts in an event's text ("pc-06 woke up, 14:03") find the PC.
 import type { EventRow } from '../api/schema';
+import { eventLabel } from '../events';
 
 export type Tone = 'ok' | 'warn' | 'bad' | 'busy' | 'idle';
 export type Fx =
@@ -33,10 +34,10 @@ export function effectFor(ev: Pick<EventRow, 'kind' | 'detail' | 'actor'>, hosts
 	const ids = idsIn(ev, hosts);
 	switch (ev.kind) {
 		case 'node.lost': return { type: 'ripple', tone: 'bad', ids };
-		case 'node.join': return { type: 'ripple', tone: 'ok', ids };
+		case 'node.join': case 'node.joined': return { type: 'ripple', tone: 'ok', ids };
 		case 'power.sleep': return { type: 'glyph', glyph: 'moon', ids };
 		case 'power.wake': return { type: 'glyph', glyph: 'sunrise', ids };
-		case 'ha.promote': return { type: 'failover', ids: ids.slice(0, 1) };
+		case 'ha.promote': case 'ha.promoted': return { type: 'failover', ids: ids.slice(0, 1) };
 		case 'ha.recruit': return { type: 'recruit', ids: ids.slice(0, 1) };
 		case 'ha.switchover': return { type: 'failover', ids: ids.slice(-1) };
 		case 'node.state': case 'node.approve': return { type: 'ripple', tone: 'warn', ids: ids.slice(0, 1) };
@@ -50,10 +51,10 @@ export function effectFor(ev: Pick<EventRow, 'kind' | 'detail' | 'actor'>, hosts
 export type RailKey = 'lost' | 'join' | 'sleep' | 'wake' | 'head' | 'recruit' | 'switch' | 'job' | 'state' | 'user' | 'other';
 export function railKind(kind: string): { key: RailKey; tone: Tone } {
 	if (kind === 'node.lost') return { key: 'lost', tone: 'bad' };
-	if (kind === 'node.join') return { key: 'join', tone: 'ok' };
+	if (kind === 'node.join' || kind === 'node.joined') return { key: 'join', tone: 'ok' };
 	if (kind === 'power.sleep') return { key: 'sleep', tone: 'idle' };
 	if (kind === 'power.wake') return { key: 'wake', tone: 'warn' };
-	if (kind === 'ha.promote') return { key: 'head', tone: 'busy' };
+	if (kind === 'ha.promote' || kind === 'ha.promoted') return { key: 'head', tone: 'busy' };
 	if (kind === 'ha.recruit') return { key: 'recruit', tone: 'ok' };
 	if (kind === 'ha.switchover') return { key: 'switch', tone: 'busy' };
 	if (kind.startsWith('job.')) return { key: 'job', tone: kind === 'job.done' ? 'ok' : 'busy' };
@@ -61,7 +62,7 @@ export function railKind(kind: string): { key: RailKey; tone: Tone } {
 	if (kind.startsWith('auth.') || kind.startsWith('user.')) return { key: 'user', tone: 'idle' };
 	return { key: 'other', tone: 'idle' };
 }
-export const railText = (ev: Pick<EventRow, 'kind' | 'detail'>) => ev.detail || ev.kind;
+export const railText = (ev: Pick<EventRow, 'kind' | 'detail'>) => ev.detail || eventLabel(ev.kind);
 
 // ---------------------------------------------------------------- timed effects
 export type Live = { fx: Fx; id: string | 'head'; t0: number; dur: number };

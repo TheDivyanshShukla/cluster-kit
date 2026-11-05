@@ -199,3 +199,12 @@ The SDK is standard library only and runs on Python 3.9 to 3.15 (including the f
 - **`ck.mean_params`** averages dicts (a torch `state_dict` stays an `OrderedDict`), lists, floats, numpy arrays and torch tensors without importing numpy or torch; integer arrays (BatchNorm `num_batches_tracked`) keep their dtype.
 
 **ML examples** (each file's header lists its packages; the PCs need the same packages installed): `ml_numpy.py` (arrays as arguments, results and blobs), `ml_pandas.py` (`ck.shard` of rows, per-shard groupby, `pd.concat`), `ml_sklearn.py` (`ck.sweep` over a cross-validated random forest, `ck.map` over fits), `ml_torch.py` (CPU, `ck.train` with `state_dict` averaging). Set `CK_LOCAL=never` to force the cluster for these small demos; by default the optimizer keeps them local. CI runs the numpy / pandas / scikit-learn ones on 3.12; torch is run by hand.
+
+## 11. Warm runner (wave 14)
+
+The first task of a job on a PC leaves a per-user warm Python worker that has already run your code's imports (torch loads once, not on every task or train round). Later tasks with the same code and the same `python3` connect to it over a unix socket and the worker forks one child per task, so tasks stay isolated and parallel and results are the same as the plain path. The task that starts the worker runs the plain way (no wait).
+
+- Socket and files live in `<temp>/ck-warm-<uid>/`, mode 0700 and owned by the user (anything else turns the feature off); the worker also refuses any peer whose uid differs (SO_PEERCRED on Linux, LOCAL_PEERCRED on macOS; where neither exists the 0700 directory is the guard).
+- Key = hash of the shipped code + `sys.executable` + Python version. Idle exit after 120 s (`CK_WARM_IDLE_S`; the `warm_idle_s` tunable is for the lead to wire). `CK_WARM=off` disables it. Windows: off.
+- Any error (no socket, refused, worker died mid-task) falls back to the plain path for the results not yet delivered.
+- Measured, 4 virtual agents, `examples/sdk/ml_torch.py` (8 rounds, 6 shards, torch CPU, 3.12): 24-25 s plain, 16 s then 11 s warm; same held-out MSE.

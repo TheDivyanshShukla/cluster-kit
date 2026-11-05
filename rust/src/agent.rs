@@ -281,6 +281,16 @@ fn start_standby(head: &str, w: &Mutex<Out>) {
         }
     }
     let data = std::path::Path::new(&std::env::var("CK_DATA").unwrap_or_else(|_| "ck-data".into())).join("standby");
+    // T55: STARTED is per process, so after a kill -9 / restart of the agent the old standby (still running, same database
+    // directory) was joined by a second one. A pid file in the data dir says one is already alive.
+    let pidf = data.join("standby.pid");
+    if cfg!(unix)
+        && std::fs::read_to_string(&pidf).ok().is_some_and(|p| {
+            std::process::Command::new("kill").args(["-0", p.trim()]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+        })
+    {
+        return;
+    }
     let r = std::env::current_exe().and_then(|exe| {
         std::fs::create_dir_all(&data)?;
         std::process::Command::new(exe)
@@ -292,6 +302,7 @@ fn start_standby(head: &str, w: &Mutex<Out>) {
     let body = match r {
         Ok(c) => {
             crate::say!("agent.standby_start", "standby: started pid {} for head {head}", c.id());
+            let _ = std::fs::write(&pidf, c.id().to_string());
             *g = Some(c);
             r#"{"standby_started":true}"#.to_string()
         }

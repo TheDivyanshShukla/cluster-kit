@@ -3,6 +3,7 @@
 import { z } from 'zod';
 import { LogList } from './logs';
 import {
+	SimReply,
 	Alert,
 	AlertList,
 	BreakdownReply,
@@ -142,6 +143,8 @@ export const api = {
 	switchover: (to: string) => call('POST', '/api/v1/ha/switchover', SwitchReply, { to }),
 	nodes: () => call('GET', '/api/v1/nodes', NodeList),
 	/** NET-06: sleep needs a connected PC, wake needs a known MAC (409 otherwise). */
+	/** POST /api/v1/sim (researcher): run a `ck sim` scenario, 409 busy while another runs */
+	sim: (scenario: unknown) => call('POST', '/api/v1/sim', SimReply, scenario),
 	powerNodes: (node_ids: string[], action: 'sleep' | 'wake') => call('POST', '/api/v1/nodes/power', NodesChanged, { node_ids, action }),
 	power: () => call('GET', '/api/v1/power', PowerReply),
 	setPower: (p: PowerSettings) => call('PUT', '/api/v1/power', PowerReply, p),

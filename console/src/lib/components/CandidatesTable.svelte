@@ -44,10 +44,11 @@
 	const stamp = $derived(`${live.ha?.epoch}:${live.ha?.standbys.map((s) => s.node_id).join(',')}`);
 	$effect(() => {
 		void stamp;
+		void live.rev.candidates;
 		let live_ = true;
 		const load = () => api.candidates().then((r) => live_ && ((rows = r.candidates), (failed = ''))).catch((e) => live_ && (failed = e instanceof ApiError ? e.message : 'The head did not answer.'));
 		void load();
-		const t = setInterval(load, 30_000);
+		const t = setInterval(load, 60_000);
 		return () => { live_ = false; clearInterval(t); };
 	});
 </script>
