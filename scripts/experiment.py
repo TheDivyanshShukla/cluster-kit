@@ -7,6 +7,7 @@ starting at a different config each round), after one warm-up run per config tha
   python3 scripts/experiment.py --head http://10.0.0.5:7702 --pcs 1,2,4,8,16,32,64,128,200 --repeats 7 \
       --n-per-pc 2e9 --policy adaptive,fixed --out exp-e1
   env CK_TOKEN: an API token with the researcher role, unless the head runs with CK_AUTH=off.
+  --upload [NAME]: at the end also store the two files on the head (Experiments page, `ck admin experiment ls`).
 
 Out: raw.csv (config,repeat,n,seconds,hashes_per_s,hits + pcs,policy,chunk,virtual: the paper's columns first),
 runs.jsonl (provenance per run: git commit, head, the exact PCs and their classes, times), summary on stdout.
@@ -28,6 +29,7 @@ p.add_argument("--synth-ns", type=int, default=1000)
 p.add_argument("--policy", default="adaptive", help="comma list: adaptive,guided,fixed")
 p.add_argument("--chunk", default="0", help="comma list of chunk sizes; 0 = the policy decides")
 p.add_argument("--selector", default="state=active", help="which PCs take part at all (ORG-04)")
+p.add_argument("--upload", nargs="?", const="", metavar="NAME", help="at the end send raw.csv and runs.jsonl to the head (POST /api/v1/experiments, needs the researcher role)")
 p.add_argument("--out", default="exp-" + time.strftime("%Y%m%d-%H%M"))
 a = p.parse_args()
 if not (a.n or a.n_per_pc):
@@ -115,3 +117,12 @@ prov.close()
 print("\nconfig                     median M/s   min    max")
 for name, v in rates.items():
     print(f"{name:<24} {statistics.median(v) / 1e6:10.1f} {min(v) / 1e6:6.1f} {max(v) / 1e6:6.1f}")
+
+if a.upload is not None:
+    try:
+        body = {"name": a.upload or os.path.basename(os.path.abspath(out)),
+                "raw_csv": open(os.path.join(out, "raw.csv")).read(), "runs_jsonl": open(os.path.join(out, "runs.jsonl")).read()}
+        e = call("POST", "/api/v1/experiments", body)["experiment"]
+        print(f"\nuploaded as experiment {e['id']} ({e['configs']} configs x {e['repeats']} repeats)")
+    except Exception as ex:  # an old head without the route, or no researcher role: the files are on disk anyway
+        print(f"\nupload failed ({ex}); results are in {out}/", file=sys.stderr)

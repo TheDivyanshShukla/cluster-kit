@@ -89,6 +89,13 @@ pub const KNOBS: &[Knob] = &[
     k("session_max_d", "Security", 7.0, 0.1, 365.0, "days", Head, "Sign-out after this long in any case."),
     k("login_fail_max", "Security", 5.0, 1.0, 100.0, "tries", Head, "Wrong passwords allowed per window before login is blocked."),
     k("login_fail_window_min", "Security", 5.0, 1.0, 1440.0, "min", Head, "Window for counting wrong passwords."),
+    // alerts (src/alerts.rs)
+    k("alert_slow_mad", "Alerts", 3.0, 1.0, 20.0, "MAD", Head, "slow_pc: a PC is slow when its rate is this many MADs below the fleet median."),
+    k("alert_slow_min_s", "Alerts", 60.0, 5.0, 86_400.0, "s", Head, "slow_pc: how long a PC must stay slow before the alert opens."),
+    k("alert_flaky_losses", "Alerts", 3.0, 1.0, 1000.0, "losses", Head, "flaky_pc: more than this many node.lost in 24 h."),
+    k("alert_head_cpu_pct", "Alerts", 85.0, 10.0, 100.0, "%", Head, "head_hot: head process CPU above this for 60 s."),
+    k("alert_standby_lag", "Alerts", 5000.0, 1.0, 100_000_000.0, "changes", Head, "standby_behind: replication lag above this for 30 s."),
+    k("alert_no_standby_s", "Alerts", 60.0, 5.0, 86_400.0, "s", Head, "no_standby: fewer standbys than the target for this long."),
     // logging (src/log.rs, docs/LOGGING.md)
     k("log_level", "Logging", 3.0, 0.0, 4.0, "level", Both, "What is written to ck-data/logs: 0 off, 1 error, 2 warn, 3 info, 4 debug."),
     k("log_chunks", "Logging", 0.0, 0.0, 1.0, "0/1", Both, "1 = also log every chunk dispatch and result (debug lines; a lot of output on big jobs)."),

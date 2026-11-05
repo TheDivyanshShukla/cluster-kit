@@ -117,8 +117,27 @@ pub fn run(o: &Opts) {
             }
             std::io::stdout().write_all(&r.body).ok();
         }
+        Some("breakdown") => {
+            let b = call(o, "GET", &format!("/api/v1/jobs/{}/breakdown", id_arg(o)))["breakdown"].clone();
+            let (wall, pcs) = (b["wall_s"].as_f64().unwrap_or(0.0), b["per_pc"].as_array().map_or(0, |a| a.len()));
+            println!("job {}  wall {wall:.1} s  {pcs} PC(s)  efficiency {:.0}%", dash(&b["job"]), b["efficiency"].as_f64().unwrap_or(0.0) * 100.0);
+            let total = (wall * pcs as f64).max(1e-9);
+            for (k, v) in b["pc_seconds"].as_object().into_iter().flatten() {
+                let s = v.as_f64().unwrap_or(0.0);
+                println!("  {k:<15} {s:>10.1} PC-s  {:>5.1}%", s / total * 100.0);
+            }
+            let c = &b["chunk_s"];
+            println!("chunk seconds  p50 {:.3}  p90 {:.3}  max {:.3}", c["p50"].as_f64().unwrap_or(0.0), c["p90"].as_f64().unwrap_or(0.0), c["max"].as_f64().unwrap_or(0.0));
+            for p in b["per_pc"].as_array().into_iter().flatten() {
+                println!("  {:<14} {:>8} chunks {:>14} numbers {:>12.3e}/s busy {:>8.1} s", dash(&p["host"]), dash(&p["chunks"]), dash(&p["numbers"]), p["rate"].as_f64().unwrap_or(0.0), p["busy_s"].as_f64().unwrap_or(0.0));
+            }
+            let st = b["stragglers"].as_array().cloned().unwrap_or_default();
+            if !st.is_empty() {
+                println!("stragglers: {}", st.iter().map(dash).collect::<Vec<_>>().join(" "));
+            }
+        }
         Some("token") => token(o),
-        _ => die("usage: ck job ls | show ID | cancel ID | result ID | token --name USER   (head: --head IP; auth: CK_TOKEN)"),
+        _ => die("usage: ck job ls | show ID | cancel ID | result ID | breakdown ID | token --name USER   (head: --head IP; auth: CK_TOKEN)"),
     }
 }
 
@@ -143,7 +162,9 @@ pub fn token(o: &Opts) {
 /// API-02: every route (users::ROUTES) maps to a CLI command or says why not. Checked in api::tests.
 pub const CLI_MAP: &[(&str, &str, &str)] = &[
     ("GET", "/me", "no CLI needed: session"), ("GET", "/ha", "ck admin ha"), ("POST", "/ha/switchover", "ck admin switchover NODE"),
-    ("POST", "/nodes/power", "ck admin sleep|wake"), ("GET", "/power", "ck admin power"), ("PUT", "/power", "ck admin power"), ("GET", "/ha/settings", "ck admin standbys"), ("PUT", "/ha/settings", "ck admin standbys"), ("GET", "/tunables", "ck admin tune"), ("PUT", "/tunables", "ck admin tune KEY VALUE|default"), ("GET", "/ha/candidates", "ck admin heads"), ("GET", "/logs", "ck logs"), ("POST", "/bootstrap", "no CLI needed: first-run setup in the browser"),
+    ("POST", "/nodes/power", "ck admin sleep|wake"), ("GET", "/power", "ck admin power"), ("PUT", "/power", "ck admin power"), ("GET", "/ha/settings", "ck admin standbys"), ("PUT", "/ha/settings", "ck admin standbys"), ("GET", "/tunables", "ck admin tune"), ("PUT", "/tunables", "ck admin tune KEY VALUE|default"), ("GET", "/ha/candidates", "ck admin heads"), ("GET", "/logs", "ck logs"),
+    ("GET", "/jobs/{id}/breakdown", "ck job breakdown ID"), ("GET", "/alerts", "ck admin alerts"), ("POST", "/alerts/{id}/ack", "ck admin alerts ack ID"),
+    ("POST", "/experiments", "ck admin experiment upload DIR [NAME]"), ("GET", "/experiments", "ck admin experiment ls"), ("GET", "/experiments/{id}", "ck admin experiment show ID"), ("GET", "/report", "ck admin report [DAY]"), ("POST", "/bootstrap", "no CLI needed: first-run setup in the browser"),
     ("POST", "/login", "ck token"), ("POST", "/logout", "no CLI needed: session"), ("POST", "/tokens", "ck token"),
     ("GET", "/users", "no CLI needed: console user admin"), ("POST", "/users", "no CLI needed: console user admin"),
     ("GET", "/cluster", "no CLI needed: stream (see ck status)"),
@@ -170,7 +191,7 @@ fn tz_offset() -> i64 {
 }
 
 /// Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -178,7 +199,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
 }
 
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;
     let era = z.div_euclid(146097);
     let doe = z - era * 146097;
@@ -209,7 +230,7 @@ fn fmt_local(ms: i64, offset_min: i64) -> String {
 }
 
 fn usage_admin() -> ! {
-    die("usage: ck admin nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | heads | tune [KEY VALUE|default] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
+    die("usage: ck admin nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | heads | tune [KEY VALUE|default] | alerts [ack ID] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
 }
 
 fn send(o: &Opts, method: &str, path: &str, body: Value) -> Value {
@@ -438,6 +459,53 @@ pub fn admin(o: &Opts) {
             sb.iter().for_each(|s| println!("standby {}  acked {}  lag {}", dash(&s["node_id"]), dash(&s["acked_seq"]), dash(&s["lag"])));
             let quorum = crate::repl::has_quorum(v["connected"].as_u64().unwrap_or(0) as usize, v["membership"].as_u64().unwrap_or(0) as usize);
             println!("{} standby(s)  quorum {} ({} of {} nodes connected)  dispatching {}", sb.len(), if quorum { "yes" } else { "NO" }, dash(&v["connected"]), dash(&v["membership"]), dash(&v["dispatching"]));
+        }
+        Some("alerts") => {
+            let v = if rest.get(1).map(String::as_str) == Some("ack") {
+                let a = send(o, "POST", &format!("/api/v1/alerts/{}/ack", num(o, 2)), serde_json::json!({}));
+                serde_json::json!({"alerts": [a["alert"].clone()]})
+            } else {
+                call(o, "GET", "/api/v1/alerts")
+            };
+            println!("{:>5}  {:<16} {:<5} {:<7} {:<14} {:<9} DETAIL", "ID", "KIND", "SEV", "STATE", "NODE", "ACKED BY");
+            for a in v["alerts"].as_array().cloned().unwrap_or_default() {
+                println!("{:>5}  {:<16} {:<5} {:<7} {:<14} {:<9} {}", dash(&a["id"]), dash(&a["kind"]), dash(&a["severity"]), if a["active"] == true { "active" } else { "closed" }, dash(&a["node_id"]), dash(&a["acked_by"]), dash(&a["detail"]));
+            }
+        }
+        Some("experiment") => match rest.get(1).map(String::as_str) {
+            Some("upload") => {
+                let dir = std::path::Path::new(arg(o, 2));
+                let read = |f: &str| std::fs::read_to_string(dir.join(f)).map_err(|e| format!("{}: {e}", dir.join(f).display()));
+                let (csv, jl) = (read("raw.csv").unwrap_or_else(|e| die(&e)), read("runs.jsonl").unwrap_or_else(|e| die(&e)));
+                let name = rest.get(3).cloned().unwrap_or_else(|| dir.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| "experiment".into()));
+                let mut body = serde_json::json!({"name": name, "raw_csv": csv, "runs_jsonl": jl});
+                if let Some(sim) = read("sim.json").ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+                    body["sim"] = sim;
+                }
+                let e = &send(o, "POST", "/api/v1/experiments", body)["experiment"];
+                println!("experiment {} \"{}\": {} configs x {} repeats, up to {} PCs{}, commit {}", dash(&e["id"]), dash(&e["name"]), dash(&e["configs"]), dash(&e["repeats"]), dash(&e["pcs_max"]), if e["virtual"] == true { " (virtual)" } else { "" }, dash(&e["commit"]));
+            }
+            Some("ls") => {
+                for e in call(o, "GET", "/api/v1/experiments")["experiments"].as_array().cloned().unwrap_or_default() {
+                    println!("{:>4}  {:<28} {:<10} {:>3} configs x {:<3} {} {}", dash(&e["id"]), dash(&e["name"]), dash(&e["submitter"]), dash(&e["configs"]), dash(&e["repeats"]), if e["virtual"] == true { "virtual" } else { "real" }, dash(&e["commit"]));
+                }
+            }
+            Some("show") => print!("{}", call(o, "GET", &format!("/api/v1/experiments/{}", num(o, 2)))["raw_csv"].as_str().unwrap_or("")),
+            _ => usage_admin(),
+        },
+        Some("report") => {
+            let q = rest.get(1).map_or(String::new(), |d| format!("?day={}", enc(d)));
+            let r = &call(o, "GET", &format!("/api/v1/report{q}"))["report"];
+            let f = |v: &Value| v.as_f64().unwrap_or(0.0);
+            println!("report {}", dash(&r["day"]));
+            println!("  throughput   peak {:.3e}/s  mean {:.3e}/s", f(&r["throughput_peak"]), f(&r["throughput_mean"]));
+            println!("  work done    {} numbers, {} items, {} jobs done, {} failed", dash(&r["work_done"]["numbers"]), dash(&r["work_done"]["items"]), dash(&r["work_done"]["jobs_done"]), dash(&r["work_done"]["jobs_failed"]));
+            println!("  PCs          {} seen, {} max online, {:.1} mean online, busy {:.0}%", dash(&r["pcs"]["seen"]), dash(&r["pcs"]["max_online"]), f(&r["pcs"]["mean_online"]), f(&r["busy_share"]) * 100.0);
+            println!("  failures     {} PCs lost, {} chunks recovered, {} head failovers", dash(&r["failures"]["pcs_lost"]), dash(&r["failures"]["recovered_chunks"]), dash(&r["failures"]["head_failovers"]));
+            println!("  energy       {}   alerts {}", r["energy_kwh"].as_f64().map_or("-".into(), |k| format!("{k:.3} kWh")), dash(&r["alerts"]));
+            for j in r["top_jobs"].as_array().into_iter().flatten() {
+                println!("  top job      {:>6} {:<24} {:.2} PC-hours", dash(&j["id"]), dash(&j["name"]), f(&j["pc_hours"]));
+            }
         }
         Some("config-export") => println!("{}", serde_json::to_string_pretty(&call(o, "GET", "/api/v1/config")).unwrap_or_default()),
         Some("config-import") => {

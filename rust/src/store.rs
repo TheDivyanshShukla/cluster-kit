@@ -69,6 +69,15 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ALTER TABLE jobs ADD COLUMN max_pcs INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN placement TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN mem_mb INTEGER NOT NULL DEFAULT 0;
+", "
+CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, severity TEXT NOT NULL, node_id TEXT, detail TEXT NOT NULL,
+  since_ms INTEGER NOT NULL, last_ms INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1, acked_by TEXT);
+CREATE UNIQUE INDEX alerts_active ON alerts(kind, IFNULL(node_id, '')) WHERE active = 1;
+CREATE TABLE experiments (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, submitter TEXT NOT NULL, created_ms INTEGER NOT NULL,
+  configs INTEGER NOT NULL, repeats INTEGER NOT NULL, virtual INTEGER NOT NULL, commit_hash TEXT NOT NULL, pcs_max INTEGER NOT NULL,
+  raw_csv TEXT NOT NULL, runs_jsonl TEXT NOT NULL, sim TEXT);
+CREATE TABLE samples (ts_ms INTEGER PRIMARY KEY, online INTEGER NOT NULL, busy INTEGER NOT NULL, rate REAL NOT NULL, energy_j REAL NOT NULL);
+CREATE TABLE job_stats (job_id INTEGER PRIMARY KEY, body TEXT NOT NULL);
 "];
 
 const NODE_SEL: &str = "SELECT node_id,host,addr,inventory,first_seen_ms,last_seen_ms,state,state_reason,state_by,lab_id,x,y,calib_mhs FROM nodes";
@@ -1417,5 +1426,183 @@ mod done_in_tests {
         assert_eq!(s.done_in(1, 20, 30), vec![]);
         assert_eq!(s.done_in(1, 25, 55), vec![(30, 40), (50, 60)]);
         assert_eq!(s.done_in(2, 0, 100), vec![]);
+    }
+}
+
+// ---- wave 12: alerts, experiments, samples, per-job time breakdown
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct AlertRow {
+    pub id: u64,
+    pub kind: String,
+    pub severity: String,
+    pub node_id: Option<String>,
+    pub detail: String,
+    pub since_ms: i64,
+    pub last_ms: i64,
+    pub active: bool,
+    pub acked_by: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ExperimentRow {
+    pub id: u64,
+    pub name: String,
+    pub submitter: String,
+    pub created_ms: i64,
+    pub configs: u64,
+    pub repeats: u64,
+    pub r#virtual: bool,
+    pub commit: String,
+    pub pcs_max: u64,
+}
+
+/// One per-minute sample of the fleet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sample {
+    pub ts_ms: i64,
+    pub online: u32,
+    pub busy: u32,
+    pub rate: f64,
+    pub energy_j: f64,
+}
+
+const ALERT_SEL: &str = "SELECT id,kind,severity,node_id,detail,since_ms,last_ms,active,acked_by FROM alerts";
+const EXP_SEL: &str = "SELECT id,name,submitter,created_ms,configs,repeats,virtual,commit_hash,pcs_max FROM experiments";
+
+fn alert_row(r: &Row) -> rusqlite::Result<AlertRow> {
+    Ok(AlertRow { id: r.get::<_, i64>(0)? as u64, kind: r.get(1)?, severity: r.get(2)?, node_id: r.get(3)?, detail: r.get(4)?, since_ms: r.get(5)?, last_ms: r.get(6)?, active: r.get::<_, i64>(7)? != 0, acked_by: r.get(8)? })
+}
+
+fn exp_row(r: &Row) -> rusqlite::Result<ExperimentRow> {
+    Ok(ExperimentRow { id: r.get::<_, i64>(0)? as u64, name: r.get(1)?, submitter: r.get(2)?, created_ms: r.get(3)?, configs: r.get::<_, i64>(4)? as u64, repeats: r.get::<_, i64>(5)? as u64,
+        r#virtual: r.get::<_, i64>(6)? != 0, commit: r.get(7)?, pcs_max: r.get::<_, i64>(8)? as u64 })
+}
+
+impl Store {
+    /// New active alert; fails if one with the same kind and node is active already (unique index).
+    pub fn alert_open(&self, kind: &str, severity: &str, node: Option<&str>, detail: &str, now_ms: i64) -> Result<AlertRow, String> {
+        let c = self.db();
+        c.execute("INSERT INTO alerts (kind,severity,node_id,detail,since_ms,last_ms) VALUES (?,?,?,?,?,?)", params![kind, severity, node, detail, now_ms, now_ms]).map_err(e)?;
+        Ok(AlertRow { id: c.last_insert_rowid() as u64, kind: kind.into(), severity: severity.into(), node_id: node.map(String::from), detail: detail.into(), since_ms: now_ms, last_ms: now_ms, active: true, acked_by: None })
+    }
+    pub fn alert_touch(&self, id: u64, detail: &str, now_ms: i64) -> Option<AlertRow> {
+        self.db().execute("UPDATE alerts SET detail=?, last_ms=? WHERE id=?", params![detail, now_ms, id as i64]).ok()?;
+        self.alert(id)
+    }
+    pub fn alert_close(&self, id: u64, now_ms: i64) -> Option<AlertRow> {
+        self.db().execute("UPDATE alerts SET active=0, last_ms=? WHERE id=?", params![now_ms, id as i64]).ok()?;
+        self.alert(id)
+    }
+    /// After a head start nothing is being watched yet: alerts left active by a previous run are closed.
+    pub fn alerts_close_stale(&self, now_ms: i64) {
+        let _ = self.db().execute("UPDATE alerts SET active=0, last_ms=? WHERE active=1", [now_ms]);
+    }
+    pub fn alert_ack(&self, id: u64, user: &str) -> Option<AlertRow> {
+        self.db().execute("UPDATE alerts SET acked_by=? WHERE id=?", params![user, id as i64]).ok()?;
+        self.alert(id)
+    }
+    pub fn alert(&self, id: u64) -> Option<AlertRow> {
+        self.db().query_row(&format!("{ALERT_SEL} WHERE id=?"), [id as i64], alert_row).optional().ok().flatten()
+    }
+    /// Newest first.
+    pub fn alerts(&self, active_only: bool, limit: usize) -> Vec<AlertRow> {
+        let c = self.db();
+        let sql = format!("{ALERT_SEL} {} ORDER BY id DESC LIMIT ?", if active_only { "WHERE active=1" } else { "" });
+        let Ok(mut s) = c.prepare(&sql) else { return vec![] };
+        s.query_map([limit as i64], alert_row).map(|r| r.flatten().collect()).unwrap_or_default()
+    }
+    pub fn alerts_opened_between(&self, a: i64, b: i64) -> u64 {
+        self.db().query_row("SELECT COUNT(*) FROM alerts WHERE since_ms>=? AND since_ms<?", [a, b], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64
+    }
+
+    pub fn add_experiment(&self, row: &ExperimentRow, raw_csv: &str, runs_jsonl: &str, sim: Option<&str>) -> Result<ExperimentRow, String> {
+        let c = self.db();
+        c.execute("INSERT INTO experiments (name,submitter,created_ms,configs,repeats,virtual,commit_hash,pcs_max,raw_csv,runs_jsonl,sim) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            params![row.name, row.submitter, row.created_ms, row.configs as i64, row.repeats as i64, row.r#virtual as i64, row.commit, row.pcs_max as i64, raw_csv, runs_jsonl, sim]).map_err(e)?;
+        Ok(ExperimentRow { id: c.last_insert_rowid() as u64, ..row.clone() })
+    }
+    pub fn experiments(&self) -> Vec<ExperimentRow> {
+        let c = self.db();
+        let Ok(mut s) = c.prepare(&format!("{EXP_SEL} ORDER BY id DESC")) else { return vec![] };
+        s.query_map([], exp_row).map(|r| r.flatten().collect()).unwrap_or_default()
+    }
+    /// The row and its files (raw.csv, runs.jsonl, sim).
+    pub fn experiment(&self, id: u64) -> Option<(ExperimentRow, String, String, Option<String>)> {
+        let c = self.db();
+        let row = c.query_row(&format!("{EXP_SEL} WHERE id=?"), [id as i64], exp_row).optional().ok()??;
+        let (a, b, s) = c.query_row("SELECT raw_csv,runs_jsonl,sim FROM experiments WHERE id=?", [id as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).ok()?;
+        Some((row, a, b, s))
+    }
+
+    /// Per-minute fleet samples; rows older than 48 h are dropped on every insert.
+    pub fn add_sample(&self, s: &Sample) -> Result<(), String> {
+        let c = self.db();
+        c.execute("INSERT OR REPLACE INTO samples (ts_ms,online,busy,rate,energy_j) VALUES (?,?,?,?,?)", params![s.ts_ms, s.online, s.busy, s.rate, s.energy_j]).map_err(e)?;
+        c.execute("DELETE FROM samples WHERE ts_ms < ?", [s.ts_ms - 48 * 3_600_000]).map_err(e)?;
+        Ok(())
+    }
+    pub fn samples_between(&self, a: i64, b: i64) -> Vec<Sample> {
+        let c = self.db();
+        let Ok(mut s) = c.prepare("SELECT ts_ms,online,busy,rate,energy_j FROM samples WHERE ts_ms>=? AND ts_ms<? ORDER BY ts_ms") else { return vec![] };
+        s.query_map([a, b], |r| Ok(Sample { ts_ms: r.get(0)?, online: r.get(1)?, busy: r.get(2)?, rate: r.get(3)?, energy_j: r.get(4)? })).map(|r| r.flatten().collect()).unwrap_or_default()
+    }
+
+    pub fn put_job_stats(&self, job: u64, body: &str) {
+        let _ = self.db().execute("INSERT OR REPLACE INTO job_stats (job_id, body) VALUES (?,?)", params![job as i64, body]);
+    }
+    pub fn job_stats(&self, job: u64) -> Option<String> {
+        self.db().query_row("SELECT body FROM job_stats WHERE job_id=?", [job as i64], |r| r.get(0)).optional().ok().flatten()
+    }
+    /// Jobs that ended in [a, b): (id, name, kind code, from, end, state).
+    pub fn jobs_finished_between(&self, a: i64, b: i64) -> Vec<(u64, String, u8, u64, u64, String)> {
+        let c = self.db();
+        let Ok(mut s) = c.prepare("SELECT id,name,kind,from_n,end_n,state FROM jobs WHERE finished_ms>=? AND finished_ms<?") else { return vec![] };
+        s.query_map([a, b], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get::<_, i64>(2)? as u8, r.get::<_, i64>(3)? as u64, r.get::<_, i64>(4)? as u64, r.get(5)?))).map(|r| r.flatten().collect()).unwrap_or_default()
+    }
+    /// (kind, detail) of the events in [a, b), oldest first.
+    pub fn events_between(&self, a: i64, b: i64) -> Vec<(String, String)> {
+        let c = self.db();
+        let Ok(mut s) = c.prepare("SELECT kind,detail FROM events WHERE ts_ms>=? AND ts_ms<? ORDER BY id") else { return vec![] };
+        s.query_map([a, b], |r| Ok((r.get(0)?, r.get(1)?))).map(|r| r.flatten().collect()).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod wave12_tests {
+    use super::*;
+
+    #[test]
+    fn migration_7_from_v6_keeps_data_and_adds_tables() {
+        let dir = std::env::temp_dir().join(format!("ck-m7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("head.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            for m in &MIGRATIONS[..6] {
+                c.execute_batch(m).unwrap();
+            }
+            c.execute_batch("PRAGMA user_version = 6").unwrap();
+            c.execute("INSERT INTO nodes (node_id,host,addr,inventory,first_seen_ms,last_seen_ms) VALUES ('n','h','a','{}',1,1)", []).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.nodes().len(), 1);
+        let a = s.alert_open("no_standby", "warn", None, "x", 5).unwrap();
+        assert!(s.alert_open("no_standby", "warn", None, "dup", 6).is_err(), "no second active alert for the same kind and node");
+        assert!(s.alert_open("slow_pc", "warn", Some("n"), "x", 6).is_ok());
+        assert_eq!(s.alert_close(a.id, 9).map(|a| a.active), Some(false));
+        assert!(s.alert_open("no_standby", "warn", None, "again", 10).is_ok(), "a closed alert frees the slot");
+        assert_eq!((s.alerts(true, 10).len(), s.alerts(false, 10).len()), (2, 3));
+        assert_eq!(s.alert_ack(a.id, "ann").unwrap().acked_by.as_deref(), Some("ann"));
+        let ex = ExperimentRow { id: 0, name: "x".into(), submitter: "ann".into(), created_ms: 1, configs: 2, repeats: 3, r#virtual: true, commit: "abc".into(), pcs_max: 8 };
+        let ex = s.add_experiment(&ex, "a,b\n", "{}\n", None).unwrap();
+        assert_eq!(s.experiment(ex.id).map(|x| (x.0, x.1)), Some((ex.clone(), "a,b\n".to_string())));
+        s.add_sample(&Sample { ts_ms: 100 * 3_600_000, online: 3, busy: 2, rate: 5.0, energy_j: 1.0 }).unwrap();
+        s.add_sample(&Sample { ts_ms: 200 * 3_600_000, online: 3, busy: 2, rate: 5.0, energy_j: 1.0 }).unwrap();
+        assert_eq!(s.samples_between(0, i64::MAX).len(), 1, "samples older than 48 h are dropped");
+        let v: i64 = s.db().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v as usize, MIGRATIONS.len());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

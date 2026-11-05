@@ -37,6 +37,7 @@ mod log;
 mod presence;
 mod proto;
 mod reduce;
+mod research;
 mod repl;
 mod sched;
 mod sim;

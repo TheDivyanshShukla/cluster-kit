@@ -107,6 +107,47 @@ pub struct State {
     pub gated: bool,                       // HA-05: no quorum; dispatch nothing
     pub noq_since: Option<Instant>,        // since when connected nodes are not a majority of the membership
     pub cfg: Option<(u64, Instant)>,       // last "config" log entry: hash of its content, when built
+    pub acct: HashMap<u64, crate::research::Acct>, // wave 12: per-job time accounting for the Breakdown
+    pub paused_s: f64,                     // seconds this head did not dispatch (no quorum / halted), finished stretches
+    pub pause_since: Option<Instant>,      // start of the current no-dispatch stretch
+}
+
+fn who_of(w: &Worker) -> (String, String) {
+    w.hello.as_ref().map_or_else(|| (String::new(), w.addr.clone()), |h| (h.node_id.clone(), h.host.clone()))
+}
+
+fn paused_now(st: &State) -> f64 {
+    st.paused_s + st.pause_since.map_or(0.0, |t| t.elapsed().as_secs_f64())
+}
+
+/// A result that was kept: counters only (two hash lookups, no allocation after the PC's first chunk).
+fn acct_kept(st: &mut State, job: u64, wid: u64, numbers: u64, secs: f64) {
+    let Some(j) = st.jobs.get(&job) else { return };
+    let t = j.started.elapsed().as_secs_f64();
+    let (workers, p) = (&st.workers, paused_now_of(st.paused_s, st.pause_since));
+    st.acct.entry(job).or_insert_with(|| crate::research::Acct { paused0: p, ..Default::default() }).kept(wid, || workers.get(&wid).map_or_else(Default::default, who_of), numbers, secs, t);
+}
+
+fn paused_now_of(s: f64, since: Option<Instant>) -> f64 {
+    s + since.map_or(0.0, |t| t.elapsed().as_secs_f64())
+}
+
+/// Compute that was thrown away (duplicate, losing speculative copy, chunk of a lost PC).
+fn acct_waste(st: &mut State, job: u64, wid: u64, secs: f64, who: Option<(String, String)>) {
+    let Some(j) = st.jobs.get(&job) else { return };
+    let t = j.started.elapsed().as_secs_f64();
+    let (workers, p) = (&st.workers, paused_now_of(st.paused_s, st.pause_since));
+    st.acct.entry(job).or_insert_with(|| crate::research::Acct { paused0: p, ..Default::default() }).wasted(wid, || who.unwrap_or_else(|| workers.get(&wid).map_or_else(Default::default, who_of)), secs, t);
+}
+
+/// Breakdown of a running job (live counters) or a finished one (stored when it ended).
+pub fn breakdown(ctx: &Ctx, id: u64) -> Option<serde_json::Value> {
+    let st = ctx.sh.0.lock().unwrap();
+    if let (Some(j), Some(a)) = (st.jobs.get(&id), st.acct.get(&id)) {
+        return Some(crate::research::breakdown(id, a, j.started.elapsed().as_secs_f64(), paused_now(&st) - a.paused0));
+    }
+    drop(st);
+    ctx.store.job_stats(id).and_then(|t| serde_json::from_str(&t).ok())
 }
 
 /// Exit status of a head that heard a higher epoch (HA-06). main/kit restarts it as `ck head --standby --head <new head>`.
@@ -394,6 +435,13 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
     let len = sched::chunk_len(j.policy, j.chunk, j.total, remaining, node_rate, fleet_rate, nodes, min, crate::tune::n("max_chunk")).max(1);
     let j = st.jobs.get_mut(&id)?;
     let (a, b) = next_chunk(&mut j.requeue, &mut j.next, j.end, len)?;
+    if !j.has_work() {
+        // nothing unassigned is left: from now on idle PCs are in the tail
+        let t = j.started.elapsed().as_secs_f64();
+        let p = paused_now_of(st.paused_s, st.pause_since);
+        st.acct.entry(id).or_insert_with(|| crate::research::Acct { paused0: p, ..Default::default() }).tail_at.get_or_insert(t);
+    }
+    let j = st.jobs.get(&id)?;
     Some((j.id, a, b, j.kind, j.arg.clone()))
 }
 
@@ -432,7 +480,7 @@ fn speculate_take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8
     None
 }
 
-fn event(ctx: &Ctx, kind: &str, actor: &str, detail: &str) {
+pub fn event(ctx: &Ctx, kind: &str, actor: &str, detail: &str) {
     match ctx.store.log_event(now_ms(), kind, actor, detail) {
         Ok(e) => ctx.bus.publish("event", &serde_json::to_string(&e).unwrap_or_default()),
         Err(e) => crate::warnl!("event.error", "event {kind}: {e}"),
@@ -465,6 +513,11 @@ fn end_job(ctx: &Ctx, st: &mut State, id: u64, state: JobState, error: Option<&s
     for tx in st.subs.remove(&id).unwrap_or_default() {
         let _ = tx.send(frame.clone());
     }
+    if let (Some(j), Some(a)) = (st.jobs.get(&id), st.acct.remove(&id)) {
+        let bd = crate::research::breakdown(id, &a, j.started.elapsed().as_secs_f64(), paused_now(st) - a.paused0);
+        ctx.store.put_job_stats(id, &bd.to_string());
+    }
+    st.acct.remove(&id);
     st.jobs.remove(&id);
     st.attempts.retain(|k, _| k.0 != id);
     sync_brief(st);
@@ -622,6 +675,8 @@ fn start_job(ctx: &Ctx, st: &mut State, id: u64) {
         requeue: todo.into_iter().rev().collect(), only: spec.only, started: Instant::now(), selector, priority: spec.priority, policy,
         max_pcs: spec.max_pcs, placement: spec.placement, mem_mb: spec.mem_mb,
     });
+    let p = paused_now(st);
+    st.acct.insert(id, crate::research::Acct { paused0: p, ..Default::default() });
     sync_brief(st);
     ctx.sh.1.notify_all();
 }
@@ -834,6 +889,11 @@ fn gate_tick(ctx: &Ctx) {
     let ok = dispatch_ok(&role, may, standbys, st.noq_since.map_or(Duration::ZERO, |t| t.elapsed()));
     let was_gated = std::mem::replace(&mut st.gated, !ok);
     let dispatching = ok && !st.halted;
+    match (dispatching, st.pause_since) {
+        (false, None) => st.pause_since = Some(Instant::now()),
+        (true, Some(t)) => (st.paused_s, st.pause_since) = (st.paused_s + t.elapsed().as_secs_f64(), None),
+        _ => {}
+    }
     if ok && was_gated {
         crate::say!("ha.quorum", "quorum back, dispatching");
         st.noq_since = None;
@@ -849,6 +909,7 @@ fn gate_tick(ctx: &Ctx) {
 fn halt(ctx: &Ctx) {
     let mut st = ctx.sh.0.lock().unwrap();
     st.halted = true;
+    st.pause_since.get_or_insert_with(Instant::now);
     for w in st.workers.values() {
         if let Some(o) = &w.out {
             let _ = o.lock().unwrap().s.0.shutdown(std::net::Shutdown::Both);
@@ -1063,19 +1124,23 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     let done = ctx.store.done_in(job, a, b);
     let cov = covered(a, b, &done);
     if cov == b - a {
+        acct_waste(&mut st, job, wid, secs, None);
         return Ok((ack_now(&st), credit)); // everything in it is stored already
     }
     if cov > 0 {
         // partial overlap: storing it would count numbers twice. Drop it, ACK it, make sure its uncovered pieces get run.
         crate::say!("chunk.overlap", "job {job}: result {a}..{b} overlaps stored parts, dropped; its gaps are queued");
+        acct_waste(&mut st, job, wid, secs, None);
         requeue_missing(&mut st, job, gaps(a, b, &done));
         sh.1.notify_all();
         return Ok((ack_now(&st), credit));
     }
     // ponytail: the store write happens under the State lock so ATTACH sees parts and live frames without a gap.
     if !ctx.store.add_part(job, a, b, &p[RESULT_HDR..]).unwrap_or_else(|e| { crate::warnl!("job.error", "job {job}: {e}"); true }) {
+        acct_waste(&mut st, job, wid, secs, None);
         return Ok((ack_now(&st), credit)); // already stored (re-run, speculative copy, or an agent resending after a failover, HA-04): ACK at once
     }
+    acct_kept(&mut st, job, wid, b - a, secs);
     // HA-03/04: log the part; ACK when the standbys have it too. repl::record / durable_seq are called under the State
     // lock (order State -> repl), so repl must call durable_upto without holding its own locks.
     let seq = crate::repl::record(ctx, "part", serde_json::json!({ "job": job, "a": a, "b": b, "body": &p[RESULT_HDR..] }));
@@ -1085,24 +1150,28 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     } else if let Some(w) = st.workers.get_mut(&wid) {
         w.pending.push((seq, job, a, b));
     }
-    for w in st.workers.values_mut() {
+    let mut wasted = vec![];
+    for (lid, w) in st.workers.iter_mut() {
         if w.inflight.contains(&(job, a, b)) {
             w.inflight.retain(|&t| t != (job, a, b)); // lost the race: its result will be dropped as a duplicate
-            w.sent.remove(&(job, a, b));
+            wasted.extend(w.sent.remove(&(job, a, b)).map(|t| (*lid, t.elapsed().as_secs_f64())));
             sends.extend(w.out.clone().map(|o| (o, CANCEL_RANGE, pack(&[job, a, b])))); // stop just this chunk on the loser
             crate::say!("chunk.speculate_won", "job {job}: chunk {a}..{b} won by worker {wid}, the copy on {} is dropped", w.addr);
         }
     }
     // chunks that overlap the new part without being identical: stop them, queue what is still uncovered
     let mut lost = vec![];
-    for w in st.workers.values_mut() {
+    for (lid, w) in st.workers.iter_mut() {
         let ov: Vec<_> = w.inflight.iter().filter(|t| t.0 == job && t.1 < b && a < t.2).copied().collect();
         for t in ov {
             w.inflight.retain(|x| *x != t);
-            w.sent.remove(&t);
+            wasted.extend(w.sent.remove(&t).map(|s| (*lid, s.elapsed().as_secs_f64())));
             sends.extend(w.out.clone().map(|o| (o, CANCEL_RANGE, pack(&[t.0, t.1, t.2]))));
             lost.push((t.1, t.2));
         }
+    }
+    for (lid, s) in wasted {
+        acct_waste(&mut st, job, lid, s, None);
     }
     if let Some(j) = st.jobs.get_mut(&job) {
         j.requeue = j.requeue.drain(..).flat_map(|r| subtract(r, (a, b))).collect();
@@ -1199,14 +1268,22 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     let err = read_results(&mut r, &mut in_mac, &ctx, wid, credit).err();
 
     let mut st = sh.0.lock().unwrap();
-    let gone = st.workers.remove(&wid).map(|w| w.inflight).unwrap_or_default();
+    let gw = st.workers.remove(&wid);
+    let gone = gw.as_ref().map(|w| w.inflight.clone()).unwrap_or_default();
+    let mut recovered = 0;
     for t in &gone {
         if held(&st, *t) {
             continue; // a speculative copy still runs elsewhere
         }
-        if let Some(j) = st.jobs.get_mut(&t.0) {
-            j.requeue.push((t.1, t.2));
+        if st.jobs.contains_key(&t.0) {
+            let spent = gw.as_ref().and_then(|w| w.sent.get(t)).map_or(0.0, |s| s.elapsed().as_secs_f64());
+            acct_waste(&mut st, t.0, wid, spent, gw.as_ref().map(who_of));
+            st.jobs.get_mut(&t.0).unwrap().requeue.push((t.1, t.2));
+            recovered += 1;
         }
+    }
+    if let (Some(n), true) = (&node, recovered > 0) {
+        event(&ctx, "chunk.recovered", "head", &format!("{recovered} chunks of node {} requeued", n.0));
     }
     if let Some(n) = &node {
         publish_node(&ctx, &st, &n.0);
@@ -1518,6 +1595,8 @@ pub fn run(o: &Opts) {
     thread::spawn(move || watchdog(wd));
     let pc = ctx.clone();
     thread::spawn(move || power_loop(pc));
+    let rc = ctx.clone();
+    thread::spawn(move || research_loop(rc));
     let l = TcpListener::bind(("0.0.0.0", port())).unwrap_or_else(|e| die(&format!("TCP {}: {e}", port())));
     let name = o.name.clone();
     let (cb, cw, n2) = (ctx.clone(), ctx.clone(), o.name.clone());
@@ -1561,6 +1640,7 @@ fn init_ha(ctx: &Ctx) {
     if ctx.repl.status.lock().unwrap().role == "candidate" {
         ctx.sh.0.lock().unwrap().gated = true;
         crate::say!("ha.candidate", "candidate: epoch {}, waiting for quorum", crate::repl::epoch(ctx));
+        event(ctx, "ha.promoted", "head", &format!("this head took over at epoch {}", crate::repl::epoch(ctx)));
     }
 }
 
@@ -2415,5 +2495,79 @@ mod tests {
         // credit: a result nobody was sent a TASK for (fed used up) gets none
         assert!(!finish_credit(&c, 1, &result(j.id, 30, 50)).unwrap());
         assert_eq!(left(&c), Some(30));
+    }
+}
+
+// ---- wave 12: alerts and per-minute samples
+fn observe(ctx: &Ctx, cpu: Option<f64>) -> (crate::research::Obs, crate::store::Sample) {
+    let (standbys, lag) = {
+        let s = ctx.repl.status.lock().unwrap();
+        (s.standbys.len(), s.standbys.iter().map(|x| x.2).max().unwrap_or(0))
+    };
+    let reserves = ctx.store.reserves();
+    let st = ctx.sh.0.lock().unwrap();
+    let mut obs = crate::research::Obs { head_cpu: cpu, standby_lag: lag, standbys, target_standbys: ha_cfg(ctx).target_standbys as usize, ..Default::default() };
+    let (mut online, mut busy, mut rate, mut energy) = (0u32, 0u32, 0.0, 0.0);
+    for w in st.workers.values().filter(|w| can_work(w)) {
+        online += 1;
+        energy += w.energy_j;
+        if !w.inflight.is_empty() {
+            busy += 1;
+            rate += w.rate;
+            if w.rate > 0.0 {
+                let (id, host) = who_of(w);
+                obs.rates.push((if id.is_empty() { w.addr.clone() } else { id }, host, w.rate));
+            }
+        }
+    }
+    if !reserves.is_empty() {
+        let views = node_views(&st);
+        for r in reserves {
+            let Ok(sel) = parse_sel(&r.selector) else { continue };
+            let have = views.iter().filter(|n| n.takes_tasks && sel.matches(&n.attrs)).count() as u32;
+            if have < r.keep_n {
+                obs.reserves_short.push(format!("reserve {} ({}) holds {have} of {}", r.id, r.selector, r.keep_n));
+            }
+        }
+    }
+    (obs, crate::store::Sample { ts_ms: now_ms(), online, busy, rate, energy_j: energy })
+}
+
+fn research_loop(ctx: Arc<Ctx>) {
+    ctx.store.alerts_close_stale(now_ms());
+    let mut eng = crate::research::Engine::default();
+    let mut sys = sysinfo::System::new();
+    let pid = sysinfo::get_current_pid().ok();
+    let (mut losses, mut tick) = (HashMap::new(), 0u64);
+    loop {
+        thread::sleep(Duration::from_secs(5));
+        tick += 1;
+        if !primary(&ctx) {
+            continue;
+        }
+        let cpu = pid.and_then(|p| {
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
+            sys.process(p).map(|x| x.cpu_usage() as f64)
+        });
+        if tick % 12 == 1 {
+            losses = losses_24h(&ctx);
+        }
+        let (mut obs, sample) = observe(&ctx, cpu);
+        obs.losses = losses.clone();
+        for ev in eng.step(&ctx.store, now_ms(), &crate::research::conditions(&obs, &crate::research::Cfg::now())) {
+            use crate::research::Ev;
+            let (row, kind) = match ev {
+                Ev::Open(r) => (r, Some("alert.open")),
+                Ev::Update(r) => (r, None),
+                Ev::Close(r) => (r, Some("alert.close")),
+            };
+            if let Some(k) = kind {
+                event(&ctx, k, "head", &format!("{} {}{}: {}", k.trim_start_matches("alert."), row.kind, row.node_id.as_deref().map_or(String::new(), |n| format!(" (node {n})")), row.detail));
+            }
+            ctx.bus.publish("alert", &serde_json::to_string(&row).unwrap_or_default());
+        }
+        if tick % 12 == 0 || tick == 2 {
+            let _ = ctx.store.add_sample(&sample);
+        }
     }
 }

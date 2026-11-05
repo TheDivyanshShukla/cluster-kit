@@ -218,7 +218,8 @@ pub fn min_role(method: &str, path: &str) -> Option<Role> {
     Some(match (method, p) {
         (_, "/api/v1/me" | "/api/v1/bootstrap" | "/api/v1/login" | "/api/v1/logout") => return None,
         (_, "/api/v1/users" | "/api/v1/config") => Role::Admin,
-        ("POST", "/api/v1/jobs") => Role::Researcher,
+        ("POST", "/api/v1/jobs" | "/api/v1/experiments") => Role::Researcher,
+        ("POST", _) if p.starts_with("/api/v1/alerts/") && p.ends_with("/ack") => Role::Operator,
         ("POST", "/api/v1/ha/switchover") | ("PUT", "/api/v1/ha/settings" | "/api/v1/tunables") => Role::Admin,
         ("GET", "/api/v1/logs") => Role::Operator,
         ("POST", "/api/v1/nodes/power") | ("PUT", "/api/v1/power") => Role::Operator,
@@ -251,6 +252,8 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/nodes/power"), ("GET", "/power"), ("PUT", "/power"), ("GET", "/ha/settings"), ("PUT", "/ha/settings"),
     ("GET", "/tunables"), ("PUT", "/tunables"), ("GET", "/ha/candidates"),
     ("GET", "/logs"),
+    ("GET", "/jobs/{id}/breakdown"), ("GET", "/alerts"), ("POST", "/alerts/{id}/ack"),
+    ("POST", "/experiments"), ("GET", "/experiments"), ("GET", "/experiments/{id}"), ("GET", "/report"),
 ];
 
 #[cfg(test)]
@@ -309,6 +312,12 @@ mod tests {
             ("PUT", "/api/v1/tunables", Some(Role::Admin)),
             ("GET", "/api/v1/ha/candidates", Some(Role::Viewer)),
             ("GET", "/api/v1/logs", Some(Role::Operator)),
+            ("GET", "/api/v1/alerts", Some(Role::Viewer)),
+            ("POST", "/api/v1/alerts/3/ack", Some(Role::Operator)),
+            ("POST", "/api/v1/experiments", Some(Role::Researcher)),
+            ("GET", "/api/v1/experiments/2", Some(Role::Viewer)),
+            ("GET", "/api/v1/jobs/4/breakdown", Some(Role::Viewer)),
+            ("GET", "/api/v1/report", Some(Role::Viewer)),
             ("GET", "/api/v1/users", Some(Role::Admin)),
             ("POST", "/api/v1/users", Some(Role::Admin)),
         ];

@@ -480,6 +480,44 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
             json_out(200, json!({"events": events, "next": next}))
         }
         ("GET", ["stream"]) => Out::Sse,
+        ("GET", ["jobs", id, "breakdown"]) => match id.parse().ok().and_then(|id| head::breakdown(ctx, id)) {
+            Some(b) => json_out(200, json!({"breakdown": b})),
+            None => fail(404, "not_found", "no such job, or it ran before time accounting existed"),
+        },
+        ("GET", ["alerts"]) => json_out(200, json!({"alerts": ctx.store.alerts(r.query.get("active").is_some_and(|v| v == "1"), 500)})),
+        ("POST", ["alerts", id, "ack"]) => match id.parse().ok().and_then(|id| ctx.store.alert_ack(id, me)) {
+            Some(a) => {
+                ctx.bus.publish("alert", &serde_json::to_string(&a).unwrap_or_default());
+                json_out(200, json!({"alert": a}))
+            }
+            None => fail(404, "not_found", "no such alert"),
+        },
+        ("POST", ["experiments"]) => {
+            let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
+            let (Some(name), Some(csv), Some(jl)) = (str_field(&v, "name"), str_field(&v, "raw_csv"), str_field(&v, "runs_jsonl")) else { return bad("give name, raw_csv and runs_jsonl (the files scripts/experiment.py writes)") };
+            let row = match crate::research::parse_experiment(name, me, csv, jl, now_ms()) { Ok(r) => r, Err(e) => return bad(&e) };
+            let sim = v.get("sim").filter(|s| !s.is_null()).map(|s| s.to_string());
+            match ctx.store.add_experiment(&row, csv, jl, sim.as_deref()) {
+                Ok(row) => {
+                    head::event(ctx, "experiment.uploaded", me, &format!("experiment {} \"{}\": {} configs x {} repeats", row.id, row.name, row.configs, row.repeats));
+                    json_out(200, json!({"experiment": row}))
+                }
+                Err(e) => fail(500, "internal", &e),
+            }
+        }
+        ("GET", ["experiments"]) => json_out(200, json!({"experiments": ctx.store.experiments()})),
+        ("GET", ["experiments", id]) => match id.parse().ok().and_then(|id| ctx.store.experiment(id)) {
+            Some((row, csv, jl, sim)) => json_out(200, json!({"experiment": row, "raw_csv": csv, "runs_jsonl": jl, "sim": sim.and_then(|s| serde_json::from_str::<Value>(&s).ok())})),
+            None => fail(404, "not_found", "no such experiment"),
+        },
+        ("GET", ["report"]) => {
+            let tz = crate::research::tz_min();
+            let day = r.query.get("day").filter(|d| !d.is_empty()).cloned().unwrap_or_else(|| crate::research::day_of(now_ms(), tz));
+            match crate::research::day_report(&ctx.store, &day, tz) {
+                Ok(v) => json_out(200, json!({"report": v})),
+                Err(e) => bad(&e),
+            }
+        }
         _ => not_found(),
     }
 }
@@ -1398,12 +1436,18 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
     let mut body = vec![];
     if matches!(rq.method().as_str(), "POST" | "PUT" | "PATCH") {
         // only a signed-in operator may send a big list-job body; everyone else is held to 1 MiB before anything is read
-        let operator = || auth.who(&ctx.store, cookie.as_deref(), bearer.as_deref()).is_some_and(|w| w.role >= Role::Operator);
-        let max = if path == "/api/v1/jobs" && operator() { mb("max_list_body_mb") } else { mb("max_body_mb") };
+        let signed = |min: Role| auth.who(&ctx.store, cookie.as_deref(), bearer.as_deref()).is_some_and(|w| w.role >= min);
+        let max = if path == "/api/v1/jobs" && signed(Role::Operator) {
+            mb("max_list_body_mb")
+        } else if path == "/api/v1/experiments" && signed(Role::Researcher) {
+            crate::research::EXPERIMENT_MAX + (1 << 20) // the two files plus JSON escaping headroom
+        } else {
+            mb("max_body_mb")
+        };
         let _ = rq.as_reader().take(max as u64 + 1).read_to_end(&mut body);
     }
     let req = Req { method: rq.method().as_str().to_string(), path: path.to_string(), query, cookie, bearer, body, ip };
-    let out = if req.body.len() > mb("max_body_mb") && !(req.method == "POST" && req.path == "/api/v1/jobs") { bad(&format!("body is over {} MB", crate::tune::get("max_body_mb"))) } else { route(ctx, auth, &req) };
+    let out = if req.body.len() > mb("max_body_mb") && !(req.method == "POST" && matches!(req.path.as_str(), "/api/v1/jobs" | "/api/v1/experiments")) { bad(&format!("body is over {} MB", crate::tune::get("max_body_mb"))) } else { route(ctx, auth, &req) };
     let _ = match out {
         Out::Plain { status, ctype, headers, body } => {
             let mut r = Response::from_data(body).with_status_code(status).with_header(header("Content-Type", ctype));
