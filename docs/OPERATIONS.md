@@ -74,3 +74,8 @@ Test the failover on one machine any time with `scripts/chaos.sh`. It prints PAS
 - **Everything is in `ck-data/head.db`** (SQLite). The standbys each hold a full copy that is replicated continuously, so losing the head PC loses nothing.
 - **Saving the setup:** `ck admin config-export > setup.json` saves labs, the map, labels, pools, caps and reserves, but not users or jobs. `ck admin config-import setup.json` restores it, and `CK_DRY_RUN=1` shows the changes first.
 - **Moving the head on purpose:** on Settings, an admin clicks Make head on a standby, or runs `ck admin switchover <node-id>`. The head waits until that standby has every change, hands over, and becomes its standby. Work pauses for about 4 s, and nothing is lost.
+
+
+## Logs
+
+Each process writes JSON lines to `ck-data/logs/<role>-YYYYMMDD.jsonl`. Read them with `ck logs --since 10m --kind node. [--follow]` or `GET /api/v1/logs` (operator). Turn chunk-level lines on with `ck admin tune log_chunks 1`, silence everything with `ck admin tune log_level 0`. Size and retention: `log_max_mb`, `log_keep`. Details: [LOGGING.md](LOGGING.md).

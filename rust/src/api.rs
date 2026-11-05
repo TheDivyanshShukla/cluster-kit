@@ -237,7 +237,25 @@ fn tz_offset() -> i32 {
     std::env::var("CK_TZ_OFFSET_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(330)
 }
 
+thread_local!(static USER: std::cell::RefCell<String> = Default::default());
+
+/// Wraps the router: one `api.request` log line per call (no bodies, no query string). Reads are debug, writes info.
 pub fn route(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
+    let t = std::time::Instant::now();
+    USER.with(|u| u.borrow_mut().clear());
+    let out = route_in(ctx, auth, r);
+    if r.path.starts_with("/api/") {
+        let status = match &out { Out::Plain { status, .. } => *status, Out::Sse => 200 };
+        let lvl = if r.method != "GET" { crate::log::Level::Info } else if status >= 400 { crate::log::Level::Warn } else { crate::log::Level::Debug };
+        if crate::log::enabled(lvl) {
+            let user = USER.with(|u| u.borrow().clone());
+            crate::log::emit(lvl, "api.request", json!({"method": r.method, "path": r.path, "status": status, "ms": t.elapsed().as_secs_f64() * 1000.0, "user": user, "ip": r.ip.to_string()}));
+        }
+    }
+    out
+}
+
+fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
     if r.path == "/stats" {
         return plain(200, "application/json", dash::stats(&ctx.sh, r.query.get("detail").is_some_and(|d| d == "1")).into_bytes());
     }
@@ -269,6 +287,7 @@ pub fn route(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
     let decoded: Vec<String> = r.path.trim_matches('/').split('/').skip(2).map(pct_decode).collect();
     let segs: Vec<&str> = decoded.iter().map(String::as_str).collect();
     let me = who.as_ref().map(|w| w.name.as_str()).unwrap_or("");
+    USER.with(|u| *u.borrow_mut() = me.to_string());
     match (r.method.as_str(), segs.as_slice()) {
         ("GET", ["me"]) => json_out(
             200,
@@ -287,6 +306,7 @@ pub fn route(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
         ("POST", ["nodes", "power"]) => node_power(ctx, r, me),
         ("GET", ["power"]) => json_out(200, power_json(ctx)),
         ("PUT", ["power"]) => put_power(ctx, r, me),
+        ("GET", ["logs"]) => get_logs(r),
         ("GET", ["tunables"]) => json_out(200, json!({"tunables": crate::tune::listing()})),
         ("PUT", ["tunables"]) => put_tunables(ctx, r, me),
         ("GET", ["ha", "candidates"]) => json_out(200, json!({"candidates": crate::head::candidates(ctx)})),
@@ -597,6 +617,21 @@ fn put_power(ctx: &Ctx, r: &Req, actor: &str) -> Out {
     audit(ctx, "power.settings", actor, &format!("{} idle {} min, keep {}, on-demand {}", p.mode, p.idle_min, p.keep_awake, p.wake_on_demand));
     crate::head::power_settings_changed(ctx);
     json_out(200, power_json(ctx))
+}
+
+/// GET /api/v1/logs?since_ms=&kind=&level=&role=&limit= : newest matching lines from this head's log files.
+fn get_logs(r: &Req) -> Out {
+    let q = |k: &str| r.query.get(k).filter(|v| !v.is_empty());
+    let level = match q("level") { Some(l) => match crate::log::Level::parse(l) { Some(l) => l, None => return bad("level is error|warn|info|debug") }, None => crate::log::Level::Debug };
+    let query = crate::log::Query {
+        role: q("role").cloned(),
+        since_ms: q("since_ms").and_then(|v| v.parse().ok()).unwrap_or(0),
+        kind: q("kind").cloned(),
+        level,
+        limit: q("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(200).clamp(1, 5000),
+    };
+    let lines: Vec<Value> = crate::log::query(&crate::log::logs_dir(), &query).iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    json_out(200, json!({"logs": lines}))
 }
 
 fn put_tunables(ctx: &Ctx, r: &Req, actor: &str) -> Out {
@@ -1627,6 +1662,16 @@ mod tests {
         let (s, v) = call(&c, &a, &ad, "PUT", "/api/v1/tunables", r#"{"ring_max":null}"#);
         assert_eq!((s, val(&v)), (200, (100_000.0, "default".to_string())));
         assert!(c.store.events(10, None).iter().any(|e| e.kind == "tune.changed"));
+    }
+
+    #[test]
+    fn logs_route_is_operator_only() {
+        let (c, a) = (ctx(), Auth::new(false));
+        let (op, vw) = (tok(&c, &a, "op", "operator"), tok(&c, &a, "vw", "viewer"));
+        assert_eq!(call(&c, &a, &vw, "GET", "/api/v1/logs", "").0, 403);
+        let (s, v) = call(&c, &a, &op, "GET", "/api/v1/logs", "");
+        assert_eq!((s, v["logs"].is_array()), (200, true));
+        assert_eq!(call(&c, &a, &op, "GET", "/api/v1/logs?level=loud", "").0, 400);
     }
 
     #[test]

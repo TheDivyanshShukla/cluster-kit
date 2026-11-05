@@ -89,6 +89,12 @@ pub const KNOBS: &[Knob] = &[
     k("session_max_d", "Security", 7.0, 0.1, 365.0, "days", Head, "Sign-out after this long in any case."),
     k("login_fail_max", "Security", 5.0, 1.0, 100.0, "tries", Head, "Wrong passwords allowed per window before login is blocked."),
     k("login_fail_window_min", "Security", 5.0, 1.0, 1440.0, "min", Head, "Window for counting wrong passwords."),
+    // logging (src/log.rs, docs/LOGGING.md)
+    k("log_level", "Logging", 3.0, 0.0, 4.0, "level", Both, "What is written to ck-data/logs: 0 off, 1 error, 2 warn, 3 info, 4 debug."),
+    k("log_chunks", "Logging", 0.0, 0.0, 1.0, "0/1", Both, "1 = also log every chunk dispatch and result (debug lines; a lot of output on big jobs)."),
+    k("log_max_mb", "Logging", 64.0, 1.0, 4096.0, "MB", Both, "A log file is closed and renamed at this size."),
+    k("log_keep", "Logging", 14.0, 1.0, 1000.0, "files", Both, "Log files kept per role; the oldest are deleted."),
+    k("log_flush_ms", "Logging", 200.0, 10.0, 60_000.0, "ms", Both, "How often buffered log lines are written to disk."),
 ];
 
 pub fn knob(key: &str) -> Option<&'static Knob> {

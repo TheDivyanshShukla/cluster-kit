@@ -297,6 +297,7 @@ impl Store {
 
     // ---- events / audit (OBS-04)
     pub fn log_event(&self, ts_ms: i64, kind: &str, actor: &str, detail: &str) -> Result<EventRow, String> {
+        crate::log::event(kind, actor, detail); // the one place head events reach the log
         let c = self.db();
         c.execute("INSERT INTO events (ts_ms,kind,actor,detail) VALUES (?,?,?,?)", params![ts_ms, kind, actor, detail]).map_err(e)?;
         Ok(EventRow { id: c.last_insert_rowid() as u64, ts_ms, kind: kind.into(), actor: actor.into(), detail: detail.into() })

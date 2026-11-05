@@ -1,0 +1,106 @@
+N,case,repeat,finished,delay_s,idle_capacity_Ghash,done_pct_at_end,recomputed_units,duplicate_units
+20,"standby, crash",1,1,4.69606,2.17625,100,0,0
+20,"standby, crash",2,1,4.69622,2.19058,100,0,0
+20,"standby, crash",3,1,4.69582,2.18225,100,0,0
+20,"standby, crash",4,1,4.69574,2.18871,100,0,0
+20,"standby, crash",5,1,4.69719,2.14721,100,0,0
+20,"standby, crash",6,1,4.69632,2.16269,100,0,0
+20,"standby, crash",7,1,4.6962,2.18176,100,0,0
+20,planned switchover,1,1,2.69606,1.24941,100,0,0
+20,planned switchover,2,1,2.69622,1.25767,100,0,0
+20,planned switchover,3,1,2.69582,1.25281,100,0,0
+20,planned switchover,4,1,2.69574,1.2565,100,0,0
+20,planned switchover,5,1,2.69719,1.23296,100,0,0
+20,planned switchover,6,1,2.69632,1.24167,100,0,0
+20,planned switchover,7,1,2.6962,1.2526,100,0,0
+20,"no standby, manual restart 5 min",1,1,298.996,138.561,100,0,0
+20,"no standby, manual restart 5 min",2,1,298.996,139.468,100,0,0
+20,"no standby, manual restart 5 min",3,1,298.996,138.95,100,0,0
+20,"no standby, manual restart 5 min",4,1,298.996,139.363,100,0,0
+20,"no standby, manual restart 5 min",5,1,298.997,136.679,100,0,0
+20,"no standby, manual restart 5 min",6,1,298.996,137.69,100,0,0
+20,"no standby, manual restart 5 min",7,1,298.996,138.908,100,0,0
+20,"no standby, manual restart 30 min",1,1,1799,833.693,100,0,0
+20,"no standby, manual restart 30 min",2,1,1799,839.15,100,0,0
+20,"no standby, manual restart 30 min",3,1,1799,836.032,100,0,0
+20,"no standby, manual restart 30 min",4,1,1799,838.521,100,0,0
+20,"no standby, manual restart 30 min",5,1,1799,822.369,100,0,0
+20,"no standby, manual restart 30 min",6,1,1799,828.451,100,0,0
+20,"no standby, manual restart 30 min",7,1,1799,835.777,100,0,0
+20,"no standby, never restarted",1,0,nan,nan,49.4801,0,0
+20,"no standby, never restarted",2,0,nan,nan,49.8041,0,0
+20,"no standby, never restarted",3,0,nan,nan,49.619,0,0
+20,"no standby, never restarted",4,0,nan,nan,49.7668,0,0
+20,"no standby, never restarted",5,0,nan,nan,48.8077,0,0
+20,"no standby, never restarted",6,0,nan,nan,49.1689,0,0
+20,"no standby, never restarted",7,0,nan,nan,49.6039,0,0
+200,"standby, crash",1,1,4.65642,21.739,100,0,0
+200,"standby, crash",2,1,4.66185,21.6824,100,0,0
+200,"standby, crash",3,1,4.65448,21.6791,100,0,0
+200,"standby, crash",4,1,4.65688,21.7191,100,0,0
+200,"standby, crash",5,1,4.65759,21.773,100,0,0
+200,"standby, crash",6,1,4.65294,21.6158,100,0,0
+200,"standby, crash",7,1,4.65704,21.7122,100,0,0
+200,planned switchover,1,1,2.65642,12.4018,100,0,0
+200,planned switchover,2,1,2.66185,12.3803,100,0,0
+200,planned switchover,3,1,2.65448,12.3637,100,0,0
+200,planned switchover,4,1,2.65688,12.3914,100,0,0
+200,planned switchover,5,1,2.65759,12.4235,100,0,0
+200,planned switchover,6,1,2.65294,12.3246,100,0,0
+200,planned switchover,7,1,2.65704,12.3877,100,0,0
+200,"no standby, manual restart 5 min",1,1,298.956,1395.71,100,0,0
+200,"no standby, manual restart 5 min",2,1,298.962,1390.48,100,0,0
+200,"no standby, manual restart 5 min",3,1,298.954,1392.44,100,0,0
+200,"no standby, manual restart 5 min",4,1,298.957,1394.3,100,0,0
+200,"no standby, manual restart 5 min",5,1,298.958,1397.55,100,0,0
+200,"no standby, manual restart 5 min",6,1,298.953,1388.82,100,0,0
+200,"no standby, manual restart 5 min",7,1,298.957,1393.81,100,0,0
+200,"no standby, manual restart 30 min",1,1,1798.96,8398.63,100,0,0
+200,"no standby, manual restart 30 min",2,1,1798.96,8367.03,100,0,0
+200,"no standby, manual restart 30 min",3,1,1798.95,8378.96,100,0,0
+200,"no standby, manual restart 30 min",4,1,1798.96,8390.1,100,0,0
+200,"no standby, manual restart 30 min",5,1,1798.96,8409.66,100,0,0
+200,"no standby, manual restart 30 min",6,1,1798.95,8357.26,100,0,0
+200,"no standby, manual restart 30 min",7,1,1798.96,8387.16,100,0,0
+200,"no standby, never restarted",1,0,nan,nan,49.9567,0,0
+200,"no standby, never restarted",2,0,nan,nan,49.7676,0,0
+200,"no standby, never restarted",3,0,nan,nan,49.8394,0,0
+200,"no standby, never restarted",4,0,nan,nan,49.9058,0,0
+200,"no standby, never restarted",5,0,nan,nan,50.0225,0,0
+200,"no standby, never restarted",6,0,nan,nan,49.7104,0,0
+200,"no standby, never restarted",7,0,nan,nan,49.8881,0,0
+1000,"standby, crash",1,1,4.6757,106.949,100,0,0
+1000,"standby, crash",2,1,4.65068,106.401,100,0,0
+1000,"standby, crash",3,1,4.68245,107.072,100,0,0
+1000,"standby, crash",4,1,4.62849,105.91,100,0,0
+1000,"standby, crash",5,1,4.63719,106.099,100,0,0
+1000,"standby, crash",6,1,4.68017,107.186,100,0,0
+1000,"standby, crash",7,1,4.65381,106.508,100,0,0
+1000,planned switchover,1,1,2.6757,61.2023,100,0,0
+1000,planned switchover,2,1,2.65068,60.6439,100,0,0
+1000,planned switchover,3,1,2.68245,61.3388,100,0,0
+1000,planned switchover,4,1,2.62849,60.1459,100,0,0
+1000,planned switchover,5,1,2.63719,60.3391,100,0,0
+1000,planned switchover,6,1,2.68017,61.3819,100,0,0
+1000,planned switchover,7,1,2.65381,60.7354,100,0,0
+1000,"no standby, manual restart 5 min",1,1,298.976,6838.58,100,0,0
+1000,"no standby, manual restart 5 min",2,1,298.951,6839.56,100,0,0
+1000,"no standby, manual restart 5 min",3,1,298.982,6836.75,100,0,0
+1000,"no standby, manual restart 5 min",4,1,298.928,6840.16,100,0,0
+1000,"no standby, manual restart 5 min",5,1,298.937,6839.7,100,0,0
+1000,"no standby, manual restart 5 min",6,1,298.98,6847.31,100,0,0
+1000,"no standby, manual restart 5 min",7,1,298.954,6841.89,100,0,0
+1000,"no standby, manual restart 30 min",1,1,1798.98,41148.6,100,0,0
+1000,"no standby, manual restart 30 min",2,1,1798.95,41157.4,100,0,0
+1000,"no standby, manual restart 30 min",3,1,1798.98,41136.8,100,0,0
+1000,"no standby, manual restart 30 min",4,1,1798.93,41163.5,100,0,0
+1000,"no standby, manual restart 30 min",5,1,1798.94,41159.8,100,0,0
+1000,"no standby, manual restart 30 min",6,1,1798.98,41200.6,100,0,0
+1000,"no standby, manual restart 30 min",7,1,1798.95,41171.1,100,0,0
+1000,"no standby, never restarted",1,0,nan,nan,49.7825,0,0
+1000,"no standby, never restarted",2,0,nan,nan,49.795,0,0
+1000,"no standby, never restarted",3,0,nan,nan,49.7675,0,0
+1000,"no standby, never restarted",4,0,nan,nan,49.8033,0,0
+1000,"no standby, never restarted",5,0,nan,nan,49.7986,0,0
+1000,"no standby, never restarted",6,0,nan,nan,49.8463,0,0
+1000,"no standby, never restarted",7,0,nan,nan,49.8118,0,0

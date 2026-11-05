@@ -196,7 +196,7 @@ impl Unacked {
             let Some((_, (k, p))) = self.by_seq.pop_first() else { break };
             self.idx.remove(&k);
             self.bytes -= p.len();
-            println!("unacked results over the limit: dropped the oldest ({}, {}..{})", k.0, k.1, k.2);
+            crate::say!("agent.unacked_drop", "unacked results over the limit: dropped the oldest ({}, {}..{})", k.0, k.1, k.2);
         }
     }
     fn ack(&mut self, key: (u64, u64, u64)) -> bool {
@@ -246,19 +246,19 @@ pub fn send_wol(macs: &[String]) {
                 for d in &dst {
                     let _ = s.send_to(&p, d.as_str());
                 }
-                println!("power: wol magic packet for {m} sent to {}", dst.join(", "));
+                crate::say!("power.wol", "power: wol magic packet for {m} sent to {}", dst.join(", "));
             }
-            None => println!("power: wol: bad mac {m}"),
+            None => crate::say!("power.wol", "power: wol: bad mac {m}"),
         }
     }
 }
 
 fn suspend() {
     if std::env::var_os("CK_POWER_DRY").is_some_and(|v| v == "1") {
-        println!("power: would sleep now");
+        crate::say!("power.sleep", "power: would sleep now");
         return;
     }
-    println!("power: sleeping now");
+    crate::say!("power.sleep", "power: sleeping now");
     let (prog, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
         ("pmset", &["sleepnow"])
     } else if cfg!(windows) {
@@ -267,7 +267,7 @@ fn suspend() {
         ("systemctl", &["suspend"])
     };
     if let Err(e) = std::process::Command::new(prog).args(args).status() {
-        println!("power: suspend failed: {e}");
+        crate::warnl!("power.sleep_failed", "power: suspend failed: {e}");
     }
 }
 
@@ -291,12 +291,12 @@ fn start_standby(head: &str, w: &Mutex<Out>) {
     });
     let body = match r {
         Ok(c) => {
-            println!("standby: started pid {} for head {head}", c.id());
+            crate::say!("agent.standby_start", "standby: started pid {} for head {head}", c.id());
             *g = Some(c);
             r#"{"standby_started":true}"#.to_string()
         }
         Err(e) => {
-            println!("standby: failed to start: {e}");
+            crate::warnl!("agent.standby_start", "standby: failed to start: {e}");
             serde_json::json!({"standby_failed": e.to_string()}).to_string()
         }
     };
@@ -372,7 +372,7 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
         };
         match connect(&hostport(&ip)) {
             Ok(s) => {
-                println!("connected to head {ip} ({threads} threads)");
+                crate::say!("agent.connect", "connected to head {ip} ({threads} threads)");
                 // the epoch to beat: what the beacon of this address says now, else what we knew
                 let epoch = SEEN.lock().unwrap().iter().filter(|e| e.0 == name && e.1 == hostport(&ip) && e.2.elapsed() < Duration::from_secs(5)).map(|e| e.3).max().unwrap_or(epoch);
                 if head.is_none() {
@@ -384,13 +384,13 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
                 }
                 let follow = head.is_none().then(|| (name.to_string(), hostport(&ip), epoch));
                 if let Err(e) = work(s, threads as u32, virt, unacked.clone(), follow) {
-                    println!("lost head {ip}: {e}");
+                    crate::warnl!("agent.head_lost", "lost head {ip}: {e}");
                     if e.kind() == io::ErrorKind::PermissionDenied {
                         thread::sleep(Duration::from_secs(28)); // refused: do not hammer the head, an operator has to act
                     }
                 }
             }
-            Err(e) => println!("cannot reach head {ip}: {e}"),
+            Err(e) => crate::warnl!("agent.unreachable", "cannot reach head {ip}: {e}"),
         }
         thread::sleep(Duration::from_secs(2));
     }
@@ -410,7 +410,7 @@ fn admit(s: &mut TcpStream, node_id: &str, kp: &std::path::Path) -> io::Result<(
                 let _ = std::fs::create_dir_all(d);
             }
             auth::save_key(kp, &key)?;
-            println!("joined: node key saved to {}", kp.display());
+            crate::say!("agent.admitted", "joined: node key saved to {}", kp.display());
             ack(s, &key)
         }
         (DENIED, m) => Err(bad(io::ErrorKind::PermissionDenied, format!("head refused this PC: {}", String::from_utf8_lossy(&m)))),
@@ -448,7 +448,7 @@ fn extras(w: Arc<Mutex<Out>>) {
         if on && Instant::now() >= next_probe {
             next_probe = Instant::now() + crate::tune::secs("presence_probe_s");
             if let Some(b) = h.step(crate::presence::busy(), t0.elapsed().as_secs(), crate::presence::get_or_env("presence_idle_s", "CK_PRESENCE_IDLE_SECS") as u64) {
-                println!("presence: {}", if b { "busy" } else { "idle" });
+                crate::say!("agent.presence", "presence: {}", if b { "busy" } else { "idle" });
                 if !ctrl(format!(r#"{{"presence":"{}"}}"#, if b { "busy" } else { "idle" })) {
                     return;
                 }
@@ -457,7 +457,7 @@ fn extras(w: Arc<Mutex<Out>>) {
         if !calib_sent {
             calib_sent = true;
             let f = *CALIB.get_or_init(|| crate::kernels::calibrate_mhs(crate::tune::get("calib_s")));
-            println!("calibration: {f:.1} MH/s");
+            crate::say!("agent.calibration", "calibration: {f:.1} MH/s");
             if !ctrl(format!(r#"{{"calib_mhs":{f}}}"#)) {
                 return;
             }
@@ -495,7 +495,7 @@ fn log_drained() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     if now >= LAST.load(Relaxed) + 5 {
         LAST.store(now, Relaxed);
-        println!("unacked results: 0");
+        crate::say!("agent.unacked", "unacked results: 0");
     }
 }
 
@@ -526,7 +526,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     {
         let u = unacked.lock().unwrap();
         if !u.by_seq.is_empty() {
-            println!("resending {} un-ACKed results", u.by_seq.len());
+            crate::say!("agent.resend", "resending {} un-ACKed results", u.by_seq.len());
         }
         for p in u.payloads() {
             send_w(RESULT, p)?;
@@ -544,7 +544,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                 return;
             }
             if let Some((a, e)) = best_head(&SEEN.lock().unwrap(), &name).filter(|(_, e)| *e > epoch) {
-                println!("head {a} has epoch {e}, higher than {addr} ({epoch}): moving");
+                crate::say!("agent.head_switch", "head {a} has epoch {e}, higher than {addr} ({epoch}): moving");
                 let _ = sock.shutdown(std::net::Shutdown::Both);
                 return;
             }
@@ -603,8 +603,8 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                 if let Some(c) = parse_cap(&p) {
                     cap_r.store(c.unwrap_or(0), Relaxed);
                     match c {
-                        Some(n) => println!("cap: chunks run on at most {n} thread(s)"),
-                        None => println!("cap lifted: chunks use all {threads} threads"),
+                        Some(n) => crate::say!("agent.cap", "cap: chunks run on at most {n} thread(s)"),
+                        None => crate::say!("agent.cap", "cap lifted: chunks use all {threads} threads"),
                     }
                 }
             }
@@ -635,6 +635,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
             }
             let (kind, arg) = (p.get(24).copied().unwrap_or(KIND_SHA), p.get(25..).unwrap_or(&[]));
             let t = Instant::now();
+            crate::lgc!("chunk.start", {"job": job, "a": a, "b": b});
             *cur.lock().unwrap() = Some((job, a, b));
             *RUNNING.lock().unwrap().entry((job, a)).or_default() += 1;
             let out = match pool_size(cap.load(Relaxed), threads) {
@@ -668,6 +669,8 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
             let body = match out {
                 Ok(body) => body,
                 Err((retry, msg)) => {
+                    crate::lg!(Warn, "chunk.failed", {"job": job, "a": a, "b": b, "retry": retry, "ms": t.elapsed().as_secs_f64() * 1000.0,
+                        "stderr_tail": msg.chars().rev().take(500).collect::<Vec<_>>().into_iter().rev().collect::<String>()});
                     // FAILED doubles as the next request, like RESULT.
                     let mut f = pack(&[job, a, b]);
                     f.push(retry as u8);
@@ -679,7 +682,12 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
             let us = t.elapsed().as_micros() as u64;
             let mut res = pack(&[job, a, b, CPU_X10.load(Relaxed), MEM_USED.load(Relaxed), MEM_TOTAL.load(Relaxed), us]);
             res.extend_from_slice(&body);
-            unacked.lock().unwrap().add((job, a, b), res.clone());
+            let pending = {
+                let mut u = unacked.lock().unwrap();
+                u.add((job, a, b), res.clone());
+                (u.by_seq.len(), u.bytes)
+            };
+            crate::lgc!("chunk.end", {"job": job, "a": a, "b": b, "ms": us as f64 / 1000.0, "unacked": pending.0, "unacked_bytes": pending.1});
             send_w(RESULT, &res)?;
         }
         Err(io::Error::new(io::ErrorKind::ConnectionAborted, "head closed the connection"))

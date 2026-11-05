@@ -8,6 +8,7 @@
 //!   ck sim     SCENARIO.json [--out DIR]   (simulate a cluster: timeline.csv + summary.json; format at the top of src/sim.rs)
 //!   ck job     ls | show ID | cancel ID | result ID [--head IP]   (jobs on the head, via the HTTP API)
 //!   ck admin   nodes | approve ID.. | state S ID.. | labs | lab-add N W H | place N LAB X Y | unplace N | join-code [USES] [MIN]
+//!   ck logs    [--role head] [--since 10m] [--kind node.] [--level info] [--limit N] [--follow]   (structured log, docs/LOGGING.md)
 //!   ck run ... --detach   submit, print the job id, exit (the job keeps running on the head)
 //!
 //! Ports: CK_PORT (default 7700) for workers and clients, +1 UDP discovery, +2 dashboard.
@@ -32,6 +33,7 @@ mod install;
 mod jobcli;
 mod jobs;
 mod kernels;
+mod log;
 mod presence;
 mod proto;
 mod reduce;
@@ -85,6 +87,8 @@ pub struct Opts {
 
 pub fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
+    crate::lg!(Error, "process.die", {"msg": msg});
+    log::flush();
     std::process::exit(1)
 }
 
@@ -148,6 +152,13 @@ fn main() {
             "--relay" => o.relay = true,
             "--out" => std::env::set_var("CK_SIM_OUT", args.next().unwrap_or_else(|| die("--out needs a directory"))),
             "--standby" => o.standby = true,
+            // `ck logs` filters, read by log::cli
+            "--role" => std::env::set_var("CK_LOGS_ROLE", args.next().unwrap_or_else(|| die("--role needs head|agent|standby|client"))),
+            "--since" => std::env::set_var("CK_LOGS_SINCE", args.next().unwrap_or_else(|| die("--since needs e.g. 10m"))),
+            "--kind" => std::env::set_var("CK_LOGS_KIND", args.next().unwrap_or_else(|| die("--kind needs a prefix, e.g. node."))),
+            "--level" => std::env::set_var("CK_LOGS_LEVEL", args.next().unwrap_or_else(|| die("--level needs error|warn|info|debug"))),
+            "--limit" => std::env::set_var("CK_LOGS_LIMIT", args.next().unwrap_or_else(|| die("--limit needs a number"))),
+            "--follow" => std::env::set_var("CK_LOGS_FOLLOW", "1"),
             // read by client.rs / jobcli.rs from the environment (one place that already handles them)
             "--policy" => std::env::set_var("CK_POLICY", args.next().unwrap_or_else(|| die("--policy needs fixed|guided|adaptive"))),
             "--reducer" => std::env::set_var("CK_REDUCER", args.next().unwrap_or_else(|| die("--reducer needs a value"))),
@@ -163,8 +174,18 @@ fn main() {
     proto::SPIN.store(o.spin, Relaxed);
     rayon::ThreadPoolBuilder::new().num_threads(o.threads).build_global().unwrap();
     match cmd.as_str() {
+        "head" | "agent" | "worker" | "run" => log::init(
+            match (cmd.as_str(), o.standby) { ("head", true) => "standby", ("head", _) => "head", ("run", _) => "client", _ => "agent" },
+            &identity::node_id(),
+        ),
+        _ => {}
+    }
+    match cmd.as_str() {
+        "logs" => log::cli(),
         "head" if o.standby => {
             repl::run_standby(&o); // returns when this PC must take over
+            log::set_role("head");
+            crate::say!("ha.promote", "standby: promoted, now the head");
             head::run(&o)
         }
         "head" => head::run(&o),
@@ -176,6 +197,7 @@ fn main() {
         "admin" => jobcli::admin(&o),
         "token" => jobcli::token(&o),
         "sim" => sim::run(&o),
-        _ => die("usage: ck head|agent|run|ping|install|job|token|admin [options]  (see the top of src/main.rs)"),
+        _ => die("usage: ck head|agent|run|ping|install|job|token|admin|logs [options]  (see the top of src/main.rs)"),
     }
+    log::flush();
 }

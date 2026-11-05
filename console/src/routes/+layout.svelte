@@ -1,11 +1,12 @@
 <script lang="ts">
 	import '../app.css';
 	import { page } from '$app/state';
-	import { CalendarClock, CircleAlert, Gauge, ListChecks, LogOut, Map as MapIcon, Moon, MonitorPlay, Server, Settings, SlidersHorizontal, Sun, User as UserIcon, Users, WifiOff } from '@lucide/svelte';
+	import { CalendarClock, CircleAlert, Gauge, ListChecks, Radio, LogOut, Map as MapIcon, Moon, MonitorPlay, Server, Settings, SlidersHorizontal, Sun, User as UserIcon, Users, WifiOff } from '@lucide/svelte';
 	import type { LayoutProps } from './$types';
 	import AuthForm from '#lib/components/AuthForm.svelte';
 	import EmptyState from '#lib/components/EmptyState.svelte';
 	import HaBanners from '#lib/components/HaBanners.svelte';
+	import { history } from '#lib/canvas/history.ts';
 	import { isStandby, live, startLive } from '#lib/live.svelte.ts';
 	import { atLeast } from '#lib/jobs.ts';
 	import { authed, loadMe, roleNow, session, signOut, userNow } from '#lib/session.svelte.ts';
@@ -15,12 +16,18 @@
 	$effect(() => void loadMe());
 	// The stream only runs while someone is signed in (or the head is in open mode).
 	$effect(() => (authed() ? startLive() : undefined));
+	// the Live page's 30 minute sparkline is filled from every cluster snapshot, on any page
+	$effect(() => {
+		const c = live.cluster;
+		if (c) history.push(c.workers, Date.now());
+	});
 
 	const nav = $derived(
 		[
 			{ href: '/', label: 'Overview', icon: Gauge, show: true },
 			{ href: '/nodes', label: 'Nodes', icon: Server, show: true },
 			{ href: '/map', label: 'Floor map', icon: MapIcon, show: true },
+			{ href: '/live', label: 'Live', icon: Radio, show: true },
 			{ href: '/jobs', label: 'Jobs', icon: ListChecks, show: true },
 			{ href: '/policies', label: 'Policies', icon: SlidersHorizontal, show: true },
 			{ href: '/events', label: 'Events', icon: CalendarClock, show: true },

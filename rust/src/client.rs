@@ -91,6 +91,7 @@ pub fn run(o: &Opts) {
         (ERR, b) => die(&String::from_utf8_lossy(&b)),
         _ => die("unexpected reply from head"),
     };
+    crate::lg!(Info, "client.submit", {"job": id, "kind": kind, "n": o.n, "detach": o.detach});
     if o.detach {
         println!("job {id}");
         return;
@@ -205,6 +206,7 @@ fn reattach(o: &Opts, id: u64) -> (BufReader<Sock>, Sock) {
             let Ok((r, mut w)) = conn(s) else { continue };
             if send(&mut w, HELLO_C, &[]).is_ok() && send(&mut w, ATTACH, &id.to_le_bytes()).is_ok() {
                 eprintln!("re-attached job {id} on {addr}");
+                crate::lg!(Info, "client.reattach", {"job": id, "head": addr});
                 return (r, w);
             }
         }
@@ -231,6 +233,7 @@ fn stream(mut r: BufReader<Sock>, mut w: Sock, id: u64, kind: u8, o: &Opts, rang
             Err(e) => e.to_string(),
         };
         eprintln!("lost head ({lost}); looking for another");
+        crate::lg!(Warn, "client.head_lost", {"job": id, "why": lost});
         (r, w) = reattach(o, id);
         moved = true;
     }

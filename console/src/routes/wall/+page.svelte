@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { Moon, RotateCcw, Sun, Sunrise, TriangleAlert, User } from '@lucide/svelte';
 	import { api } from '#lib/api/client.ts';
-	import FloorMap from '#lib/components/FloorMap.svelte';
+	import LiveCanvas from '#lib/components/LiveCanvas.svelte';
 	import HeadTopology from '#lib/components/HeadTopology.svelte';
 	import { count, duration, rate } from '#lib/format.ts';
 	import { progress, runningJobs } from '#lib/jobs.ts';
@@ -120,19 +120,10 @@
 		</div>
 	{/if}
 
-	{#if live.labs.length === 0}
+	{#if items.length > 0}
+		<div class="bg-surface border-line min-h-[260px] flex-1 rounded-lg border p-[0.4vw]"><LiveCanvas wall /></div>
+	{:else if live.labs.length === 0}
 		<p class="text-muted-foreground m-auto text-[max(1rem,2vw)]">No lab map yet. Create one under Floor map.</p>
-	{:else}
-		<div class="flex min-h-0 flex-1 flex-wrap content-stretch items-stretch gap-[1.2vw] md:flex-nowrap">
-			{#each live.labs as lab (lab.id)}
-				<section class="bg-surface border-line flex min-h-0 min-w-0 flex-1 flex-col rounded-lg border p-[0.9vw]" aria-label={lab.name}>
-					<h2 class="mb-[0.8vh] text-[max(1rem,1.6vw)] font-semibold">{lab.name}</h2>
-					<div class="min-h-0 flex-1">
-						<FloorMap {lab} items={items.filter((i) => i.node.lab_id === lab.id && i.node.x != null)} overlay="state" flash={live.flash} wall />
-					</div>
-				</section>
-			{/each}
-		</div>
 	{/if}
 	{#if ticker.length}
 		<ul class="text-muted-foreground shrink-0 text-[max(0.85rem,1.1vw)]" aria-label="Recent head and power events">

@@ -108,3 +108,54 @@ Two cards side by side at ≥ 1024 px, stacked below that:
 - A failover in the mock (the role flips to candidate, then to primary with the epoch bumped, then a recruit) captured as 3 frames on the wall.
 - `scrollWidth` equals the viewport width on every page, there are 0 console errors, and `bun run check`, `bun test` and `bun run build` pass.
 - No Unicode glyph icons remain (`rg "☾|☀" console/src` finds nothing).
+
+## 7. Live system canvas (`/live`, and the wall's main panel)
+
+The one picture of everything happening in the cluster: PCs, heads, work moving and events, at 200 PCs on a lab PC
+and 1,000+ in the simulator view. HTML `<canvas>` 2D (no library), devicePixelRatio aware, 60 fps target and never
+below 30 fps with 1,000 PCs (draw only what changed; batch per frame with requestAnimationFrame; no DOM per PC).
+
+### Layout (force-free, stable: a PC never jumps)
+- **Labs** are rounded regions laid out in a grid (positions from the lab map when the PC is placed, else packed
+  rows by lab, then by node id). A PC is a small circle, 6-10 px, sized by threads.
+- **Head** sits at the centre top with a Crown glyph; **standbys** to its right in takeover order (Eye glyph and a
+  number). A thin replication line runs head → standby (solid in sync, `warn` when behind).
+- **Fill** = state, the same as the map: busy (`busy`), idle (surface), in use (outline `warn`), asleep (35 % and
+  dashed), waking (pulse), lost (`bad`), cordoned or draining (hatched). There is always a legend in the corner.
+
+### Motion (each motion means one real event)
+- **Work flow:** a dispatched chunk is a small particle from the head to the PC, and a result returns as a particle
+  back. Batch them: at most ~300 particles alive, so high task rates show as density, not a firehose. The colour is
+  per job (up to 8 job hues derived from `primary`, then grey), and a legend lists the jobs.
+- **Events** draw a ripple at their PC or head and a line in the event rail:
+  - PC lost: a `bad` ripple;
+  - PC joined: an `ok` ripple;
+  - sleep / wake: a Moon / Sunrise fade;
+  - speculation copy: a dashed particle;
+  - head failover: the head node cracks to `bad`, the promoted standby glides into the head spot (600 ms), and the term
+    counter rolls;
+  - recruit: a new standby slot fades in.
+- `prefers-reduced-motion`: there are no particles or ripples; state changes still recolour, and the rail still lists
+  everything.
+
+### Interaction
+- Hover a PC: a tooltip with host, lab, state, current job, rate and last event. Click: pin a side panel with its
+  recent events and actions (operator: Drain, Sleep, Wake).
+- Wheel or pinch to zoom and drag to pan; double-click resets. A filter bar takes a selector (`lab=A`, `job=12`,
+  `state=lost`), and PCs that do not match dim to 15 %.
+- **Event rail** (right, 320 px; at 390 px a bottom sheet): the newest events at the top, with an icon, a short sentence
+  and the time. Click one: the canvas flashes the PCs involved.
+- **Timeline scrubber** (bottom): the last 30 minutes as a sparkline (busy PCs, tasks/s), with event ticks coloured by
+  kind. Drag it into the past to replay: the canvas redraws from the event history (GET /api/v1/events; the log API when
+  present); "Live" returns to now. Replay is read-only.
+
+### States
+Loading: a skeleton of lab regions. Empty (no PCs): "No PCs yet: add one with a join code" and a link. Head unreachable:
+the last frame frozen, greyed, with "Reconnecting…". Huge fleet (> 2,000 PCs): circles become 3 px points, particles turn
+off and per-lab totals show instead.
+
+### Acceptance
+The mock (scripts/mock-api.ts) streams chunk and node events at a realistic rate (about 50 tasks/s, some lost, a
+failover at 30 s, a recruit). There are screenshots at 1440 and 390 in light and dark, and a 3-frame capture of a failover.
+An FPS probe with 1,000 mock PCs stays ≥ 30 fps (log `performance.now()` frame times in a test page). check, test and
+build pass; scrollWidth equals the viewport; 0 console errors.

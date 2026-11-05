@@ -220,6 +220,7 @@ pub fn min_role(method: &str, path: &str) -> Option<Role> {
         (_, "/api/v1/users" | "/api/v1/config") => Role::Admin,
         ("POST", "/api/v1/jobs") => Role::Researcher,
         ("POST", "/api/v1/ha/switchover") | ("PUT", "/api/v1/ha/settings" | "/api/v1/tunables") => Role::Admin,
+        ("GET", "/api/v1/logs") => Role::Operator,
         ("POST", "/api/v1/nodes/power") | ("PUT", "/api/v1/power") => Role::Operator,
         ("POST", "/api/v1/nodes/state" | "/api/v1/labs" | "/api/v1/join-codes") => Role::Operator,
         ("PUT", _) if p.starts_with("/api/v1/nodes/") && p.ends_with("/place") => Role::Operator,
@@ -249,6 +250,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/reservations"), ("POST", "/reservations"), ("DELETE", "/reservations/{id}"), ("GET", "/estimate"),
     ("POST", "/nodes/power"), ("GET", "/power"), ("PUT", "/power"), ("GET", "/ha/settings"), ("PUT", "/ha/settings"),
     ("GET", "/tunables"), ("PUT", "/tunables"), ("GET", "/ha/candidates"),
+    ("GET", "/logs"),
 ];
 
 #[cfg(test)]
@@ -306,6 +308,7 @@ mod tests {
             ("GET", "/api/v1/tunables", Some(Role::Viewer)),
             ("PUT", "/api/v1/tunables", Some(Role::Admin)),
             ("GET", "/api/v1/ha/candidates", Some(Role::Viewer)),
+            ("GET", "/api/v1/logs", Some(Role::Operator)),
             ("GET", "/api/v1/users", Some(Role::Admin)),
             ("POST", "/api/v1/users", Some(Role::Admin)),
         ];

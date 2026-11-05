@@ -120,6 +120,17 @@ fn num(o: Option<String>) -> u64 {
     o.and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+/// Log standby lag only when its size class (0, 1, 2-3, 4-7 ...) or the connected count changes, not on every ack.
+fn lag_log(standbys: &[(String, u64, u64)], connected: usize, members: usize) {
+    use std::sync::atomic::AtomicU64;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let max = standbys.iter().map(|x| x.2).max().unwrap_or(0);
+    let class = (64 - max.leading_zeros() as u64) << 16 | (connected as u64) << 8 | members as u64;
+    if LAST.swap(class, SeqCst) != class {
+        crate::lg!(Info, "ha.lag", {"max_lag": max, "standbys": standbys.len(), "connected": connected, "members": members});
+    }
+}
+
 fn sync_status(ctx: &Ctx, g: &Inner) {
     let mut s = ctx.repl.status.lock().unwrap();
     s.role = if g.candidate { "candidate" } else { "primary" }.into();
@@ -127,6 +138,7 @@ fn sync_status(ctx: &Ctx, g: &Inner) {
     s.last_seq = g.last;
     s.standbys = g.links.iter().map(|l| (l.node.clone(), l.acked, g.last.saturating_sub(l.acked))).collect();
     s.membership = g.members.len();
+    lag_log(&s.standbys, g.connected, g.members.len());
     s.connected = g.connected;
     s.dispatching = !g.candidate && has_quorum(g.connected, g.members.len());
     s.primary.clear();
@@ -398,7 +410,7 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
         let first = hello_entry(&g, lid, if snapshot { "snapshot" } else { "replay" });
         (lid, snapshot, replay, g.last, g.epoch, first)
     };
-    println!("standby {} joined ({})", h.node_id, if snapshot { "snapshot" } else { "replay" });
+    crate::say!("ha.standby_join", "standby {} joined ({})", h.node_id, if snapshot { "snapshot" } else { "replay" });
     let mut w = s.try_clone()?;
     let rs = s.try_clone()?;
     let (mut htx, mut hrx) = match sk { Some(k) => (Half::new(k, 0), Half::new(k, 1)), None => (Half::plain(), Half::plain()) };
@@ -464,7 +476,7 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
         sync_status(ctx, &g);
     }
     crate::head::durable_upto(ctx, durable_seq(ctx)); // fewer standbys can mean more is durable
-    println!("standby {} left", h.node_id);
+    crate::say!("ha.standby_leave", "standby {} left", h.node_id);
     res
 }
 
@@ -654,6 +666,7 @@ fn session(store: &mut Store, path: &Path, mut s: TcpStream, sb: &mut Sb) -> io:
             proto::SNAPSHOT => {
                 let (epoch, seq) = (u64_at(&p, 0)?, u64_at(&p, 8)?);
                 install_snapshot(store, path, &p[16..]).map_err(io::Error::other)?;
+                crate::lg!(Info, "standby.snapshot", {"epoch": epoch, "seq": seq, "bytes": p.len()});
                 for (k, v) in [("last_seq", seq), ("epoch", epoch)] {
                     store.set_meta(k, &v.to_string()).map_err(io::Error::other)?;
                 }
@@ -679,13 +692,13 @@ fn session(store: &mut Store, path: &Path, mut s: TcpStream, sb: &mut Sb) -> io:
                 } else if e.seq > applied {
                     if e.kind == "promote" && e.data["node"].as_str() == Some(node.as_str()) {
                         sb.handover = true;
-                        println!("standby: the primary hands over to this PC");
+                        crate::say!("standby.handover", "standby: the primary hands over to this PC");
                     }
                     if e.seq != applied + 1 {
                         return Err(invalid("gap in the change log"));
                     }
                     if let Err(x) = apply(store, &e) {
-                        eprintln!("standby: entry {} ({}): {x}", e.seq, e.kind); // ponytail: logged, not fatal
+                        crate::warnl!("standby.apply_error", "standby: entry {} ({}): {x}", e.seq, e.kind); // ponytail: logged, not fatal
                     }
                     applied = e.seq;
                     let _ = store.set_meta("last_seq", &applied.to_string());
@@ -739,10 +752,10 @@ pub fn run_standby(o: &crate::Opts) {
     set_sb(|t| { t.role = "standby".into(); t.epoch = epoch.load(SeqCst); t.last_seq = num(store.meta("last_seq")); t.primary = head.lock().unwrap().clone() });
     let mut sb = Sb { handover: false, priority: 0, peers: vec![], last_heard: Instant::now(), epoch: epoch.clone() };
     let mut backoff = Duration::from_millis(200);
-    println!("standby: following {}", head.lock().unwrap());
+    crate::say!("standby.follow", "standby: following {}", head.lock().unwrap());
     loop {
         if let Some(a) = switch.lock().unwrap().take() {
-            println!("standby: a head with a higher epoch beacons at {a}, following it");
+            crate::say!("standby.follow", "standby: a head with a higher epoch beacons at {a}, following it");
             *head.lock().unwrap() = a;
             sb.last_heard = Instant::now();
         }
@@ -753,9 +766,9 @@ pub fn run_standby(o: &crate::Opts) {
             let _ = store.set_meta("candidate", "1");
             set_sb(|t| { t.role = "candidate".into(); t.epoch = e; t.connected = 0 });
             if sb.handover {
-                println!("standby: planned handover, promoting at epoch {e}");
+                crate::say!("ha.promote", "standby: planned handover, promoting at epoch {e}");
             } else {
-                println!("standby: primary silent for {:.1}s, promoting at epoch {e}", sb.last_heard.elapsed().as_secs_f64());
+                crate::say!("ha.promote", "standby: primary silent for {:.1}s, promoting at epoch {e}", sb.last_heard.elapsed().as_secs_f64());
             }
             return;
         }
@@ -770,7 +783,7 @@ pub fn run_standby(o: &crate::Opts) {
             let r = session(&mut store, &path, s, &mut sb);
             *cur.lock().unwrap() = None;
             set_sb(|x| x.connected = 0);
-            eprintln!("standby: link to {t} ended: {}", r.err().map_or("closed".into(), |e| e.to_string()));
+            crate::warnl!("standby.link_end", "standby: link to {t} ended: {}", r.err().map_or("closed".into(), |e| e.to_string()));
             ran = true;
             backoff = Duration::from_millis(200);
             break;

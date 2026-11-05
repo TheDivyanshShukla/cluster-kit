@@ -38,7 +38,7 @@ const ago = (ms: number) => now() - ms;
 mkJob({ name: 'SHA sweep 0-50M', kind: 'sha', total: 50_000_000, done: 50_000_000, state: 'done', created_ms: ago(9e6), started_ms: ago(9e6), finished_ms: ago(8.9e6) });
 mkJob({ name: 'Flaky command', kind: 'cmd', total: 8_000_000, done: 3_000_000, state: 'failed', error: 'worker 10.0.0.7 exited with status 2', submitter: 'ana', created_ms: ago(7e6), started_ms: ago(7e6), finished_ms: ago(6.9e6) });
 mkJob({ name: 'Old synth', kind: 'synth', total: 1_000_000_000, done: 400_000_000, state: 'cancelled', submitter: 'ana', created_ms: ago(5e6), started_ms: ago(5e6), finished_ms: ago(4.9e6) });
-mkJob({ name: 'Synth 500G numbers', kind: 'synth', total: 500_000_000_000, done: 50_000_000_000, state: 'running', created_ms: ago(40_000), started_ms: ago(40_000), selector: 'lab="Lab A"', priority: 2 });
+mkJob({ name: 'Synth 500G numbers', kind: 'synth', total: 500_000_000_000, done: 50_000_000_000, state: 'running', created_ms: ago(40_000), started_ms: ago(40_000), selector: '', priority: 2 });
 mkJob({ name: 'Exam grading (urgent)', kind: 'sha', total: 80_000_000_000, done: 8_000_000_000, state: 'running', created_ms: ago(30_000), started_ms: ago(30_000), selector: 'pool=night', priority: 0, submitter: 'ana' });
 mkJob({ name: 'Hash the word list', kind: 'list', total: 6, done: 6, state: 'done', reducer: 'sort', policy: 'guided', submitter: 'ana', created_ms: ago(3e6), started_ms: ago(3e6), finished_ms: ago(2.9e6), items: ['pear', 'apple', 'fig', 'plum', 'kiwi', 'lime'] });
 mkJob({ name: 'Nightly SHA batch', kind: 'sha', total: 200_000_000, submitter: 'ana' });
@@ -174,8 +174,9 @@ for (let i = 0; i < 70; i++) {
 
 const runningAll = () => jobs.filter((j) => j.state === 'running');
 const running = () => runningAll()[0] ?? null;
+const BASE = 30;
 function refreshRules() {
-	for (const w of workers) {
+	for (const w of workers.slice(0, BASE)) {
 		const n = nodes.get(w.node_id!)!;
 		n.presence = w.presence;
 		const hit = wins.filter((x) => winActive(x) && matchIds(x.selector).includes(w.node_id!));
@@ -189,18 +190,22 @@ function tick() {
 	refreshRules();
 	const j = running();
 	const others = runningAll().slice(1);
-	for (const o of others) { o.done = Math.min(o.total, o.done + 20_000_000 * 0.5 * 30); for (const s of subs) s('job', o); }
+	for (const o of others) { o.done = Math.min(workers.length > BASE ? o.total * 0.5 : o.total, o.done + 20_000_000 * 0.5 * 30); for (const s of subs) s('job', o); }
 	let busy = 0;
 	for (const w of workers) {
 		w.busy = !!j && takes(w.node_id!) && w.id % 7 !== 0 && !w.blocked && w.presence !== 'busy';
 		if (w.busy) busy++;
+	}
+	// ~50 finished chunks/s across the busy base PCs (1.5/s per PC in the 1000-PC probe), jittered
+	const perTick = busy ? (workers.length > BASE ? 0.75 * workers.length / busy : 25 / busy) : 0;
+	for (const w of workers) {
 		w.rate = w.busy ? w.threads * (4.5e6 + Math.random() * 1.5e6) : 0;
 		w.cpu = w.busy ? 90 + Math.random() * 9 : 2 + Math.random() * 5;
 		w.mem_used = w.mem_total * (0.3 + Math.random() * 0.1);
-		if (w.busy) { w.numbers += w.rate * 0.5; w.chunks += Math.random() < 0.1 ? 1 : 0; w.secs += 0.5; }
+		if (w.busy) { const e = perTick * (0.6 + Math.random() * 0.8); w.numbers += w.rate * 0.5; w.chunks += Math.floor(e) + (Math.random() < e % 1 ? 1 : 0); w.secs += 0.5; }
 	}
 	if (j) {
-		j.done = Math.min(j.total, Math.floor(j.done + workers.reduce((a, w) => a + w.rate, 0) * 0.5));
+		j.done = Math.min(workers.length > BASE ? j.total * 0.5 : j.total, Math.floor(j.done + workers.reduce((a, w) => a + w.rate, 0) * 0.5)); // the 1000-PC probe keeps its jobs running
 		if (j.done >= j.total) {
 			j.state = 'done'; j.finished_ms = now();
 			logEvent('job.done', '', `job ${j.id} finished`);
@@ -260,7 +265,7 @@ function failover(after: number, first?: string) {
 		}, 8_000);
 	}, after);
 }
-failover(30_000);
+failover(Number(process.env.MOCK_FAILOVER_MS ?? 30_000));
 setInterval(() => { haSeq += 3; }, 1000);
 let lastHa = '';
 setInterval(() => {
@@ -275,6 +280,42 @@ Object.assign(nodes.get('n010')!, { online: false, power: 'waking' });
 const hm = () => hhmm(new Date());
 setTimeout(() => { for (const id of ['n016', 'n017', 'n019']) setNode(id, { online: false, power: 'asleep' }); logEvent('power.sleep', '', `3 PCs went to sleep, ${hm()}`); }, 15_000);
 setTimeout(() => { setNode('n006', { power: 'waking' }); setTimeout(() => { setNode('n006', { online: true, power: 'awake' }); logEvent('power.wake', '', `pc-06 woke up, ${hm()}`); }, 6_000); }, 22_000);
+
+// PCs that drop off and come back (pc-30 stays gone for a while), and a late wake
+const lose = (id: string, back: number) => {
+	const n = nodes.get(id);
+	if (!n || !n.online || n.power !== 'awake' || n.state === 'maintenance') return;
+	setNode(id, { online: false });
+	logEvent('node.lost', '', `${n.host} lost`);
+	setTimeout(() => { setNode(id, { online: true }); logEvent('node.join', '', `${n.host} joined`); }, back);
+};
+const FLAPPY = ['n020', 'n021', 'n023', 'n024', 'n025', 'n026', 'n009', 'n011'];
+let flap = 0;
+setInterval(() => lose(FLAPPY[flap++ % FLAPPY.length], 7_000 + Math.random() * 8_000), 11_000);
+setTimeout(() => { setNode('n030', { online: true }); logEvent('node.join', '', 'pc-30 joined'); }, 52_000);
+setTimeout(() => { setNode('n016', { power: 'waking' }); setTimeout(() => { setNode('n016', { online: true, power: 'awake' }); logEvent('power.wake', '', `pc-16 woke up, ${hm()}`); }, 5_000); }, 40_000);
+
+// ---- bigger fleets for the canvas FPS probe: any request with ?pcs=N (or MOCK_PCS=N) resizes the fleet; ?pcs=0 goes back to 30
+function setFleet(n: number) {
+	const want = Math.max(0, Math.min(5000, Math.floor(n) || 0));
+	if (want === workers.length - BASE) return;
+	for (const w of workers.splice(BASE)) nodes.delete(w.node_id!);
+	labs.splice(0, labs.length, ...labs.filter((l) => l.id <= 100));
+	for (let i = 0; i < want; i++) {
+		const li = Math.floor(i / 100);
+		if (i % 100 === 0) labs.push({ id: 101 + li, name: `Sim ${li + 1}`, w: 10, h: 10, created_ms: ago(1e8) });
+		const id = `x${String(i + 1).padStart(4, '0')}`, threads = i % 3 === 0 ? 16 : 8;
+		const w = { ...workers[0], id: 1000 + i, addr: `10.1.${Math.floor(i / 250)}.${i % 250}:7701`, threads, chunks: 0, numbers: 0, busy: false, rate: 0, node_id: id, host: `sim-${String(i + 1).padStart(4, '0')}`, virtual: true, presence: 'idle' as const, blocked: false, cap: null };
+		workers.push(w);
+		nodes.set(id, { ...nodes.get('n001')!, node_id: id, host: w.host!, addr: w.addr, lab_id: 101 + li, x: (i % 100) % 10, y: Math.floor((i % 100) / 10), state: 'active', online: true, power: 'awake', presence: 'idle', labels: {}, pools: [] });
+	}
+}
+if (process.env.MOCK_PCS) setFleet(Number(process.env.MOCK_PCS));
+setInterval(() => {
+	if (workers.length <= BASE) return;
+	const w = workers[BASE + Math.floor(Math.random() * (workers.length - BASE))];
+	if (w.id % 5 === 0) lose(w.node_id!, 4_000);
+}, 1_500);
 
 // ---- tunables: copy of rust/src/tune.rs KNOBS [key, group, default, min, max, unit, scope, help]
 const KNOBS: [string, string, number, number, number, string, 'head' | 'agent' | 'both', string][] = [
@@ -385,6 +426,7 @@ async function handle(req: Request): Promise<Response> {
 	const url = new URL(req.url);
 	const p = url.pathname;
 	const m = req.method;
+	if (url.searchParams.has('pcs')) setFleet(Number(url.searchParams.get('pcs')));
 	const body = async () => (await req.json().catch(() => ({}))) as Record<string, any>;
 
 	if (p === '/stats') return err(404, 'not_found', 'stats is not mocked');

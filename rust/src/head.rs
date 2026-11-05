@@ -424,7 +424,7 @@ fn speculate_take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8
             }
         }
         if let Some(&(job, a, b)) = sched::speculate(&infl, 1).first() {
-            println!("job {job}: speculative copy of {a}..{b} on {} (original still running after {:.1}s)", w.addr,
+            crate::say!("chunk.speculate", "job {job}: speculative copy of {a}..{b} on {} (original still running after {:.1}s)", w.addr,
                 infl.iter().find(|i| (i.a, i.b) == (a, b)).map_or(0.0, |i| i.age_secs));
             return Some((job, a, b, j.kind, j.arg.clone()));
         }
@@ -435,7 +435,7 @@ fn speculate_take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8
 fn event(ctx: &Ctx, kind: &str, actor: &str, detail: &str) {
     match ctx.store.log_event(now_ms(), kind, actor, detail) {
         Ok(e) => ctx.bus.publish("event", &serde_json::to_string(&e).unwrap_or_default()),
-        Err(e) => eprintln!("event {kind}: {e}"),
+        Err(e) => crate::warnl!("event.error", "event {kind}: {e}"),
     }
 }
 
@@ -455,7 +455,7 @@ fn publish_job(ctx: &Ctx, row: &JobRow) {
 fn end_job(ctx: &Ctx, st: &mut State, id: u64, state: JobState, error: Option<&str>, ev: &str, actor: &str, detail: &str) {
     match set_state(ctx, id, state, error) {
         Ok(row) => publish_job(ctx, &row),
-        Err(e) => eprintln!("job {id}: {e}"),
+        Err(e) => crate::warnl!("job.error", "job {id}: {e}"),
     }
     event(ctx, ev, actor, detail);
     let frame = match state {
@@ -498,14 +498,14 @@ fn chunk_failed(ctx: &Ctx, st: &mut State, job: u64, a: u64, b: u64, retry: bool
     }
     match attempt(&mut st.attempts, (job, a, b), retry) {
         Verdict::Requeue => {
-            println!("job {job}: chunk {a}..{b} failed ({msg}), running it again");
+            crate::say!("chunk.requeue", "job {job}: chunk {a}..{b} failed ({msg}), running it again");
             st.jobs.get_mut(&job).unwrap().requeue.push((a, b));
             ctx.sh.1.notify_all();
             vec![]
         }
         Verdict::Fail => {
             let m = format!("chunk {a}..{b} failed: {msg}");
-            println!("job {job}: {m}");
+            crate::say!("chunk.failed", "job {job}: {m}");
             stop_job(ctx, st, job, JobState::Failed, Some(&m), "job.failed", "head", &format!("job {job}: {m}"))
         }
     }
@@ -574,7 +574,7 @@ fn watchdog(ctx: Arc<Ctx>) {
 
 fn complete(ctx: &Ctx, st: &mut State, id: u64, todo: u64, secs: f64) {
     let msg = format!("job {id}: {todo} numbers in {secs:.3}s ({:.1} M/s)", todo as f64 / secs.max(1e-9) / 1e6);
-    println!("{msg}");
+    crate::say!("job.complete", "{msg}");
     end_job(ctx, st, id, JobState::Done, None, "job.done", "head", &msg);
     st.last = Some(msg);
 }
@@ -608,11 +608,11 @@ fn start_job(ctx: &Ctx, st: &mut State, id: u64) {
     if row.state != JobState::Running {
         match set_state(ctx, id, JobState::Running, None) {
             Ok(r) => publish_job(ctx, &r),
-            Err(e) => eprintln!("job {id}: {e}"),
+            Err(e) => crate::warnl!("job.error", "job {id}: {e}"),
         }
     }
     st.next_id = st.next_id.max(id);
-    println!("job {id}: {total} numbers ({left} to do), chunk {chunk}, {pcs} matching workers, priority {}, selector '{}', policy {policy:?}", spec.priority, spec.selector);
+    crate::say!("job.started", "job {id}: {total} numbers ({left} to do), chunk {chunk}, {pcs} matching workers, priority {}, selector '{}', policy {policy:?}", spec.priority, spec.selector);
     if left == 0 {
         complete(ctx, st, id, 0, 0.0);
         return;
@@ -642,7 +642,7 @@ fn publish_node(ctx: &Ctx, st: &State, node_id: &str) {
 fn cordon(ctx: &Ctx, node_id: &str) {
     match ctx.store.set_node_state(node_id, "cordoned", "drain finished", "head", now_ms()) {
         Ok(_) => event(ctx, "node.state", "head", &format!("node {node_id} drained, now cordoned")),
-        Err(e) => eprintln!("node {node_id}: {e}"),
+        Err(e) => crate::warnl!("node.error", "node {node_id}: {e}"),
     }
 }
 
@@ -835,11 +835,11 @@ fn gate_tick(ctx: &Ctx) {
     let was_gated = std::mem::replace(&mut st.gated, !ok);
     let dispatching = ok && !st.halted;
     if ok && was_gated {
-        println!("quorum back, dispatching");
+        crate::say!("ha.quorum", "quorum back, dispatching");
         st.noq_since = None;
         ctx.sh.1.notify_all();
     } else if !ok && !was_gated {
-        println!("! no quorum, dispatching paused");
+        crate::say!("ha.quorum", "! no quorum, dispatching paused");
     }
     drop(st);
     ctx.repl.status.lock().unwrap().dispatching = dispatching;
@@ -883,7 +883,7 @@ fn watch_epoch(ctx: Arc<Ctx>, name: String) {
         if let Some(e) = higher_epoch(t, &name, &own, crate::repl::epoch(&ctx)) {
             halt(&ctx);
             let addr = t.split_whitespace().nth(2).unwrap_or("").to_string();
-            println!("! FENCED: the head at {addr} has epoch {e} (mine is {}). Dispatching stopped, agents closed; restarting as its standby", crate::repl::epoch(&ctx));
+            crate::say!("ha.fence", "! FENCED: the head at {addr} has epoch {e} (mine is {}). Dispatching stopped, agents closed; restarting as its standby", crate::repl::epoch(&ctx));
             thread::sleep(Duration::from_millis(300));
             rejoin_as_standby(&addr);
         }
@@ -901,7 +901,7 @@ pub fn switch_to(ctx: Arc<Ctx>, node: &str, actor: &str) -> Result<String, Strin
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(200)); // let the HTTP reply go out
                 halt(&ctx);
-                println!("handing over to {to}; restarting as its standby");
+                crate::say!("ha.switchover", "handing over to {to}; restarting as its standby");
                 rejoin_as_standby(&to);
             });
             Ok(peer)
@@ -944,7 +944,7 @@ fn rejoin_as_standby(addr: &str) -> ! {
 
 fn deny(s: &mut TcpStream, ctx: &Ctx, h: &Hello, addr: &str, why: &str) -> io::Result<()> {
     event(ctx, "node.denied", "head", &format!("{} at {addr} (node {}): {why}", h.host, h.node_id));
-    println!("! denied {addr} node {}: {why}", h.node_id);
+    crate::say!("admission.denied", "! denied {addr} node {}: {why}", h.node_id);
     send(s, DENIED, why.as_bytes())
 }
 
@@ -1026,6 +1026,7 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     let secs = u64_at(p, 48)? as f64 / 1e6; // compute time measured by the worker (excludes queueing)
     let t1 = now();
     let t0 = t1 - secs;
+    crate::lgc!("chunk.done", {"job": job, "a": a, "b": b, "wid": wid, "ms": secs * 1000.0});
     let mut st = sh.0.lock().unwrap();
     let kind = st.jobs.get(&job).map(|j| j.kind);
     let mut upd = None;
@@ -1066,13 +1067,13 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     }
     if cov > 0 {
         // partial overlap: storing it would count numbers twice. Drop it, ACK it, make sure its uncovered pieces get run.
-        println!("job {job}: result {a}..{b} overlaps stored parts, dropped; its gaps are queued");
+        crate::say!("chunk.overlap", "job {job}: result {a}..{b} overlaps stored parts, dropped; its gaps are queued");
         requeue_missing(&mut st, job, gaps(a, b, &done));
         sh.1.notify_all();
         return Ok((ack_now(&st), credit));
     }
     // ponytail: the store write happens under the State lock so ATTACH sees parts and live frames without a gap.
-    if !ctx.store.add_part(job, a, b, &p[RESULT_HDR..]).unwrap_or_else(|e| { eprintln!("job {job}: {e}"); true }) {
+    if !ctx.store.add_part(job, a, b, &p[RESULT_HDR..]).unwrap_or_else(|e| { crate::warnl!("job.error", "job {job}: {e}"); true }) {
         return Ok((ack_now(&st), credit)); // already stored (re-run, speculative copy, or an agent resending after a failover, HA-04): ACK at once
     }
     // HA-03/04: log the part; ACK when the standbys have it too. repl::record / durable_seq are called under the State
@@ -1089,7 +1090,7 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
             w.inflight.retain(|&t| t != (job, a, b)); // lost the race: its result will be dropped as a duplicate
             w.sent.remove(&(job, a, b));
             sends.extend(w.out.clone().map(|o| (o, CANCEL_RANGE, pack(&[job, a, b])))); // stop just this chunk on the loser
-            println!("job {job}: chunk {a}..{b} won by worker {wid}, the copy on {} is dropped", w.addr);
+            crate::say!("chunk.speculate_won", "job {job}: chunk {a}..{b} won by worker {wid}, the copy on {} is dropped", w.addr);
         }
     }
     // chunks that overlap the new part without being identical: stop them, queue what is still uncovered
@@ -1134,11 +1135,11 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     let (threads, version, hello) = parse_hello(hello);
     let addr = s.peer_addr()?.ip().to_string();
     match &hello {
-        Some(h) => println!(
-            "+ worker {addr} ({threads} threads) node {} host {}{} v{version} {} {} {} cores {} GB",
+        Some(h) => crate::say!(
+            "node.connect", "+ worker {addr} ({threads} threads) node {} host {}{} v{version} {} {} {} cores {} GB",
             h.node_id, h.host, if h.virtual_node { " (virtual)" } else { "" }, h.inv.os, h.inv.arch, h.inv.cores_logical, h.inv.ram_bytes >> 30
         ),
-        None => println!("+ worker {addr} ({threads} threads) v{version}, no hello"),
+        None => crate::say!("node.connect", "+ worker {addr} ({threads} threads) v{version}, no hello"),
     }
     // HA-01: a worker silent for LOST_AFTER (pulled cable, frozen process) errors the reader out, which requeues its chunks.
     // ponytail: with --spin the socket is non-blocking and there is no timeout.
@@ -1218,7 +1219,7 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     if let Some(n) = &node {
         event(&ctx, "node.lost", "head", &detail(n));
     }
-    println!("- worker {addr} ({})", err.map_or("closed".into(), |e| e.to_string()));
+    crate::say!("node.disconnect", "- worker {addr} ({})", err.map_or("closed".into(), |e| e.to_string()));
     Ok(())
 }
 
@@ -1303,6 +1304,7 @@ fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>
                     wk.inflight.push((t.0, t.1, t.2));
                     wk.fed += 1;
                     wk.sent.insert((t.0, t.1, t.2), Instant::now());
+                    crate::lgc!("chunk.dispatch", {"job": t.0, "a": t.1, "b": t.2, "wid": wid});
                     break (t.0, t.1, t.2, t.3, t.4, mem);
                 }
                 // 2 s timeout: an idle node re-checks for an overdue chunk to copy (watchdog also wakes it every 5 s)
@@ -1371,7 +1373,7 @@ fn serve_standby_conn(mut s: TcpStream, ctx: Arc<Ctx>, p: &[u8]) -> io::Result<(
             Err(why) => return deny(&mut s, &ctx, &h, &addr, &why),
         }
     }
-    println!("+ standby {addr} node {}{}", h.node_id, if sk.is_some() { " (sealed)" } else { "" });
+    crate::say!("ha.standby_join", "+ standby {addr} node {}{}", h.node_id, if sk.is_some() { " (sealed)" } else { "" });
     crate::repl::serve_standby(&ctx, s, p, sk)
 }
 
@@ -1476,7 +1478,7 @@ pub fn cancel_job(ctx: &Ctx, id: u64, actor: &str) -> Result<JobRow, String> {
     }
     let mut st = ctx.sh.0.lock().unwrap();
     let outs = stop_job(ctx, &mut st, id, JobState::Cancelled, Some("job cancelled"), "job.cancelled", actor, &format!("job {id} cancelled"));
-    println!("job {id} cancelled by {actor}");
+    crate::say!("job.cancelled", "job {id} cancelled by {actor}");
     drop(st);
     cancel_outs(outs, id);
     ctx.store.job(id).ok_or_else(|| "no such job".into())
@@ -1488,7 +1490,7 @@ fn resume(ctx: &Ctx) {
     let mut ids: Vec<u64> = ctx.store.unfinished().iter().map(|r| r.id).collect();
     ids.sort();
     if !ids.is_empty() {
-        println!("resuming {} unfinished job(s)", ids.len());
+        crate::say!("job.resume", "resuming {} unfinished job(s)", ids.len());
     }
     for id in ids {
         start_job(ctx, &mut st, id);
@@ -1558,7 +1560,7 @@ fn init_ha(ctx: &Ctx) {
     crate::repl::start(ctx);
     if ctx.repl.status.lock().unwrap().role == "candidate" {
         ctx.sh.0.lock().unwrap().gated = true;
-        println!("candidate: epoch {}, waiting for quorum", crate::repl::epoch(ctx));
+        crate::say!("ha.candidate", "candidate: epoch {}, waiting for quorum", crate::repl::epoch(ctx));
     }
 }
 
@@ -1775,7 +1777,7 @@ pub fn power_settings_changed(ctx: &Ctx) {
         let ids: Vec<String> = pw_ctx(ctx).asleep.iter().cloned().collect();
         if !ids.is_empty() {
             if let Err(e) = wake_nodes(ctx, &ids, "head") {
-                eprintln!("power: {e}");
+                crate::warnl!("power.error", "power: {e}");
             }
         }
     }
@@ -1864,8 +1866,9 @@ fn eco_tick(ctx: &Ctx) {
             }).collect();
             let ids = choose_wake(&cands, &demand);
             if !ids.is_empty() {
+                crate::lg!(Info, "power.eco", {"action": "wake", "nodes": ids});
                 if let Err(e) = wake_nodes(ctx, &ids, "eco") {
-                    eprintln!("power: {e}");
+                    crate::warnl!("power.error", "power: {e}");
                 }
             }
         }
@@ -1877,8 +1880,9 @@ fn eco_tick(ctx: &Ctx) {
     }).collect();
     let ids = choose_sleep(&cands, cfg.idle_min, awake, cfg.keep_awake);
     if !ids.is_empty() {
+        crate::lg!(Info, "power.eco", {"action": "sleep", "nodes": ids, "awake": awake});
         if let Err(e) = sleep_nodes(ctx, &ids, "eco") {
-            eprintln!("power: {e}");
+            crate::warnl!("power.error", "power: {e}");
         }
     }
 }
@@ -1895,7 +1899,7 @@ pub fn tune_changed(ctx: &Ctx) {
     for o in &outs {
         ctrl_to(o, m.clone());
     }
-    println!("tune: sent to {} agents: {}", outs.len(), m["tune"]);
+    crate::say!("tune.sent", "tune: sent to {} agents: {}", outs.len(), m["tune"]);
     pw().last_recruit = None;
 }
 

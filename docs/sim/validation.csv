@@ -1,0 +1,15 @@
+point,measured,simulated,unit,error_pct,result
+2 PCs throughput (mean of runs),44.6929,43.2646,MH/s,-3.19583,pass
+2 PCs efficiency vs sum of single PCs,100.985,97.7573,%,-3.19583,pass
+2 PCs CV of the repeats,2.79818,2.7183,%,-2.85501,info
+3 PCs throughput (mean of runs),67.1989,65.7801,MH/s,-2.11129,pass
+3 PCs efficiency vs sum of single PCs,99.4146,97.3156,%,-2.11129,pass
+3 PCs CV of the repeats,2.40301,1.55027,%,-35.486,info
+4 PCs throughput (mean of runs),87.8523,87.9814,MH/s,0.146895,pass
+4 PCs efficiency vs sum of single PCs,96.6132,96.7552,%,0.146895,pass
+4 PCs CV of the repeats,1.41802,1.2054,%,-14.9942,info
+1 PC throughput,23.3246,23.3117,MH/s,-0.0552286,pass
+"head ceiling, 200 agents (measured range 2100-2670)",2385,2273.88,tasks/s,-4.65924,pass
+"head ceiling, 1000 agents (measured range 1560-1900)",1730,1647.7,tasks/s,-4.75737,pass
+"adaptive 10 s-ideal job, 200 agents",11,10.8829,s,-1.06464,pass
+"adaptive 10 s-ideal job, number of parts",4919,4760,parts,-3.23236,pass
