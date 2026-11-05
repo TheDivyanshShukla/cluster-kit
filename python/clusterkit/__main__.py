@@ -1,8 +1,12 @@
 """python -m clusterkit bench | advise path/script.py:func [--items EXPR]"""
+from __future__ import annotations
 import argparse, importlib.util, os, sys
+from types import ModuleType
+from typing import Any, Callable
+from collections.abc import Sequence
 
 
-def load(spec):
+def load(spec: str) -> tuple[ModuleType, Callable[..., Any]]:
     path, _, name = spec.partition(":")
     if not name:
         sys.exit("give the function as path/script.py:func")
@@ -13,13 +17,13 @@ def load(spec):
     mod = importlib.util.module_from_spec(m)
     sys.modules[stem] = mod  # not __main__: the script's `if __name__ == "__main__":` block must not run
     m.loader.exec_module(mod)
-    fn = mod
+    fn: Any = mod
     for part in name.split("."):
         fn = getattr(fn, part)
     return mod, fn
 
 
-def main(argv=None):
+def main(argv: Sequence[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m clusterkit")
     ap.add_argument("--head", help="head URL (default CK_HEAD or http://127.0.0.1:7702)")
     sub = ap.add_subparsers(dest="cmd", required=True)

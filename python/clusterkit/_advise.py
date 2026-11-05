@@ -1,7 +1,11 @@
 """ck.advise(fn, items): run a small sample, then say what would make the work faster (or safer) on the cluster.
 Standard library only. Every rule is a small function that reads the facts gathered once in `_facts`."""
-import ast, cProfile, inspect, math, os, pickle, pstats, statistics, sys, textwrap, time
+from __future__ import annotations
+import ast, cProfile, inspect, math, os, pickle, pstats, statistics, sys, time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from types import ModuleType
+from typing import Any, Callable
 
 # ponytail: used on Python 3.9 where sys.stdlib_module_names does not exist; unknown names count as third-party
 _STD = getattr(sys, "stdlib_module_names", None) or frozenset(
@@ -13,12 +17,22 @@ _STD = getattr(sys, "stdlib_module_names", None) or frozenset(
 _SEV = {"blocker": 0, "warn": 1, "gain": 2, "info": 3}
 
 
+@dataclass(repr=False)
 class Suggestion:
-    def __init__(self, id, title, why, hint, severity="gain", gain=None, gain_s=None, evidence=None):
-        self.id, self.title, self.why, self.hint, self.severity = id, title, why, hint, severity
-        self.gain, self.gain_s, self.evidence = gain, gain_s, evidence or {}
+    """One advisor finding: id, one-line title, why (evidence), what to try, severity (blocker|warn|gain|info), gain text and seconds."""
+    id: str
+    title: str
+    why: str
+    hint: str
+    severity: str = "gain"
+    gain: str | None = None
+    gain_s: float | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
 
-    def __str__(self):
+    def __post_init__(self) -> None:
+        self.evidence = self.evidence or {}
+
+    def __str__(self) -> str:
         out = [f"[{self.id}] {self.title}", f"    why:  {self.why}"]
         if self.gain:
             out.append(f"    gain: {self.gain}")
@@ -28,33 +42,36 @@ class Suggestion:
     __repr__ = __str__
 
 
-class Advice(list):
-    def ids(self):
+class Advice(list[Suggestion]):
+    """The ranked suggestions (a list of Suggestion); .facts has what the sample measured."""
+    facts: dict[str, Any]
+
+    def ids(self) -> list[str]:
         return [s.id for s in self]
 
-    def __str__(self):
+    def __str__(self) -> str:
         if not self:
             return "no suggestions: nothing in the sample stands out"
         return "\n\n".join(f"{i}. {s}" for i, s in enumerate(self, 1))
 
 
-def _t(s):
+def _t(s: float) -> str:
     return f"{s * 1000:.1f} ms" if s < 1 else f"{s:.1f} s" if s < 120 else f"{s / 60:.1f} min"
 
 
-def _mb(b):
+def _mb(b: float) -> str:
     return f"{b / 1048576:.1f} MB" if b >= 1 << 20 else f"{b / 1024:.1f} KB"
 
 
 # ---------------------------------------------------------------- facts
-def _same(a, b):
+def _same(a: Any, b: Any) -> bool:
     try:
         return a == b or pickle.dumps(a, 4) == pickle.dumps(b, 4)
     except Exception:
         return False
 
 
-def _fingerprint(mod):
+def _fingerprint(mod: ModuleType) -> dict[str, Any]:
     """What the module's mutable globals look like right now (to see whether fn changed them)."""
     out = {}
     for k, v in vars(mod).items():
@@ -68,11 +85,11 @@ def _fingerprint(mod):
     return out
 
 
-def _called_names(node):
+def _called_names(node: ast.AST) -> set[str]:
     return {n.func.id for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
 
 
-def _static(fn, mod):
+def _static(fn: Callable[..., Any], mod: ModuleType) -> dict[str, Any]:
     """AST facts about fn and the same-module functions it calls (3 levels): side effects, randomness, imports."""
     f = {"globals_written": set(), "writes": [], "random": [], "imports": set(), "calls": set()}
     try:
@@ -117,7 +134,7 @@ def _static(fn, mod):
                     mode = n.args[1].value if len(n.args) > 1 and isinstance(n.args[1], ast.Constant) else next(
                         (k.value.value for k in n.keywords if k.arg == "mode" and isinstance(k.value, ast.Constant)), "r")
                     if isinstance(mode, str) and set(mode) & set("wax+"):
-                        f["writes"].append("open(..., %r)" % mode)
+                        f["writes"].append(f"open(..., {mode!r})")
                 elif isinstance(fn_, ast.Attribute):
                     root = fn_.value.id if isinstance(fn_.value, ast.Name) else None
                     if root in ("os", "shutil", "subprocess", "requests") and fn_.attr in (
@@ -139,7 +156,7 @@ def _static(fn, mod):
     return f
 
 
-def _facts(fn, items, sample, ck, o):
+def _facts(fn: Callable[..., Any], items: list[Any], sample: int, ck: Any, o: dict[str, Any]) -> dict[str, Any]:
     n, k = len(items), max(1, min(sample, len(items)))
     idx = sorted({int(i * n / k) for i in range(k)})
     xs = [items[i] for i in idx]
@@ -204,7 +221,7 @@ def _facts(fn, items, sample, ck, o):
     return F
 
 
-def _picklable(x):
+def _picklable(x: Any) -> bool:
     try:
         pickle.dumps(x, 4)
         return True
@@ -212,7 +229,7 @@ def _picklable(x):
         return False
 
 
-def _hot(fn, xs, ck):
+def _hot(fn: Callable[..., Any], xs: list[Any], ck: Any) -> dict[str, Any]:
     """cProfile of a few calls: share of the time spent in the user's own Python code, and the hottest function."""
     pr, t0 = cProfile.Profile(), time.perf_counter()
     pr.enable()
@@ -237,7 +254,7 @@ def _hot(fn, xs, ck):
 
 
 # ---------------------------------------------------------------- rules (each returns a Suggestion or None)
-def _unpicklable(F):
+def _unpicklable(F: dict[str, Any]) -> Suggestion | None:
     if F.get("unpicklable_fn") or F.get("unpicklable_item") or F.get("bad_res"):
         why = F.get("unpicklable_fn") or ("an argument cannot be pickled: " + F["unpicklable_item"] if F.get("unpicklable_item")
                                            else f"a result of type {F['bad_res']} cannot be pickled")
@@ -247,13 +264,13 @@ def _unpicklable(F):
                           "blocker", "the cluster cannot run this at all until fixed (it runs locally now)", None, {"error": why})
 
 
-def _failing(F):
+def _failing(F: dict[str, Any]) -> Suggestion | None:
     if F["error"]:
         return Suggestion("raises", "fn raised on a sample item", F["error"], "run fn(items[0]) by hand and fix the error first", "blocker",
                           evidence={"error": F["error"]})
 
 
-def _tiny(F):
+def _tiny(F: dict[str, Any]) -> Suggestion | None:
     ck, o = F["ck"], F["o"]
     if F["ran"] and F["per"] < 0.005 and F["n"] >= 50:
         slots = max(F.get("slots") or 2, 2)
@@ -270,15 +287,15 @@ def _tiny(F):
                               {"per_item_s": F["per"], "n": F["n"], "batch": B, "calls": lines})
 
 
-def _big(F):
-    ck, lim = F["ck"], F["ck"]._cfg["max_item_bytes"]
+def _big(F: dict[str, Any]) -> list[Suggestion]:
+    _ck, lim = F["ck"], F["ck"]._cfg["max_item_bytes"]
     out = []
     if F["item_bytes"]:
         b = statistics.mean(F["item_bytes"])
         if b > lim / 2:
             out.append(Suggestion("big_args", f"Arguments are big ({_mb(b)} each encoded; the limit is {_mb(lim)})",
                                   f"{F['n']:,} items x {_mb(b)} = {_mb(b * F['n'])} must travel to the head and on to the PCs",
-                                  "send a path or a seed and load/generate the data inside fn:\n"
+                                  "ck.put(data) or ck.shard(path, parts=k) sends it once as a blob (cached on the PCs), or send a path or a seed and load/generate the data inside fn:\n"
                                   "ck.map(load_and_process, paths)   # paths every PC can read, or shard ids / random seeds\n"
                                   f"or raise the limit: ck admin tune max_item_bytes {int(b * 2)} and ck.config(max_item_bytes=...)", "warn",
                                   f"{_t(b * F['n'] / 20e6)} of transfer at 20 MB/s avoided", b * F["n"] / 20e6, {"item_bytes": b, "limit": lim}))
@@ -293,7 +310,7 @@ def _big(F):
     return out
 
 
-def _hot_loop(F):
+def _hot_loop(F: dict[str, Any]) -> Suggestion | None:
     p = F.get("prof")
     if p and F["per"] >= 0.0002 and p["py_share"] >= 0.5:
         total = F["n"] * F["per"]
@@ -308,7 +325,7 @@ def _hot_loop(F):
                           {"py_share": p["py_share"], "builtin_share": p["builtin_share"], "hot_function": p["top"]})
 
 
-def _threads(F):
+def _threads(F: dict[str, Any]) -> Suggestion | None:
     r, sp = F["cpu_ratio"], F.get("thread_speedup")
     if not F["ran"] or F["per"] < 0.001:
         return None
@@ -328,7 +345,7 @@ def _threads(F):
                           "info", "use processes, not threads (the SDK already does)", None, {"cpu_ratio": r, "thread_speedup": sp})
 
 
-def _memory(F):
+def _memory(F: dict[str, Any]) -> Suggestion | None:
     mb = F.get("peak_mb") or 0
     if mb >= 100:
         want = math.ceil(mb * 1.5)
@@ -340,7 +357,7 @@ def _memory(F):
                           "warn", "avoids out-of-memory kills on small PCs", None, {"peak_mb": mb, "mem_mb": want})
 
 
-def _side_effects(F):
+def _side_effects(F: dict[str, Any]) -> Suggestion | None:
     s = F["static"] or {}
     g = sorted(set(s.get("globals_written", ())) | set(F.get("globals_changed", ())))
     if g or s.get("writes"):
@@ -354,7 +371,7 @@ def _side_effects(F):
                           "correctness: results can differ from the local run", None, {"globals": g, "writes": sorted(set(s.get("writes", ())))})
 
 
-def _nondet(F):
+def _nondet(F: dict[str, Any]) -> Suggestion | None:
     s = F["static"] or {}
     if F.get("differs"):
         return Suggestion("nondeterministic", "Output differs between two runs on the same input",
@@ -368,7 +385,7 @@ def _nondet(F):
                           "pass a seed in each item and use random.Random(seed)", "info", "reproducible results", None, {"sources": s["random"]})
 
 
-def _imports(F):
+def _imports(F: dict[str, Any]) -> Suggestion | None:
     s, ck = F["static"] or {}, F["ck"]
     mod = F["mod"]
     here = os.path.dirname(os.path.abspath(getattr(mod, "__file__", "") or ""))
@@ -391,7 +408,23 @@ def _imports(F):
                           "warn" if ext or loc else "info", "avoids a failed job after the upload", None, {"third_party": ext, "local": loc})
 
 
-def _cannot_help(F):
+def _transfer(F: dict[str, Any]) -> Suggestion | None:
+    pl = F.get("plan")
+    if not pl or pl.where != "cluster" or not pl.bytes or not pl.cluster_s or pl.transfer_s < 1.0 or pl.transfer_s < 0.4 * pl.cluster_s:
+        return None
+    alt = ", ".join(f"{k} {_t(v)}" for k, v in pl.transfer_alt.items())
+    k1 = pl.finish_by_pcs.get(1)
+    return Suggestion("transfer_dominates", f"Moving the data dominates: {_t(pl.transfer_s)} of {_t(pl.cluster_s)}",
+                      f"{_mb(pl.bytes)} to move ({_mb(pl.shared_bytes)} to every PC, {_mb(pl.item_bytes)} split); strategy {pl.strategy} ({alt}); "
+                      f"estimate on {pl.pcs} PCs {_t(pl.cluster_s)}" + (f", on 1 PC {_t(k1)}" if k1 else ""),
+                      "shard it: ck.map(fn, ck.shard(path, parts=k)) so each PC gets only its part, once;\n"
+                      "cache it: ck.put(data) once and pass the handle (a PC that has the blob never fetches it again; the second run moves 0 bytes);\n"
+                      "or use fewer PCs: ck.map(fn, items, pcs=N), since every extra PC needs its own copy of shared data",
+                      "warn", f"up to {_t(pl.transfer_s)} of transfer", pl.transfer_s,
+                      {"bytes": pl.bytes, "shared_bytes": pl.shared_bytes, "transfer_s": pl.transfer_s, "cluster_s": pl.cluster_s, "strategy": pl.strategy})
+
+
+def _cannot_help(F: dict[str, Any]) -> Suggestion | None:
     ck, o = F["ck"], F["o"]
     try:
         pl = ck._plan(F["fn"], F["items"], "call", {**o, "local": "auto"}, profile=(F["per"], F.get("peak_mb") or 0.0))
@@ -413,13 +446,13 @@ def _cannot_help(F):
                       {"total_work_s": work, "need_total_s": need_w, "per_item_s": F["per"], "need_per_item_s": need_t, "local_s": pl.local_s})
 
 
-def advise(fn, items, sample, o):
+def advise(fn: Callable[..., Any], items: list[Any], sample: int, o: dict[str, Any]) -> Advice:
     import clusterkit as ck
     if not items:
         return Advice()
     F = _facts(fn, items, sample, ck, o)
     cc = _cannot_help(F) if F["ran"] else None
-    out = [r for r in (_unpicklable(F), _failing(F), _tiny(F), _hot_loop(F), _threads(F), _memory(F), _side_effects(F), _nondet(F), _imports(F), cc) if r]
+    out = [r for r in (_unpicklable(F), _failing(F), _tiny(F), _hot_loop(F), _threads(F), _memory(F), _side_effects(F), _nondet(F), _imports(F), cc, _transfer(F) if F.get('plan') else None) if r]
     out += _big(F)
     out.sort(key=lambda s: (_SEV[s.severity], -(s.gain_s or 0)))
     a = Advice(out)

@@ -1,4 +1,7 @@
 """python3 -m unittest discover -s python/tests   (offline; the head is faked, the pushed runner really runs)"""
+from __future__ import annotations
+from collections.abc import Iterator
+from typing import Any
 import io, json, os, subprocess, sys, tempfile, threading, time, unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -11,11 +14,13 @@ from clusterkit import _hist
 
 class FakeHead:
     """Stands in for _http: runs the pushed script for real, two pieces per job (like two threads), joins in order."""
-    def __init__(self, workers=None):
+    def __init__(self, workers=None) -> None:
         self.jobs, self.posted, self.hang, self.cancelled, self.polls = {}, [], False, [], 0
         self.workers = workers if workers is not None else [{"threads": 4, "mem_total": 8 << 30, "mem_used": 1 << 30, "node_id": f"n{i}"} for i in range(4)]
 
-    def __call__(self, method, path, body=None, text=False, timeout=60):
+    def __call__(self, method, path, body=None, text=False, timeout=60, raw=False, length=None) -> Any:
+        if path.startswith(("/api/v1/blobs", "/api/v1/net", "/api/v1/estimate")):  # an older head: no blob store
+            raise ck.ClusterError(f"{method} {path}: HTTP 404 not found")
         if path == "/api/v1/cluster":
             return {"workers": self.workers, "jobs": []}
         if path == "/api/v1/nodes":
@@ -182,7 +187,7 @@ class T(unittest.TestCase):
         self.assertEqual((rec["where"], rec["failed"]), ("replanned", True))
 
     def test_no_replan_when_local_is_forbidden(self):
-        self.head.hang, polls = True, []
+        self.head.hang, _polls = True, []
         ck.config(replan_min_s=0.0)
         with self.assertRaises(ck.ClusterError):
             ck.map(sdkfns.inc, range(40), local="never", timeout_s=0.3)
@@ -194,7 +199,7 @@ class T(unittest.TestCase):
         saved = ck._stream_open
         stop = threading.Event()
 
-        def fake_stream(head, token):  # like the real one: delivers the events, then stays open
+        def fake_stream(head, token) -> Iterator[bytes]:  # like the real one: delivers the events, then stays open
             yield from ev
             stop.wait(5)
         ck._stream_open = fake_stream
@@ -244,7 +249,7 @@ class T(unittest.TestCase):
         self.assertAlmostEqual(r["run_s"], 0.5)  # finished_ms - started_ms of the fake job row
 
     # ---- advisor: one fixture per rule
-    def ids(self, fn, items, **kw):
+    def ids(self, fn, items, **kw: Any) -> list[str]:
         return ck.advise(fn, items, sample=kw.pop("sample", 8), **kw).ids()
 
     def test_advise_tiny_items_and_cannot_help(self):

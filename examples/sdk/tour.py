@@ -14,7 +14,7 @@ import clusterkit as ck
 
 
 # 1. Data processing: an existing function, unchanged ------------------------------------------------
-def clean(row):
+def clean(row: str) -> dict[str, object]:
     """Parse one CSV-ish row and derive a feature. A stand-in for real per-record work."""
     name, x, y = row.split(",")
     s = 0.0
@@ -24,7 +24,7 @@ def clean(row):
 
 
 # 2. A model to tune: plain function of hyper-parameters ---------------------------------------------
-def train_and_score(lr, epochs):
+def train_and_score(lr: float, epochs: int) -> float:
     """Fit y = 3x + 1 with SGD on synthetic data; return the final squared error (lower is better)."""
     rnd = random.Random(42)
     data = [(x, 3 * x + 1 + rnd.gauss(0, 0.1)) for x in (rnd.uniform(-1, 1) for _ in range(2_000))]
@@ -38,7 +38,7 @@ def train_and_score(lr, epochs):
 
 
 # 3. Data-parallel training: one step on one shard ---------------------------------------------------
-def sgd_step(params, shard_seed):
+def sgd_step(params: dict[str, float], shard_seed: int) -> dict[str, float]:
     """Run a few SGD epochs on this PC's shard (generated from a seed, so no data is shipped)."""
     rnd = random.Random(shard_seed)
     w, b = params["w"], params["b"]
@@ -53,7 +53,7 @@ def sgd_step(params, shard_seed):
 
 
 @ck.remote  # calling it is unchanged; .map() spreads it over the cluster
-def is_prime(n):
+def is_prime(n: int) -> bool:
     if n < 2:
         return False
     return all(n % d for d in range(2, int(n ** 0.5) + 1))

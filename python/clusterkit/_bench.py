@@ -1,5 +1,7 @@
 """python -m clusterkit bench: time every overhead step of a forced-cluster job with empty work."""
-import os, statistics, subprocess, sys, tempfile, time
+from __future__ import annotations
+import os, statistics, subprocess, tempfile, time
+from typing import Any
 import clusterkit as ck
 from clusterkit import _runner, _benchfn
 
@@ -13,14 +15,14 @@ ROWS = [("encode", "encode_s", "pickle + compress the items (this PC)"),
         ("decode", "decode_s", "unpickle the results (this PC)")]
 
 
-def python_start():
+def python_start() -> tuple[float, float]:
     """Seconds to start python3 and the runner once (what each piece pays on a PC like this one)."""
     pay = ck._payload(_benchfn.noop, "call", False)
     script = f"PAYLOAD = {pay!r}\n" + open(_runner.__file__).read()
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(script)
     try:
-        def one(cmd, inp=""):
+        def one(cmd: list[str], inp: str = "") -> float:
             t = time.perf_counter()
             subprocess.run(cmd, input=inp, capture_output=True, text=True)
             return time.perf_counter() - t
@@ -31,8 +33,8 @@ def python_start():
     return bare, full
 
 
-def measure(n, batch, reps):
-    runs = []
+def measure(n: int, batch: bool, reps: int) -> dict[str, float]:
+    runs: list[dict[str, Any]] = []
     for _ in range(reps):
         o = ck._opts({"local": "never", "history": False, "batch": batch})
         items = list(range(n))
@@ -44,7 +46,7 @@ def measure(n, batch, reps):
     return {k: statistics.median(r[k] for r in runs if r.get(k) is not None) for k in keys}
 
 
-def main(sizes=(1, 100, 10000), reps=3):
+def main(sizes: tuple[int, ...] = (1, 100, 10000), reps: int = 3) -> None:
     cols = [(n, False) for n in sizes] + [(sizes[-1], True)]
     ck._stream.ensure()
     res = [measure(n, b, reps) for n, b in cols]
@@ -57,7 +59,7 @@ def main(sizes=(1, 100, 10000), reps=3):
     lines.append(["per item (us)"] + [f"{r['wall'] / n * 1e6:,.0f}" for r, (n, _) in zip(res, cols)])
     lines.append(["pieces / PCs / slots"] + [f"{r['lines']:.0f} lines / {r['pcs']:.0f} / {r['slots']:.0f}" for r in res])
     w = [max(len(l[i]) for l in lines) for i in range(len(head))]
-    print("Forced-cluster job with empty work (median of %d runs, head %s)\n" % (reps, ck._cfg["head"]))
+    print(f"Forced-cluster job with empty work (median of {reps} runs, head {ck._cfg['head']})\n")
     for i, l in enumerate(lines):
         print("  ".join(c.ljust(w[j]) if j == 0 else c.rjust(w[j]) for j, c in enumerate(l)))
         if i == 0:
@@ -79,7 +81,7 @@ def main(sizes=(1, 100, 10000), reps=3):
               f"(start_s = effective cost of one remote call per slot; python alone starts in {full * 1000:.0f} ms)")
 
 
-def _slots():
+def _slots() -> int:
     try:
         pcs, *_ = ck._cluster_view(ck._opts({}))
         return sum(t for t, _ in pcs)

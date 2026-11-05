@@ -13,3 +13,6 @@ dependencies = []
 [tool.setuptools]
 packages = ["clusterkit"]
 package-dir = {clusterkit = "."}
+
+[tool.setuptools.package-data]
+clusterkit = ["py.typed"]

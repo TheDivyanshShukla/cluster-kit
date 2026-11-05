@@ -125,6 +125,7 @@ e.g. `"lab=A !virtual"`), `local` (`auto` | `always` | `never`), `mem_mb` (per i
 | `side_effects` | AST of `fn` and same-file helpers: `global`, writes to module-level containers, file writes, `os`/`subprocess`/`requests` calls; or a module global changed during the sample | names |
 | `nondeterministic` | two runs on the same input differ (definite), or unseeded `random`/`time`/`uuid` calls (maybe) | differing items, sources |
 | `missing_imports` | imports outside the standard library (must exist on every PC), or your own modules beside the script that are not shipped; imports inside `try/except ImportError` are ignored | names |
+| `transfer_dominates` | the plan moves blobs and the transfer estimate is at least 40 % of the cluster estimate (and 1 s or more) | bytes (shared / split), strategy, estimate per PC count; try: shard, cache with `ck.put`, fewer PCs |
 | `cluster_cannot_help` | the plan is local | total work, per-item time, break-even numbers |
 
 For `examples/sdk/tour.py:clean` (1,000 rows, 20,000 sin/cos per row): `tiny_items` (109 rows per call), `hot_loop` (70 % of the time in `clean()` itself: use numpy), `gil_bound` (threads give 1.0x), `cluster_cannot_help` (about 4 s of work locally, 0.7 s with all cores; break-even: more than about 0.2 s of total work and 0.02 ms per item, which it exceeds, so the blocker is that the awake PCs add no cores beyond this machine's own on a one-box test bed).
@@ -157,3 +158,22 @@ Tour before and after, forced cluster (`local='never'`, same head, interleaved r
 2. Treat the job's `chunk` as a cap under the adaptive policy for list jobs: in `sched::chunk_len`, `let v = if fixed_chunk > 0 && p != ChunkPolicy::Fixed { v.min(fixed_chunk) } else { v };` before the final clamp. Today the chunk size comes from the PC's items-per-second on earlier jobs, so a slow list job that follows fast ones gets huge chunks (200 x 0.5 s took 28 to 48 s against about 8 s ideal; steady state 20 s). The SDK already sends `chunk` (about 1 s of work per thread, at least 3 chunks per PC).
 3. `policy: "fixed"` and `"guided"` run list jobs almost serially (96 x 0.5 s: 21 s against 8.7 s adaptive); worth a look.
 4. A content-addressed push (`cmd_ref`) so the script is uploaded once per session, not with every job.
+
+
+## 9. Bulk distribution (wave 13; design in docs/BULK.md, head API in docs/API.md "Bulk distribution")
+
+Needs a head with the blob store; with an older head every call below behaves as before (big arguments hit `max_item_bytes`, code ships inline).
+
+```python
+h = ck.put(big_table)                      # object or file path -> Handle; uploaded once, same bytes = same blob
+ck.map(score, [h] * 100)                   # fn gets the object (or, for a file, its local path on the PC)
+ck.map(count, ck.shard("/data/500mb.txt", parts=50))   # 50 line-aligned shard blobs; each goes to the PC that runs it, once
+ck.map(fn, ck.shard(rows, parts=8))        # a list: fn gets one slice
+```
+
+- **Handles in items:** an item that is a handle becomes `@blob:<sha>` (the head places by it and gives the runner a path); handles inside tuples, lists and dicts (two levels, up to 64 entries) are resolved by the runner. Blobs holding objects start with a magic header, so the runner can tell an object from a plain file.
+- **Automatic:** an argument whose pickle is over `min(blob_auto_kb, max_item_bytes)` becomes a blob (small containers are opened one level, so a big shared `params` is one blob for all items and `train` rounds do not re-send shards; big objects are remembered by identity, not re-pickled). Module-level data that `fn` reads and that is over `blob_auto_kb` goes as a blob and replaces the global after the module loads. The code (compressed sources) goes as a blob when over `code_blob_kb` (8): the pushed script is just the runner plus the sha, built and uploaded once per session; batching is a header line, so one blob serves both.
+- **Bulk results:** a result over `blob_auto_kb` is PUT to the head by the PC (payload `rb`: URL, token, limit) and the result line holds its sha; the SDK fetches them in parallel. If the PC cannot reach the head (`ck.config(result_head=...)` names the URL PCs should use) the result goes inline. `bulk_results=False` turns this off. The token is part of the pushed command in that case (visible to anyone who can read the job).
+- **Estimate:** `ck.plan()` accounts the blobs of the run: bytes used by several items (and code/data blobs) go to every PC that runs something, bytes used by one item go once; blobs some PC already caches (head `holders`) count as moved. Transfer seconds for k PCs come from `GET /api/v1/estimate?bytes=&work_s=&items=&max_pcs=k` (best strategy's `transfer_s`), asked at power-of-two k and memoised; against a head without the new form, the BULK.md formulas on `head_uplink_mbps` / node `net_mbps` from `/api/v1/net`, else the upload and download speed this SDK measured (history `where: "link"`), else an assumed 100 MB/s (the plan says "assumed link speed"). The cluster estimate per PC count includes it, so a data-heavy job picks fewer PCs. The plan has `bytes, shared_bytes, item_bytes, blobs, strategy, transfer_s, transfer_alt, finish_by_pcs, transfer_src` and `plan.transfer()` prints them.
+- **Learning:** every upload and bulk download of 256 KB or more appends bytes and seconds to the history; the learned `fixed_s` excludes the SDK's own upload and download time, so transfer is not counted twice.
+- **Typing:** the package ships `py.typed`. `ck.map(fn, items)` returns `list[R]` (or `S` with `reduce=`), `ck.put(x)` a `Handle[T]`, `@ck.remote` a `Remote[P, R]` (argument types kept on Python 3.10+), `sweep` a `list[SweepRow]`, `train` the type of `init`, `plan` a `Plan` dataclass, `advise` an `Advice` (a `list[Suggestion]`). `placement`, `priority` and `local` are `Literal` types.

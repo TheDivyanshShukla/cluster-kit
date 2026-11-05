@@ -3,7 +3,7 @@ import _path  # noqa: F401  (lets this run from a checkout without pip install)
 import clusterkit as ck
 
 
-def clean_row(line):
+def clean_row(line: str) -> dict[str, object]:
     name, age, city = [f.strip() for f in line.split(",")]
     s = 0
     for i in range(200_000):  # stand-in for real work

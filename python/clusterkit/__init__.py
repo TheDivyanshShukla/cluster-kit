@@ -1,19 +1,41 @@
 """Cluster Kit Python SDK: run ordinary Python work on the lab cluster. Standard library only. See docs/SDK.md."""
-import base64, functools, inspect, itertools, json, logging, math, os, resource, sys, threading, time, traceback, urllib.error, urllib.request, zlib
+from __future__ import annotations
+import base64, functools, itertools, json, logging, math, os, resource, sys, threading, time, urllib.error, urllib.request, zlib
 import tracemalloc
 import urllib.parse
-from . import _runner, _hist
+from dataclasses import dataclass, field
+from typing import Any, Callable, Generic, Literal, TypedDict, TypeVar, overload
+from collections.abc import Iterable, Sequence
+from . import _runner, _hist, _bulk
+from ._bulk import Handle
+from ._advise import Advice, Suggestion
 
-__all__ = ["connect", "config", "map", "remote", "sweep", "train", "plan", "advise", "mean_params", "RemoteError", "ClusterError", "Plan"]
+T = TypeVar("T")
+R = TypeVar("R")
+S = TypeVar("S")
+M = TypeVar("M")  # model parameters in train()
+Placement = Literal["auto", "spread", "pack", "fastest", "efficient"]
+Priority = Literal["urgent", "high", "normal", "low", "background"]
+LocalMode = Literal["auto", "always", "never"]
+Opts = dict[str, Any]
+if sys.version_info >= (3, 10):
+    from typing import ParamSpec
+    P = ParamSpec("P")
+else:  # Python 3.9 has no ParamSpec (and typing_extensions is not allowed): Remote keeps the result type, not the arguments
+    P = TypeVar("P")
+
+__all__ = ["connect", "config", "map", "remote", "sweep", "train", "put", "shard", "plan", "Handle", "Suggestion", "Advice", "SweepRow", "Remote", "advise", "mean_params", "RemoteError", "ClusterError", "Plan"]
 log = logging.getLogger("clusterkit")
 
-_cfg = {"head": os.environ.get("CK_HEAD", "http://127.0.0.1:7702"), "token": os.environ.get("CK_TOKEN"), "pcs": None,
+_cfg: Opts = {"head": os.environ.get("CK_HEAD", "http://127.0.0.1:7702"), "token": os.environ.get("CK_TOKEN"), "pcs": None,
         "placement": "auto", "priority": "normal", "selector": "", "local": "auto", "mem_mb": None, "timeout_s": None,
         "retries": 0, "name": None, "ship": [], "push_max_kb": 64, "max_item_bytes": 4096, "target_wall_s": 10.0,
         # self-optimizing runtime (docs/SDK.md section 6): defaults come from `python -m clusterkit bench`
         "batch": True, "batch_s": 0.5, "push": True, "adaptive": True, "replan_min_s": 2.0, "history": True,
-        "learn_last": 20, "fixed_s": 0.1, "item_c": 1e-5, "start_s": 0.03}
-_OPTS = ("pcs", "placement", "priority", "selector", "local", "mem_mb", "timeout_s", "retries", "name", "batch", "adaptive", "history")
+        "learn_last": 20, "fixed_s": 0.1, "item_c": 1e-5, "start_s": 0.03,
+        # bulk distribution (docs/BULK.md): blob_auto_kb mirrors the head knob of the same name; result_head is how the PCs reach the head
+        "bulk": True, "blob_per_chunk": False, "blob_auto_kb": 64, "code_blob_kb": 8, "bulk_results": True, "result_head": None}
+_OPTS = ("pcs", "placement", "priority", "selector", "local", "mem_mb", "timeout_s", "retries", "name", "batch", "adaptive", "history", "blob_per_chunk", "bulk")
 
 
 class ClusterError(Exception):
@@ -23,25 +45,32 @@ class ClusterError(Exception):
 class RemoteError(Exception):
     """fn raised on a PC; .remote_traceback has the traceback from there."""
 
-    def __init__(self, tb):
+    def __init__(self, tb: str) -> None:
         super().__init__("remote call failed:\n" + tb)
         self.remote_traceback = tb
 
 
-def connect(head=None, token=None):
+def connect(head: str | None = None, token: str | None = None) -> None:
     _cfg["head"] = (head or _cfg["head"]).rstrip("/")
     if token is not None:
         _cfg["token"] = token
 
 
-def config(**kw):
+def config(*, placement: Placement | None = None, priority: Priority | None = None, local: LocalMode | None = None, **kw: Any) -> None:
+    """Set session defaults (any option of docs/SDK.md section 1)."""
+    kw = _lit(kw, placement, priority, local)
     bad = set(kw) - set(_cfg)
     if bad:
         raise TypeError("unknown option(s): " + ", ".join(sorted(bad)))
     _cfg.update(kw)
 
 
-def _opts(kw):
+def _lit(kw: dict[str, Any], placement: str | None, priority: str | None, local: str | None) -> dict[str, Any]:
+    """The three Literal-typed options, folded into the keyword options."""
+    return {**kw, **{k: v for k, v in (("placement", placement), ("priority", priority), ("local", local)) if v is not None}}
+
+
+def _opts(kw: dict[str, Any]) -> Opts:
     bad = set(kw) - set(_OPTS)
     if bad:
         raise TypeError("unknown option(s): " + ", ".join(sorted(bad)))
@@ -49,10 +78,14 @@ def _opts(kw):
 
 
 # ---------------------------------------------------------------- HTTP
-def _http(method, path, body=None, text=False, timeout=60):
-    req = urllib.request.Request(_cfg["head"] + path, method=method, data=None if body is None else json.dumps(body).encode())
+def _http(method: str, path: str, body: Any = None, text: bool = False, timeout: float = 60, raw: bool = False, length: int | None = None) -> Any:
+    """JSON in/out. A bytes (or file-like, with length=) body is sent as is (blob upload); raw=True returns bytes; HEAD returns {}."""
+    blob = isinstance(body, (bytes, bytearray)) or hasattr(body, "read")
+    req = urllib.request.Request(_cfg["head"] + path, method=method, data=body if blob else None if body is None else json.dumps(body).encode())
     if body is not None:
-        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Type", "application/octet-stream" if blob else "application/json")
+        if hasattr(body, "read"):
+            req.add_header("Content-Length", str(length))
     if _cfg["token"]:
         req.add_header("Authorization", "Bearer " + _cfg["token"])
     try:
@@ -62,11 +95,13 @@ def _http(method, path, body=None, text=False, timeout=60):
         raise ClusterError(f"{method} {path}: HTTP {e.code} {e.read()[:300].decode(errors='replace')}") from None
     except OSError as e:
         raise ClusterError(f"cannot reach the head at {_cfg['head']} ({e}); call ck.connect(url) or set CK_HEAD") from None
-    return data.decode() if text else json.loads(data)
+    if raw:
+        return data
+    return {} if method == "HEAD" else data.decode() if text else json.loads(data)
 
 
 # ---------------------------------------------------------------- code shipping
-def _describe(fn):
+def _describe(fn: Callable[..., Any]) -> tuple[str, str, str]:
     """(module name, module source, attr path) for a function the PCs can re-import, or raise ValueError."""
     fn = getattr(fn, "_ck_fn", fn)
     q = getattr(fn, "__qualname__", "")
@@ -82,21 +117,21 @@ def _describe(fn):
     return name, src, q
 
 
-def _payload(fn, mode, batch=False):
+def _payload(fn: Callable[..., Any], mode: str, batch: bool = False, gl: dict[str, str] | None = None, rb: dict[str, Any] | None = None) -> str:
     name, src, q = _describe(fn)
     mods = []
     for p in _cfg["ship"]:
         with open(p, encoding="utf-8") as f:
             mods.append([os.path.splitext(os.path.basename(p))[0], f.read()])
     mods.append([name, src])
-    raw = json.dumps({"mods": mods, "main": name, "attr": q, "mode": mode, "batch": batch}).encode()
+    raw = json.dumps({"mods": mods, "main": name, "attr": q, "mode": mode, "batch": batch, **({"gl": gl} if gl else {}), **({"rb": rb} if rb else {})}).encode()
     return base64.b64encode(zlib.compress(raw, 9)).decode()
 
 
-def _cmd(payload):
+def _cmd(payload: str, sha: str | None = None, batch: bool = False) -> str:
     with open(_runner.__file__, encoding="utf-8") as f:
         runner = f.read()
-    script = f"PAYLOAD = {payload!r}\n" + runner
+    script = f"BATCH = {batch!r}\n" + (f"PAYLOAD_BLOB = {sha!r}\n" if sha else f"PAYLOAD = {payload!r}\n") + runner
     limit = _cfg["push_max_kb"] * 1024
     if len(script) > limit:
         raise ClusterError(f"the shipped code is {len(script)} bytes, over the push limit of {limit}; "
@@ -104,11 +139,36 @@ def _cmd(payload):
     return "\x01PUSH\npython3\nck_runner.py\n" + script
 
 
-_cmds = {}
+_cmds: dict[Any, Any] = {}
+_self = sys.modules[__name__]
 
 
-def _cmd_for(fn, mode, batch):
-    """The pushed command for fn, built once per session (until the source file changes). Returns (cmd, build seconds)."""
+def _big_globals(fn: Callable[..., Any], thr: int) -> dict[str, Handle[Any]]:
+    """Module-level data fn reads (not functions/classes/modules) whose pickle is over thr: {name: Handle}."""
+    out: dict[str, Handle[Any]] = {}
+    names: set[str] = set()
+    stack: list[Any] = [getattr(fn, "__code__", None)]
+    while stack:
+        c = stack.pop()
+        if c is not None:
+            names |= set(c.co_names)
+            stack += [k for k in c.co_consts if hasattr(k, "co_names")]
+    g = getattr(fn, "__globals__", {})
+    for n in sorted(names):
+        v = g.get(n)
+        if v is None or callable(v) or isinstance(v, type(sys)) or type(v) in (int, float, bool):
+            continue
+        try:
+            if _bulk._size(v) > thr:
+                out[n] = _bulk.from_obj(v)
+        except Exception:
+            pass
+    return out
+
+
+def _cmd_for(fn: Callable[..., Any], mode: str, batch: bool) -> tuple[str, float, list[Handle[Any]]]:
+    """The pushed command for fn, built once per session (until the source file changes). Returns (cmd, build seconds, blob handles).
+    With a head that has a blob store: big module-level data and code over code_blob_kb travel as blobs; results above blob_auto_kb come back as blobs."""
     t0 = time.perf_counter()
     fn = getattr(fn, "_ck_fn", fn)
     p = getattr(sys.modules.get(fn.__module__), "__file__", None)
@@ -117,35 +177,76 @@ def _cmd_for(fn, mode, batch):
         stamp = (st.st_mtime_ns, st.st_size)
     except (OSError, TypeError):
         stamp = None
-    key = (p, stamp, fn.__qualname__, mode, batch, tuple(_cfg["ship"]), _cfg["push_max_kb"])
+    key = (p, stamp, fn.__qualname__, mode, tuple(_cfg["ship"]), _cfg["push_max_kb"], _cfg["head"],
+           _cfg["bulk"], _cfg["blob_auto_kb"], _cfg["code_blob_kb"], _cfg["bulk_results"], _cfg["result_head"], _cfg["token"])
     if stamp and key in _cmds:
-        return _cmds[key], 0.0
-    cmd = _cmd(_payload(fn, mode, batch))
+        return _cmd(*_cmds[key][:2], batch), 0.0, _cmds[key][2]
+    gl: dict[str, str] | None = None
+    hs: list[Handle[Any]] = []
+    rb: dict[str, Any] | None = None
+    sha: str | None = None
+    if _cfg["bulk"] and _bulk.supported(_self):
+        big = _big_globals(fn, _cfg["blob_auto_kb"] * 1024)
+        gl, hs = {n: h.sha for n, h in big.items()}, list(big.values())
+        # Never embed a user API token in a job (job args are visible to viewers, stored and logged): bulk results
+        # are only used on an open head until the head issues job-scoped upload capabilities (docs/BULK.md).
+        if _cfg["bulk_results"] and not _cfg["token"]:
+            rb = {"url": (_cfg["result_head"] or _cfg["head"]).rstrip("/"), "token": _cfg["token"], "kb": _cfg["blob_auto_kb"]}
+    payload = _payload(fn, mode, False, gl, rb)  # batching is a header line of the script, so one payload (and one code blob) serves both
+    if _cfg["bulk"] and _bulk._ok.get(_cfg["head"]) and len(payload) > _cfg["code_blob_kb"] * 1024:
+        hs.append(_bulk.from_bytes(payload.encode()))
+        sha = hs[-1].sha
+    cmd = _cmd(payload, sha, batch)
     if stamp:
-        _cmds[key] = cmd
-    return cmd, time.perf_counter() - t0
+        _cmds[key] = (payload, sha, hs)
+    return cmd, time.perf_counter() - t0, hs
 
 
-def _encode(items):
-    lines = [_runner.enc(x) for x in items]
+def _encode(items: Sequence[Any]) -> list[str]:
+    lines = [("@blob:" + x.sha) if isinstance(x, _bulk.Handle) else _runner.enc(x) for x in items]  # the head swaps `@blob:` for a path, and places by it
     lim = _cfg["max_item_bytes"]
     for i, s in enumerate(lines):
         if len(s) > lim:
             raise ClusterError(f"item {i} is {len(s)} bytes encoded, over max_item_bytes={lim}; raise it with "
                                f"`ck admin tune max_item_bytes {len(s) + 64}` and ck.config(max_item_bytes=...), "
-                               "or pass paths every PC can read instead of the data itself")
+                               "or pass paths every PC can read instead of the data itself, or ck.put(data) / ck.shard(path, parts=k) "
+                               "(a head with a blob store sends big arguments as blobs by itself)")
     return lines
 
 
+@overload
+def put(x: os.PathLike[str]) -> Handle[str]: ...
+@overload
+def put(x: T) -> Handle[T]: ...
+def put(x: Any) -> Handle[Any]:
+    """Upload x (an object, or a file path) to the head once and return a Handle. Same bytes twice are one blob. Use the handle in
+    items or arguments: fn receives the object, or the local file path for a file."""
+    h = _bulk.make(x)
+    _bulk.upload([h], _self)
+    return h
+
+
+@overload
+def shard(src: str | os.PathLike[str], parts: int) -> list[Handle[str]]: ...
+@overload
+def shard(src: Iterable[T], parts: int) -> list[Handle[list[T]]]: ...
+def shard(src: Any, parts: int) -> list[Handle[Any]]:
+    """Split a file (at line ends) or a list into `parts` blobs and return their handles: ck.map(fn, ck.shard(path, 50)).
+    fn gets the path of one shard file (or one slice of the list); each shard travels to the PC that runs it, once."""
+    hs = _bulk.shard(src, parts)
+    _bulk.upload(hs, _self)
+    return hs
+
+
 # ---------------------------------------------------------------- local execution
-_G = None
+_G: Any = None
 
 
-def _lw(x):
+def _lw(x: Any) -> Any:
     return _runner.apply(_G[0], _G[1], x)
 
 
-def _local(fn, mode, items, procs=1):
+def _local(fn: Callable[..., Any], mode: str, items: list[Any], procs: int = 1) -> list[Any]:
     global _G
     fn = getattr(fn, "_ck_fn", fn)
     if procs > 1 and len(items) > 1:
@@ -160,21 +261,62 @@ def _local(fn, mode, items, procs=1):
 
 
 # ---------------------------------------------------------------- plan
+@dataclass(repr=False, eq=False)
 class Plan:
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
+    """What the optimizer decided and why (ck.plan). Time fields are seconds; bytes fields are data moved as blobs."""
+    n: int = 0
+    item_s: float = 0.0
+    mem_mb: int = 1
+    local_s: float = 0.0
+    local_procs: int = 1
+    cluster_s: float | None = None
+    pcs: int = 0
+    where: Literal["local", "cluster"] = "local"
+    placement: str = "auto"
+    priority: str = "normal"
+    reasons: list[str] = field(default_factory=list)
+    profile: tuple[float, float] = (0.0, 0.0)
+    batch: int = 1
+    learned: bool = False
+    model: dict[str, Any] | None = None
+    slots: int = 0
+    all_slots: int = 0
+    bytes: int = 0
+    shared_bytes: int = 0
+    item_bytes: int = 0
+    blobs: int = 0
+    strategy: str | None = None
+    transfer_s: float = 0.0
+    transfer_alt: dict[str, float] = field(default_factory=dict)
+    finish_by_pcs: dict[int, float] = field(default_factory=dict)
+    transfer_src: str | None = None
+    code_handles: list[Any] = field(default_factory=list)
 
-    def __str__(self):
+    def __str__(self) -> str:
         t = lambda s: f"{s:.1f} s" if s < 120 else f"{s / 60:.1f} min"
         head = (f"{self.n:,} items x {self.item_s:.3g} s: " +
                 (f"cluster, {self.pcs} PCs, about {t(self.cluster_s)} (local: {t(self.local_s)})" if self.where == "cluster"
                  else f"local, about {t(self.local_s)} (cluster: {t(self.cluster_s) if self.cluster_s else 'n/a'})"))
         return head + "".join("; " + r for r in self.reasons)
 
+    def transfer(self) -> str:
+        """One line on the data movement: bytes, strategy, estimate per PC count."""
+        if not self.bytes:
+            return "no blobs"
+        t = lambda s: f"{s:.1f} s" if s < 120 else f"{s / 60:.1f} min"
+        alt = ", ".join(f"{k} {t(v)}" for k, v in self.transfer_alt.items())
+        return (f"{_bulk_mb(self.bytes)} to move ({_bulk_mb(self.shared_bytes)} to every PC, {_bulk_mb(self.item_bytes)} split over the PCs): "
+                f"{self.strategy}, about {t(self.transfer_s)} on {self.pcs or 'the chosen'} PCs ({alt}); finish by PC count: "
+                + ", ".join(f"{k}: {t(v)}" for k, v in self.finish_by_pcs.items()) + f" [{self.transfer_src}]")
+
     __repr__ = __str__
 
 
-def _profile(fn, mode, items):
+def _bulk_mb(b: float) -> str:
+    return f"{b / 1e9:.2f} GB" if b >= 1e9 else f"{b / 1e6:.1f} MB" if b >= 1e5 else f"{b / 1e3:.1f} KB"
+
+
+def _profile(fn: Callable[..., Any], mode: str, items: list[Any]) -> tuple[float, float]:
     n = len(items)
     k = max(3, math.ceil(n * 0.01))
     t0, done = time.perf_counter(), 0
@@ -197,7 +339,7 @@ def _profile(fn, mode, items):
     return per, max(peak, rss) / 1048576
 
 
-def _cluster_view(o):
+def _cluster_view(o: Opts) -> tuple[list[tuple[int, float | None]], int, float, int]:
     """[(threads, free_mb)] of usable PCs, asleep count, rtt seconds, queue note."""
     t0 = time.perf_counter()
     c = _http("GET", "/api/v1/cluster", timeout=10)
@@ -225,7 +367,7 @@ def _cluster_view(o):
     return pcs, asleep, rtt, len(c.get("jobs") or ([c["job"]] if c.get("job") else []))
 
 
-def _model(o, rtt):
+def _model(o: Opts, rtt: float) -> dict[str, Any]:
     """Overhead constants for the estimate: learned from history.jsonl when there is enough of it, else the defaults."""
     m = _hist.fit(_cfg["head"], o["learn_last"]) if o["history"] else None
     d = {"fixed_s": o["fixed_s"] + 2 * rtt, "item_c": o["item_c"], "speed": 1.0, "runs": 0, "learned": False}
@@ -237,23 +379,24 @@ def _model(o, rtt):
     return d
 
 
-def _batch_size(per, n, slots, o):
+def _batch_size(per: float, n: int, slots: int, o: Opts) -> int:
     """Items per remote call: about batch_s of work each, but at least ~2 calls per slot so every slot stays busy."""
     if not o["batch"] or n < 2 or per <= 0:
         return 1
     return max(1, min(round(o["batch_s"] / per), math.ceil(n / (2 * max(slots, 1)))))
 
 
-def _plan(fn, items, mode, o, profile=None):
+def _plan(fn: Callable[..., Any], items: list[Any], mode: str, o: Opts, profile: tuple[float, float] | None = None) -> Plan:
     n = len(items)
     per, peak_mb = profile or (_profile(fn, mode, items) if n else (0.0, 0.0))
     cpus = os.cpu_count() or 1
     procs = min(cpus, n) if per * n > 1.0 else 1
     local_s = n * per / procs + (0.2 if procs > 1 else 0)
     mem_mb = o["mem_mb"] or max(1, math.ceil(peak_mb * 1.5))
-    p = dict(n=n, item_s=per, mem_mb=mem_mb, local_s=local_s, local_procs=procs, cluster_s=None, pcs=0, where="local",
+    p: dict[str, Any] = dict(n=n, item_s=per, mem_mb=mem_mb, local_s=local_s, local_procs=procs, cluster_s=None, pcs=0, where="local",
              placement=o["placement"], priority=o["priority"], reasons=[], profile=(per, peak_mb), batch=1, learned=False,
-             model=None, slots=0, all_slots=0)
+             model=None, slots=0, all_slots=0, bytes=0, shared_bytes=0, item_bytes=0, blobs=0, strategy=None, transfer_s=0.0,
+             transfer_alt={}, finish_by_pcs={}, transfer_src=None, code_handles=[])
     if o["local"] == "always" or (n < 2 and o["local"] != "never"):
         p["reasons"].append("local forced" if o["local"] == "always" else "one item")
         return Plan(**p)
@@ -272,9 +415,22 @@ def _plan(fn, items, mode, o, profile=None):
     conc = sorted((min(th, int(free * 0.8 // mem_mb)) if free is not None else th for th, free in pcs), reverse=True)
     conc = [c for c in conc if c > 0]
     p["all_slots"] = sum(conc)
-    def cost(k):  # fixed + per item + compute spread over the slots + one python start per remote call
+    xf = None
+    if o["bulk"] and _bulk.supported(_self):  # data movement: the blobs this run needs (code, big data, shards) and what it costs
+        try:
+            p["code_handles"] = _cmd_for(fn, mode, False)[2]
+        except (ClusterError, ValueError, OSError):
+            pass
+        if p["code_handles"] or any(_bulk.find(x) for x in items):
+            sh, pi, p["blobs"] = _bulk.account(items, p["code_handles"], _bulk.holders(_self), o["blob_per_chunk"])
+            p.update(shared_bytes=sh, item_bytes=pi, bytes=sh + pi)
+            if sh + pi:
+                xf = _bulk.Xfer(_self, o, sh, pi, n * per / m["speed"], n, len(conc))
+
+    def cost(k: int) -> float:  # fixed + per item + compute spread over the slots + one python start per remote call + moving the data
         sl = sum(conc[:k])
-        return m["fixed_s"] + n * m["item_c"] + (n * per + math.ceil(n / _batch_size(per, n, sl, o)) * o["start_s"]) / (m["speed"] * sl)
+        return (m["fixed_s"] + n * m["item_c"] + (n * per + math.ceil(n / _batch_size(per, n, sl, o)) * o["start_s"]) / (m["speed"] * sl)
+                + (xf.at(k)[0] if xf else 0.0))
     best_k, best_t, prev = 0, float("inf"), float("inf")
     for k in range(1, len(conc) + 1):
         t = cost(k)
@@ -289,6 +445,12 @@ def _plan(fn, items, mode, o, profile=None):
         best_k = min(o["pcs"], len(conc)) or best_k
         best_t = cost(best_k) if best_k else best_t
     p["cluster_s"] = best_t if best_k else None
+    if xf and best_k:
+        p["transfer_s"], p["strategy"], p["transfer_alt"] = xf.at(best_k)
+        p["transfer_src"] = xf.source + (f", assumed {', '.join(xf.assumed)}" if xf.assumed else "")
+        p["finish_by_pcs"] = {k: cost(k) for k in sorted({k for k in (1, 2, 4, 8, 16, 32, 64, 128, 256) if k < best_k} | {best_k})}
+        p["reasons"].append(f"data {_bulk_mb(p['bytes'])}: {p['strategy']}, transfer about {p['transfer_s']:.1f} s"
+                            + (" (" + ", ".join(f"{k} {v:.1f} s" for k, v in p["transfer_alt"].items() if k != p["strategy"]) + " otherwise)" if len(p["transfer_alt"]) > 1 else ""))
     if not best_k:
         p["reasons"].append(f"no awake PC has room for {mem_mb} MB per item" if pcs else "no awake PCs")
         if o["local"] == "never":
@@ -311,23 +473,33 @@ def _plan(fn, items, mode, o, profile=None):
     return Plan(**p)
 
 
-def plan(fn, items, **kw):
+def _prep(items: list[Any], o: Opts) -> list[Any]:
+    """Big arguments become handles (not uploaded yet) when the head has a blob store."""
+    if o["bulk"] and o["local"] != "always" and not os.environ.get("CK_JOB") and len(items) > 0 and _bulk.supported(_self):
+        return _bulk.prepare(items, min(o["blob_auto_kb"] * 1024, _cfg["max_item_bytes"]))
+    return items
+
+
+def plan(fn: Callable[..., Any], items: Iterable[Any], *, placement: Placement | None = None, priority: Priority | None = None,
+         local: LocalMode | None = None, **kw: Any) -> Plan:
     """What the optimizer would do and why, without running the work."""
-    items = list(items)
-    return _plan(getattr(fn, "_ck_fn", fn), items, "call", _opts(kw))
+    o = _opts(_lit(kw, placement, priority, local))
+    items = _prep(list(items), o)
+    return _plan(getattr(fn, "_ck_fn", fn), items, "call", o)
 
 
-def advise(fn, items, sample=20, **kw):
+def advise(fn: Callable[..., Any], items: Iterable[Any], sample: int = 20, *, placement: Placement | None = None,
+           priority: Priority | None = None, local: LocalMode | None = None, **kw: Any) -> Advice:
     """Ranked suggestions to make fn faster on the cluster (or to tell you it cannot help). See docs/SDK.md section 7."""
     from . import _advise
-    return _advise.advise(getattr(fn, "_ck_fn", fn), list(items), sample, _opts(kw))
+    return _advise.advise(getattr(fn, "_ck_fn", fn), list(items), sample, _opts(_lit(kw, placement, priority, local)))
 
 
 # ---------------------------------------------------------------- results pushed by the head (SSE), polling as the fallback
 _TERMINAL = ("done", "failed", "cancelled")
 
 
-def _stream_open(head, token):
+def _stream_open(head: str, token: str | None) -> Any:
     req = urllib.request.Request(head + "/api/v1/stream", headers={"Accept": "text/event-stream"})
     if token:
         req.add_header("Authorization", "Bearer " + token)
@@ -337,11 +509,16 @@ def _stream_open(head, token):
 class _Stream:
     """One background connection to /api/v1/stream per session; keeps the newest JobRow of every job it sees."""
 
-    def __init__(self):
-        self.cv, self.rows, self.live, self.gen, self.head = threading.Condition(), {}, False, 0, None
-        self.arrived, self.wins, self.judge = {}, [], None
+    def __init__(self) -> None:
+        self.cv, self.live, self.gen = threading.Condition(), False, 0
+        self.rows: dict[Any, dict[str, Any]] = {}
+        self.head: str | None = None
+        self.arrived: dict[Any, float] = {}
+        self.wins: list[bool] = []
+        self.judge: tuple[Any, float] | None = None
+        self.thread: threading.Thread | None = None
 
-    def trusted(self):
+    def trusted(self) -> bool:
         """Do pushed events beat a poll? Judged on the last runs: a head that buffers its stream (as today's does, up to
         2 s) loses, so we keep polling fast; a head that flushes each event wins, and polling drops to a 3 s safety net."""
         if self.judge:
@@ -352,7 +529,7 @@ class _Stream:
             del self.wins[:-5]
         return len(self.wins) >= 3 and sum(self.wins) >= 3
 
-    def ensure(self):
+    def ensure(self) -> bool:
         if not _cfg["push"]:
             return False
         if self.head != _cfg["head"] or not getattr(self, "thread", None) or not self.thread.is_alive():
@@ -361,7 +538,7 @@ class _Stream:
             self.thread.start()
         return self.live  # never waits: until the stream is connected (the head may send its headers late), polling covers
 
-    def _run(self, head, gen):
+    def _run(self, head: str, gen: int) -> None:
         while self.gen == gen:
             try:
                 r = _stream_open(head, _cfg["token"])
@@ -396,14 +573,14 @@ class _Stream:
 
 
 _stream = _Stream()
-_last = {}  # plan, timings and wall time of the latest cluster run (python -m clusterkit bench reads it)
+_last: dict[str, Any] = {}  # plan, timings and wall time of the latest cluster run (python -m clusterkit bench reads it)
 
 
 class _Replan(Exception):
     pass
 
 
-def _await(jid, timeout_s, check=None, st=None):
+def _await(jid: int, timeout_s: float | None, check: Callable[[dict[str, Any], float], None] | None = None, st: dict[str, Any] | None = None) -> dict[str, Any]:
     """Wait for the job; returns its final row. Events from the stream wake us at once; without a live stream, poll."""
     t0, delay, polled = time.time(), 0.03, time.time()
     safety = 3.0 if _stream.live and _cfg["push"] and _stream.trusted() else None
@@ -443,11 +620,11 @@ def _await(jid, timeout_s, check=None, st=None):
 
 
 # ---------------------------------------------------------------- run
-def _groups(items, size, limit):
+def _groups(items: Sequence[Any], size: int, limit: int) -> list[str]:
     """Batches of up to `size` items, each encoded as one list item <= limit bytes (split in half when too big)."""
-    out = []
+    out: list[str] = []
 
-    def put(chunk):
+    def put(chunk: Sequence[Any]) -> None:
         s = _runner.enc(chunk)
         if len(s) > limit and len(chunk) > 1:
             h = len(chunk) // 2
@@ -465,15 +642,20 @@ def _groups(items, size, limit):
     return out
 
 
-def _submit(fn, mode, items, pl, o, st):
+def _submit(fn: Callable[..., Any], mode: str, items: list[Any], pl: Plan, o: Opts, st: dict[str, Any]) -> int:
     t0 = time.perf_counter()
     batch = pl.batch > 1
     lines = _groups(items, pl.batch, _cfg["max_item_bytes"]) if batch else _encode(items)
     st["encode_s"] = time.perf_counter() - t0
-    cmd, st["ship_s"] = _cmd_for(fn, mode, batch)
+    cmd, st["ship_s"], code_hs = _cmd_for(fn, mode, batch)
     st["cmd_bytes"] = len(cmd)
+    hs = {h.sha: h for x in items for h in _bulk.find(x)}
+    hs.update({h.sha: h for h in code_hs})
+    st["up_bytes"], st["up_s"] = _bulk.upload(list(hs.values()), _self) if hs else (0, 0.0)
     body = {"kind": "list", "cmd": cmd, "items": lines, "name": o["name"] or f"sdk:{fn.__name__}",
             "priority": o["priority"], "max_pcs": pl.pcs, "placement": pl.placement, "mem_mb": pl.mem_mb}
+    if hs:
+        body["blobs"] = list(hs)
     # Chunk size cap: about 1 s of work per thread and at least 3 chunks per PC. Today's head ignores `chunk` under the default
     # adaptive policy (it sizes chunks from the PCs' rate on earlier jobs, which hands a PC far too many slow items after fast
     # ones); a head that treats it as a cap fixes that (docs/SDK.md section 8). Never use policy fixed/guided: measured 2-3x slower.
@@ -488,12 +670,12 @@ def _submit(fn, mode, items, pl, o, st):
     return jid
 
 
-def _checker(pl, o, items, st):
+def _checker(pl: Plan, o: Opts, items: list[Any], st: dict[str, Any]) -> Callable[[dict[str, Any], float], None]:
     """Called while the job runs: finish locally when the cluster is losing (actual progress vs the plan)."""
     local_ok = o["adaptive"] and o["local"] != "never" and not os.environ.get("CK_JOB")
     n = len(items)
 
-    def check(row, elapsed):
+    def check(row: dict[str, Any], elapsed: float) -> None:
         total, done = row.get("total") or n, row.get("done") or 0
         if not local_ok or elapsed < o["replan_min_s"]:
             return
@@ -508,7 +690,7 @@ def _checker(pl, o, items, st):
     return check
 
 
-def _cluster_run(fn, mode, items, pl, o, st):
+def _cluster_run(fn: Callable[..., Any], mode: str, items: list[Any], pl: Plan, o: Opts, st: dict[str, Any]) -> list[Any]:
     st.update(attempts=0)
     _stream.ensure()
     for attempt in range(o["retries"] + 1):
@@ -540,13 +722,25 @@ def _cluster_run(fn, mode, items, pl, o, st):
     if len(lines) != st["lines"]:
         raise ClusterError(f"job {jid} returned {len(lines)} results for {st['lines']} items")
     t0 = time.perf_counter()
-    out = []
+    out: list[Any] = []
+    big: dict[str, list[int]] = {}
     for l in lines:
         r = _runner.dec(l)
         for tag, v in (r if pl.batch > 1 and isinstance(r, list) else [r]):  # a failed batch line is a lone ("err", tb)
             if tag == "err":
                 raise RemoteError(v)
+            if tag == "blob":  # a big result the PC left on the head: fetched below, all in parallel
+                big.setdefault(v, []).append(len(out))
+                v = None
             out.append(v)
+    if big:
+        t1 = time.perf_counter()
+        got = _bulk.fetch_all(list(big), _self)
+        for sha, idx in big.items():
+            v = _runner.dec(got[sha].decode())
+            for i in idx:
+                out[i] = v
+        st["down_bytes"], st["down_s"] = sum(map(len, got.values())), time.perf_counter() - t1
     st["decode_s"] = time.perf_counter() - t0
     if len(out) != len(items):
         raise ClusterError(f"job {jid} returned {len(out)} results for {len(items)} items")
@@ -554,7 +748,7 @@ def _cluster_run(fn, mode, items, pl, o, st):
     return out
 
 
-def _learn(st, pl, n, actual, where, o, fn):
+def _learn(st: dict[str, Any], pl: Plan, n: int, actual: float, where: str, o: Opts, fn: Callable[..., Any]) -> None:
     """Append predicted vs actual to history.jsonl (the next plan() fits its constants from it)."""
     if not o["history"]:
         return
@@ -567,7 +761,10 @@ def _learn(st, pl, n, actual, where, o, fn):
                    ship_s=round(st["ship_s"], 4), detect_s=round(st["detect_s"], 3) if st.get("detect_s") is not None else None,
                    fetch_s=round(st["fetch_s"], 3), decode_s=round(st["decode_s"], 3), encode_s=round(st["encode_s"], 3),
                    item_c=round(item_c, 7), push=st.get("push"),
-                   fixed_s=round(max(0.0, actual - st["run_s"] - n * item_c), 3))
+                   fixed_s=round(max(0.0, actual - st["run_s"] - n * item_c - st.get("up_s", 0.0) - st.get("down_s", 0.0)), 3))
+        if pl.bytes:  # predicted vs measured data movement: the uploads to the head (the PCs' side shows up in queue_s)
+            rec.update(bytes=pl.bytes, xfer_pred_s=round(pl.transfer_s, 3), strategy=pl.strategy, up_bytes=st.get("up_bytes", 0),
+                       up_s=round(st.get("up_s", 0.0), 3), queue_s=round(st["queue_s"], 3))
         if pl.slots and pl.item_s > 0:
             rec["speed"] = round(n * pl.item_s / (max(st["run_s"], 1e-6) * pl.slots), 4)  # per-slot throughput vs this PC
     elif where == "replanned":
@@ -578,7 +775,7 @@ def _learn(st, pl, n, actual, where, o, fn):
     _hist.record(rec)
 
 
-def _run(fn, mode, items, o, pl=None, learn=True):
+def _run(fn: Callable[..., Any], mode: str, items: list[Any], o: Opts, pl: Plan | None = None, learn: bool = True) -> list[Any]:
     fn = getattr(fn, "_ck_fn", fn)
     if os.environ.get("CK_JOB"):  # already on a PC (the user's module ran this call at import): never recurse
         return _local(fn, mode, items)
@@ -591,8 +788,11 @@ def _run(fn, mode, items, o, pl=None, learn=True):
             raise ClusterError(str(e)) from None
         log.info("running locally: %s", e)
         return _local(fn, mode, items, os.cpu_count() or 1)
+    items = _prep(items, o)
     pl = pl or _plan(fn, items, mode, o)
     log.info("%s", pl)
+    if pl.bytes:
+        log.info("data: %s", pl.transfer())
     global _last
     t0, st = time.perf_counter(), {}
     _last = {"plan": pl, "st": st}
@@ -613,42 +813,81 @@ def _run(fn, mode, items, o, pl=None, learn=True):
     return out
 
 
-def map(fn, items, reduce=None, **kw):
+@overload
+def map(fn: Callable[[T], R], items: Iterable[T | Handle[T]], reduce: None = None, *, placement: Placement | None = None,
+        priority: Priority | None = None, local: LocalMode | None = None, **kw: Any) -> list[R]: ...
+@overload
+def map(fn: Callable[[T], R], items: Iterable[T | Handle[T]], reduce: Callable[[list[R]], S], *, placement: Placement | None = None,
+        priority: Priority | None = None, local: LocalMode | None = None, **kw: Any) -> S: ...
+def map(fn: Callable[[Any], Any], items: Iterable[Any], reduce: Callable[[list[Any]], Any] | None = None, *, placement: Placement | None = None,
+        priority: Priority | None = None, local: LocalMode | None = None, **kw: Any) -> Any:
     """Same results, same order as [fn(x) for x in items]; runs on the cluster when that is faster."""
     items = list(items)
-    out = _run(fn, "call", items, _opts(kw))
+    out = _run(fn, "call", items, _opts(_lit(kw, placement, priority, local)))
     return reduce(out) if reduce else out
 
 
-class _Remote:
-    def __init__(self, fn, kw):
-        self._ck_fn, self._kw = fn, kw
-        functools.update_wrapper(self, fn)
+if sys.version_info >= (3, 10):
+    class Remote(Generic[P, R]):
+        """What @ck.remote returns: calling it is the plain function (same arguments and result types); .map(items) uses the cluster."""
 
-    def __call__(self, *a, **k):
-        return self._ck_fn(*a, **k)
+        def __init__(self, fn: Callable[P, R], kw: dict[str, Any]) -> None:
+            self._ck_fn, self._kw = fn, kw
+            functools.update_wrapper(self, fn)
 
-    def map(self, items, **kw):
-        return map(self._ck_fn, items, **{**self._kw, **kw})
+        def __call__(self, *a: P.args, **k: P.kwargs) -> R:
+            return self._ck_fn(*a, **k)
+
+        def map(self, items: Iterable[Any], *, placement: Placement | None = None, priority: Priority | None = None,
+                local: LocalMode | None = None, **kw: Any) -> list[R]:
+            return map(self._ck_fn, items, **{**self._kw, **_lit(kw, placement, priority, local)})  # type: ignore[no-any-return]
+else:
+    class Remote(Generic[P, R]):  # type: ignore[no-redef]
+        """What @ck.remote returns: calling it is the plain function (result type kept; Python 3.9 cannot keep the argument types)."""
+
+        def __init__(self, fn: Callable[..., R], kw: dict[str, Any]) -> None:
+            self._ck_fn, self._kw = fn, kw
+            functools.update_wrapper(self, fn)
+
+        def __call__(self, *a: Any, **k: Any) -> R:
+            return self._ck_fn(*a, **k)
+
+        def map(self, items: Iterable[Any], *, placement: Placement | None = None, priority: Priority | None = None,
+                local: LocalMode | None = None, **kw: Any) -> list[R]:
+            return map(self._ck_fn, items, **{**self._kw, **_lit(kw, placement, priority, local)})  # type: ignore[no-any-return]
 
 
-def remote(fn=None, **kw):
+_Remote = Remote
+
+
+@overload
+def remote(fn: Callable[P, R], **kw: Any) -> Remote[P, R]: ...
+@overload
+def remote(fn: None = None, **kw: Any) -> Callable[[Callable[P, R]], Remote[P, R]]: ...
+def remote(fn: Callable[..., Any] | None = None, **kw: Any) -> Any:
     """@ck.remote: calling fn is unchanged; fn.map(items) uses the cluster."""
-    return _Remote(fn, kw) if fn else (lambda f: _Remote(f, kw))
+    return Remote(fn, kw) if fn else (lambda f: Remote(f, kw))
 
 
-def sweep(fn, grid, key=None, top=None, minimize=False, **kw):
+class SweepRow(TypedDict):
+    params: dict[str, Any]
+    result: Any
+
+
+def sweep(fn: Callable[..., R], grid: dict[str, Iterable[Any]], key: Callable[[R], Any] | None = None, top: int | None = None,
+          minimize: bool = False, *, placement: Placement | None = None, priority: Priority | None = None,
+          local: LocalMode | None = None, **kw: Any) -> list[SweepRow]:
     """Run fn(**config) for every combination in grid. Returns [{'params','result'}], best first when key is given."""
     names = list(grid)
     cfgs = [dict(zip(names, v)) for v in itertools.product(*(grid[k] for k in names))]
-    res = _run(fn, "kw", cfgs, _opts(kw))
-    rows = [{"params": c, "result": r} for c, r in zip(cfgs, res)]
+    res = _run(fn, "kw", cfgs, _opts(_lit(kw, placement, priority, local)))
+    rows: list[SweepRow] = [{"params": c, "result": r} for c, r in zip(cfgs, res)]
     if key:
         rows.sort(key=lambda r: key(r["result"]), reverse=not minimize)
     return rows[:top] if top else rows
 
 
-def mean_params(ps):
+def mean_params(ps: Sequence[Any]) -> Any:
     """Average a list of params: dicts of floats, lists of floats, or plain floats (recursive)."""
     p0 = ps[0]
     if isinstance(p0, dict):
@@ -658,11 +897,12 @@ def mean_params(ps):
     return sum(ps) / len(ps)
 
 
-def train(step, init, shards, rounds=10, average=mean_params, **kw):
+def train(step: Callable[[M, S], M], init: M, shards: Iterable[S], rounds: int = 10, average: Callable[[list[M]], M] = mean_params, *,
+          placement: Placement | None = None, priority: Priority | None = None, local: LocalMode | None = None, **kw: Any) -> M:
     """Model averaging (local SGD): each round every shard runs step(params, shard) on a PC, then results are averaged."""
-    shards, o = list(shards), _opts(kw)
+    shards, o = list(shards), _opts(_lit(kw, placement, priority, local))
     params = init
-    pl = _plan(getattr(step, "_ck_fn", step), [(init, s) for s in shards], "star", o) if shards else None
+    pl = _plan(getattr(step, "_ck_fn", step), _prep([(init, s) for s in shards], o), "star", o) if shards else None
     for r in range(rounds):
         outs = _run(step, "star", [(params, s) for s in shards], o, pl, learn=r == 0)
         params = average(outs)

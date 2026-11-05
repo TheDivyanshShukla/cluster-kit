@@ -4,15 +4,15 @@ from collections import Counter
 import clusterkit as ck
 
 
-def count_words(text):
+def count_words(text: str) -> Counter[str]:
     c = Counter(text.split())
     for _ in range(30_000):  # stand-in for heavier tokenising
         c.update(["x"])
     return c
 
 
-def merge(counters):
-    total = Counter()
+def merge(counters: list[Counter[str]]) -> Counter[str]:
+    total: Counter[str] = Counter()
     for c in counters:
         total += c
     return total

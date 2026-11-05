@@ -1,14 +1,16 @@
 """Run history (~/.clusterkit/history.jsonl, override with CK_SDK_HOME) and the model fitted from it. Standard library only."""
+from __future__ import annotations
 import json, os, statistics, time
+from typing import Any
 
 MIN_RUNS = 3
 
 
-def path():
+def path() -> str:
     return os.path.join(os.environ.get("CK_SDK_HOME") or os.path.expanduser("~/.clusterkit"), "history.jsonl")
 
 
-def record(rec):
+def record(rec: dict[str, Any]) -> None:
     """Append one run (predicted vs actual). Never raises: history is a convenience."""
     try:
         p = path()
@@ -19,7 +21,7 @@ def record(rec):
         pass
 
 
-def load(head, last=20, where=("cluster", "replanned")):
+def load(head: str, last: int = 20, where: tuple[str, ...] = ("cluster", "replanned")) -> list[dict[str, Any]]:
     """The last `last` runs on this head that went to the cluster (oldest first)."""
     try:
         with open(path(), encoding="utf-8") as f:
@@ -28,7 +30,7 @@ def load(head, last=20, where=("cluster", "replanned")):
             lines = f.read().split("\n")
     except OSError:
         return []
-    out = []
+    out: list[dict[str, Any]] = []
     for l in lines:
         try:
             r = json.loads(l)
@@ -39,7 +41,7 @@ def load(head, last=20, where=("cluster", "replanned")):
     return out[-last:]
 
 
-def fit(head, last=20):
+def fit(head: str, last: int = 20) -> dict[str, Any] | None:
     """Robust (median) overhead constants and PC speed from recent runs; None until MIN_RUNS usable runs exist.
     fixed_s: seconds of overhead that do not depend on n (submit, ship, dispatch, result detection);
     item_c: seconds per item (encode + result fetch + decode); speed: PC throughput per slot relative to this PC."""
@@ -52,3 +54,13 @@ def fit(head, last=20):
     speeds = [r["speed"] for r in runs if r.get("speed") and r.get("run_s", 0) >= 1.0]
     return {"runs": len(fixed), "fixed_s": max(0.0, med(fixed)), "item_c": max(0.0, med(items)) if items else None,
             "speed": min(20.0, max(0.05, med(speeds))) if len(speeds) >= MIN_RUNS else None}
+
+
+def link(head: str, last: int = 20) -> dict[str, float]:
+    """Observed transfer speed to/from the head in bytes/s: {'up': .., 'down': ..} (a key is missing until seen)."""
+    out: dict[str, float] = {}
+    for d in ("up", "down"):
+        v = [r["bytes"] / r["s"] for r in load(head, last * 3, ("link",)) if r.get("dir") == d and r.get("s", 0) > 0][-last:]
+        if v:
+            out[d] = statistics.median(v)
+    return out

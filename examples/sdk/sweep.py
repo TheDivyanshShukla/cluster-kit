@@ -3,7 +3,7 @@ import _path  # noqa: F401
 import clusterkit as ck
 
 
-def train_and_score(lr, depth):
+def train_and_score(lr: float, depth: int) -> dict[str, float]:
     w = 0.0
     for step in range(300_000 // depth * 4):  # toy fit of y = 3x
         w += lr * (3 - w)
