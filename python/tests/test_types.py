@@ -20,6 +20,7 @@ def callables(mod):
 
 
 class Types(unittest.TestCase):
+    @unittest.skipIf(sys.version_info < (3, 10), "X | None hints only evaluate at runtime on 3.10+; the SDK itself runs on 3.9")
     def test_hints_resolve_and_are_complete(self):
         n = 0
         for mod in (ck, _advise, _bench, _benchfn, _bulk, _hist, _runner, cli):
@@ -33,6 +34,7 @@ class Types(unittest.TestCase):
                 n += 1
         self.assertGreater(n, 100)
 
+    @unittest.skipIf(sys.version_info < (3, 10), "X | None hints only evaluate at runtime on 3.10+; the SDK itself runs on 3.9")
     def test_public_surface(self):
         for name in ck.__all__:
             o = getattr(ck, name)

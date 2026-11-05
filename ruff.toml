@@ -16,3 +16,6 @@ ignore = ["ANN401"]  # Any is allowed where a value is truly dynamic (JSON, pick
 
 [lint.per-file-ignores]
 "python/tests/**" = ["ANN201", "ANN001"]  # unittest methods and fixtures
+# runs on the PCs with whatever python3 they have (3.9 included) and cannot start with a __future__ import (the SDK
+# prepends lines), so its annotations must evaluate on 3.9: Optional[...] instead of X | None
+"python/clusterkit/_runner.py" = ["UP007", "UP045", "FA100"]

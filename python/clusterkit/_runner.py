@@ -98,7 +98,7 @@ def _put(v: Any, rb: dict[str, Any]) -> tuple[str, Any]:
         return ("ok", v)
 
 
-def _one(mode: str, fn: Callable[..., Any], x: Any, rb: dict[str, Any] | None = None) -> tuple[str, Any]:
+def _one(mode: str, fn: Callable[..., Any], x: Any, rb: Optional[dict[str, Any]] = None) -> tuple[str, Any]:
     try:
         v = apply(mode, fn, x)
         return _put(v, rb) if rb else ("ok", v)
