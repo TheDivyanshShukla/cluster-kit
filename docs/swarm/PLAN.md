@@ -1,5 +1,16 @@
+# Swarm plan: wave 10b (job fields max_pcs, placement, mem_mb) follows wave 9 below
+
+## Wave 10b
+Contracts (lead, done): `JobSpec.max_pcs`, `placement` (`jobs::PLACEMENTS`), `mem_mb` (rust/src/jobs.rs); API parsing in api.rs `client_job_json`; proto CTRL `{"job": {"id", "mem_mb"}}` (comment below Inventory); docs/SDK.md section 4 (semantics).
+| id | agent | owns | deliverable | status |
+|----|-------|------|-------------|--------|
+| T40 | f1 | `rust/src/head.rs`, `rust/src/sched.rs` | max_pcs: a job never holds chunks on more than max_pcs PCs at once; placement: spread (today), pack (prefer PCs already running this job, then most threads), fastest (highest calib_mhs first), efficient (smallest set of fastest PCs whose summed rate meets the job in about the time `spread` would take x 1.2, others left idle so eco can sleep them); eco wake-on-demand wakes at most max(0, max_pcs - awake matching PCs) for a job with max_pcs (else as today); send CTRL job {id, mem_mb} to an agent before its first TASK of a job with mem_mb > 0; pure placement chooser in sched.rs with tests | todo |
+| T41 | f2 | `rust/src/agent.rs`, `rust/src/kernels.rs` | on CTRL job remember mem_mb per job; when running a chunk of that job use copies = min(threads, max(1, floor(free RAM MB x 0.8 / mem_mb))) (free RAM from sysinfo, refreshed per chunk); test the copy count function | done |
+| T42 | f3 | `rust/src/store.rs`, `rust/src/api.rs` (job JSON only) | migration 6: jobs columns max_pcs INTEGER, placement TEXT, mem_mb INTEGER (default 0/''), saved by create_job and insert_job_with_id, read back into JobSpec on resume; JobRow JSON in the API gains the three fields; a resume test | done |
+| T43 | f4 | `console/**` except schema.ts, app.css | New job form: "Use at most [ ] PCs", placement Segmented (Spread / Pack / Fastest / Efficient, with one-line help each), "Memory per copy [ ] MB"; job detail shows them; mock accepts them; check/test/build + screenshots 1440/390 | done |
+
 # Swarm plan: wave 9, every value adjustable + head choice by calibration + one shared settings page
-status: running        updated: 2026-11-05
+status: done        updated: 2026-11-05
 Waves 1-7 are done (records: docs/loop/STATE.md). Wave 8 (console design, docs/DESIGN.md) is running (agent c1, console/**).
 
 User asks (2026-11-05): "every thing and value should be adjustable"; "dynamic head and calibration can help to find

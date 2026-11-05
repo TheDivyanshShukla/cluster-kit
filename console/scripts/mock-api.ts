@@ -20,6 +20,7 @@ type Job = {
 	state: 'queued' | 'running' | 'done' | 'cancelled' | 'failed'; submitter: string;
 	created_ms: number; started_ms: number | null; finished_ms: number | null; error: string | null;
 	selector: string; priority: number; policy: string; reducer: string; eta_ms: number | null; items?: string[];
+	max_pcs?: number; placement?: string; mem_mb?: number;
 };
 const now = () => Date.now();
 const jobs: Job[] = [];
@@ -711,9 +712,10 @@ async function handle(req: Request): Promise<Response> {
 		if (b.kind === 'list' && !(Array.isArray(b.items) && b.items.length)) return err(400, 'invalid_request', 'A list job needs items.');
 		if (!b[b.kind === 'synth' ? 'synth_ns' : b.kind === 'list' ? 'cmd' : b.kind]) return err(400, 'invalid_request', `Give the ${b.kind} field.`);
 		if (b.selector) { const f = parseSel(String(b.selector)); if (typeof f === 'string') return err(400, 'invalid_request', f); }
+		if (b.placement && !['spread', 'pack', 'fastest', 'efficient'].includes(b.placement)) return err(400, 'invalid_request', 'placement must be spread, pack, fastest or efficient.');
 		const pr = ['urgent', 'high', 'normal', 'low', 'background'].indexOf(b.priority ?? 'normal');
 		if (pr < 0) return err(400, 'invalid_request', 'priority must be urgent, high, normal, low or background.');
-		const j = mkJob({ kind: b.kind, total: b.n, from: b.from ?? 1, chunk: b.chunk ?? 0, name: b.name ?? '', submitter: me.name, selector: String(b.selector ?? '').trim(), priority: pr, policy: b.policy ?? 'adaptive', reducer: b.reducer ?? '', items: b.items });
+		const j = mkJob({ kind: b.kind, total: b.n, from: b.from ?? 1, chunk: b.chunk ?? 0, name: b.name ?? '', submitter: me.name, selector: String(b.selector ?? '').trim(), priority: pr, policy: b.policy ?? 'adaptive', reducer: b.reducer ?? '', items: b.items, max_pcs: b.max_pcs ?? 0, placement: b.placement ?? '', mem_mb: b.mem_mb ?? 0 });
 		if (!running()) { j.state = 'running'; j.started_ms = now(); }
 		logEvent('job.submit', me.name, `job ${j.id} submitted`);
 		for (const s of subs) s('job', j);

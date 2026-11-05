@@ -82,6 +82,47 @@ pub fn pick_job(wid: u64, nodes: &[NodeView], jobs: &[JobView], reserves: &[Rese
     Some(if assigned(best.id) < share.div_ceil(same) { best.id } else { cur.id })
 }
 
+/// A node that could take a chunk of a job now (matches, can work), for `place`.
+#[derive(Clone, Debug)]
+pub struct PlaceNode {
+    pub node_id: String,
+    /// units/s for the job's kind (measured, else calibration)
+    pub rate: f64,
+    pub threads: u32,
+    /// already has chunks of this job in flight
+    pub holds: bool,
+}
+
+/// Wave 10b: node ids allowed to take a NEW chunk of one job now. `max_pcs` 0 = no limit. Never more than max_pcs
+/// nodes hold the job: a non-holder is refused while max_pcs holders exist, and a holder outside the chosen set only
+/// drains what it has. spread: everyone (holders first when limited); pack: holders, then most threads; fastest:
+/// highest rate; efficient: the fewest fastest nodes whose summed rate is at least spread's total / 1.2 (so the job
+/// takes about 1.2 x as long as spread and the others can sleep). Pure.
+pub fn place(mode: &str, max_pcs: u32, nodes: &[PlaceNode]) -> std::collections::BTreeSet<String> {
+    let mut v: Vec<&PlaceNode> = nodes.iter().collect();
+    let by_rate = |a: &&PlaceNode, b: &&PlaceNode| b.rate.total_cmp(&a.rate).then_with(|| a.node_id.cmp(&b.node_id));
+    match mode {
+        "pack" => v.sort_by(|a, b| b.holds.cmp(&a.holds).then(b.threads.cmp(&a.threads)).then_with(|| by_rate(a, b))),
+        "fastest" | "efficient" => v.sort_by(by_rate),
+        _ => v.sort_by(|a, b| b.holds.cmp(&a.holds).then_with(|| by_rate(a, b))),
+    }
+    let mut k = if max_pcs == 0 { v.len() } else { (max_pcs as usize).min(v.len()) };
+    let total: f64 = v.iter().map(|n| n.rate).sum();
+    if mode == "efficient" && total > 0.0 {
+        let (mut sum, mut need) = (0.0, 0);
+        for n in &v {
+            if sum >= total / 1.2 {
+                break;
+            }
+            sum += n.rate;
+            need += 1;
+        }
+        k = k.min(need.max(1));
+    }
+    let holders = nodes.iter().filter(|n| n.holds).count();
+    v.into_iter().take(k).filter(|n| n.holds || max_pcs == 0 || holders < max_pcs as usize).map(|n| n.node_id.clone()).collect()
+}
+
 /// Effective thread cap of a node: min over matching caps; None = no cap.
 pub fn thread_cap(attrs: &Attrs, caps: &[CapView]) -> Option<u32> {
     caps.iter().filter(|c| c.selector.matches(attrs)).filter_map(|c| c.max_threads).min()
@@ -684,5 +725,62 @@ mod head_score_tests {
         assert!(head_score(&flaky, &best, w).0 < g && head_score(&busy, &best, w).0 < g);
         assert!(head_score(&flaky, &best, w).0 < head_score(&busy, &best, w).0, "stability weighs double");
         assert_eq!(head_score(&good, &best, HeadWeights { speed: 0.0, memory: 0.0, stability: 0.0, free: 0.0 }).0, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod place_tests {
+    use super::*;
+
+    fn pn(id: &str, rate: f64, threads: u32, holds: bool) -> PlaceNode {
+        PlaceNode { node_id: id.into(), rate, threads, holds }
+    }
+    fn ids(s: std::collections::BTreeSet<String>) -> Vec<String> {
+        s.into_iter().collect()
+    }
+
+    #[test]
+    fn spread_is_everyone_unless_limited() {
+        let n = [pn("a", 1.0, 4, false), pn("b", 2.0, 8, false), pn("c", 3.0, 2, false)];
+        assert_eq!(ids(place("spread", 0, &n)), ["a", "b", "c"]);
+        assert_eq!(ids(place("", 0, &n)), ["a", "b", "c"]);
+        assert_eq!(ids(place("spread", 2, &n)), ["b", "c"]); // fastest two when nobody holds yet
+    }
+
+    #[test]
+    fn max_pcs_never_exceeded() {
+        // 3 holders at max 3: a newcomer is refused even if fastest
+        let n = [pn("a", 1.0, 4, true), pn("b", 1.0, 4, true), pn("c", 1.0, 4, true), pn("z", 9.0, 4, false)];
+        assert_eq!(ids(place("spread", 3, &n)), ["a", "b", "c"]);
+        assert!(!place("fastest", 3, &n).contains("z"));
+        assert!(!place("spread", 3, &n).contains("z"));
+        assert!(!place("pack", 3, &n).contains("z"));
+        // 2 holders at max 3: one newcomer may join, only one set member beyond holders is possible
+        let n = [pn("a", 1.0, 4, true), pn("b", 1.0, 4, true), pn("y", 5.0, 4, false), pn("z", 9.0, 4, false)];
+        assert!(place("spread", 3, &n).contains("a") && place("spread", 3, &n).len() == 3);
+    }
+
+    #[test]
+    fn pack_prefers_holders_then_threads() {
+        let n = [pn("a", 5.0, 2, false), pn("b", 1.0, 16, false), pn("c", 1.0, 4, true)];
+        assert_eq!(ids(place("pack", 2, &n)), ["b", "c"]);
+        assert_eq!(ids(place("pack", 0, &n)), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn fastest_takes_highest_calib() {
+        let n = [pn("a", 1.0, 4, false), pn("b", 7.0, 4, false), pn("c", 3.0, 4, false), pn("d", 5.0, 4, false)];
+        assert_eq!(ids(place("fastest", 2, &n)), ["b", "d"]);
+    }
+
+    #[test]
+    fn efficient_is_smallest_fast_set() {
+        // total 10, need >= 8.33: 6 + 3 = 9 -> two nodes; the 1.0s sleep
+        let n = [pn("a", 1.0, 4, false), pn("b", 6.0, 4, false), pn("c", 3.0, 4, false)];
+        assert_eq!(ids(place("efficient", 0, &n)), ["b", "c"]);
+        assert_eq!(ids(place("efficient", 1, &n)), ["b"]);
+        // unknown rates: no basis to leave anyone out
+        let z = [pn("a", 0.0, 4, false), pn("b", 0.0, 4, false)];
+        assert_eq!(ids(place("efficient", 0, &z)), ["a", "b"]);
     }
 }

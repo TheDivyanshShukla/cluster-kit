@@ -11,7 +11,7 @@
 	import { live } from '#lib/live.svelte.ts';
 	import { count, datetime, duration, rate } from '#lib/format.ts';
 	import { canCancel, elapsedMs, etaMs, jobRate, progress } from '#lib/jobs.ts';
-	import { etaLeft, joinReducer, POLICIES, reducerLabel, REDUCER_OPTIONS, splitReducer } from '#lib/sched.ts';
+	import { etaLeft, joinReducer, PLACEMENTS, POLICIES, reducerLabel, REDUCER_OPTIONS, splitReducer } from '#lib/sched.ts';
 	import { roleNow, userNow } from '#lib/session.svelte.ts';
 	import { btnDanger, btnGhost, card, field } from '#lib/ui.ts';
 
@@ -32,6 +32,7 @@
 	let seeded = -1; // job whose own reducer filled the switch
 
 	// live.jobs holds the newest copy of every job: the stream, the cluster tick and this page's fetches all write to it.
+	let hints = $state<{ max_pcs: number; placement: string; mem_mb: number }>({ max_pcs: 0, placement: '', mem_mb: 0 });
 	const job = $derived(Number.isInteger(id) ? live.jobs[id] : undefined);
 	const now = $derived(live.cluster?.now_ms ?? Date.now());
 
@@ -47,6 +48,7 @@
 			.then((r) => {
 				live.jobs[jid] = r.job;
 				parts = r.parts;
+				hints = r.job;
 			})
 			.catch((e) => (error = e instanceof ApiError ? { message: e.message, status: e.status } : { message: 'Could not load the job.', status: 0 }))
 			.finally(() => (fetched = true));
@@ -113,6 +115,9 @@
 					['Elapsed', duration(elapsedMs(job, now))],
 					['Average rate', rate(jobRate(job, now))],
 					['Policy', POLICIES.find((p) => p.value === job.policy)?.label.replace(' (recommended)', '') ?? (job.policy || '—')],
+					['Use at most', hints.max_pcs > 0 ? `${hints.max_pcs} PC${hints.max_pcs === 1 ? '' : 's'}` : 'All PCs'],
+					['Placement', PLACEMENTS.find((p) => p.value === hints.placement)?.label ?? 'Spread'],
+					...(hints.mem_mb > 0 ? [['Memory per copy', `${count(hints.mem_mb)} MB`]] : []),
 					['Reducer', job.reducer ? reducerLabel(job.reducer) : 'Raw parts'],
 					['Time left', job.state === 'running' ? (etaWords?.replace(' left', '') ?? duration(etaMs(job, now))) : '—']
 				]

@@ -196,13 +196,36 @@ pub fn job_spec(v: &Value, who: &Who) -> Result<JobSpec, String> {
         Some(_) => return Err(format!("reducer must be one of {}", reduce::REDUCERS.join(", "))),
     };
     let end = if is_list { items.len() as u64 } else { end };
-    Ok(JobSpec { name, kind: k, from, end, chunk, arg, only, submitter: who.name.clone(), selector, priority, policy, reducer, items })
+    let max_pcs = match v.get("max_pcs") {
+        None | Some(Value::Null) => 0,
+        Some(x) => uint(x).filter(|n| *n <= 1_000_000).ok_or("max_pcs must be a whole number, 0 = no limit")? as u32,
+    };
+    let placement = match str_field(v, "placement") {
+        None | Some("") | Some("auto") => String::new(),
+        Some(p) if crate::jobs::PLACEMENTS.contains(&p) => p.to_string(),
+        Some(_) => return Err(format!("placement must be one of {}", crate::jobs::PLACEMENTS.join(", "))),
+    };
+    let mem_mb = match v.get("mem_mb") {
+        None | Some(Value::Null) => 0,
+        Some(x) => uint(x).filter(|n| *n <= 16 << 20).ok_or("mem_mb must be a whole number of MB")?,
+    };
+    Ok(JobSpec { max_pcs, placement, mem_mb, name, kind: k, from, end, chunk, arg, only, submitter: who.name.clone(), selector, priority, policy, reducer, items })
 }
 
 /// Fill in the estimated finish of a running job (SCH-03).
 fn with_eta(mut j: JobRow, rates: &HashMap<u64, f64>) -> JobRow {
     j.eta_ms = rates.get(&j.id).filter(|_| j.state == crate::jobs::JobState::Running).and_then(|r| sched::eta_secs(j.total.saturating_sub(j.done), *r)).map(|s| now_ms() + (s * 1000.0) as i64);
     j
+}
+
+/// Job JSON: the JobRow plus max_pcs / placement / mem_mb read from the stored spec.
+fn job_json(ctx: &Ctx, j: &JobRow) -> Value {
+    let (max_pcs, placement, mem_mb) = ctx.store.job_limits(j.id);
+    let mut v = json!(j);
+    v["max_pcs"] = json!(max_pcs);
+    v["placement"] = json!(placement);
+    v["mem_mb"] = json!(mem_mb);
+    v
 }
 
 fn etas(ctx: &Ctx, jobs: Vec<JobRow>) -> Vec<JobRow> {
@@ -387,7 +410,7 @@ pub fn route(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
             let (limit, before) = page(r);
             let jobs = etas(ctx, ctx.store.jobs(limit, before));
             let next = next_of(jobs.len(), limit, jobs.last().map(|j| j.id));
-            json_out(200, json!({"jobs": jobs, "next": next}))
+            json_out(200, json!({"jobs": jobs.iter().map(|j| job_json(ctx, j)).collect::<Vec<_>>(), "next": next}))
         }
         ("POST", ["jobs"]) => {
             let who = who.unwrap();
@@ -399,7 +422,7 @@ pub fn route(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
                 Err(m) if m.starts_with("forbidden: ") => fail(403, "forbidden", &m[11..]),
                 Err(m) => bad(&m),
                 Ok(spec) => match head::submit(ctx, spec) {
-                    Ok(job) => json_out(200, json!({"job": etas(ctx, vec![job]).remove(0)})),
+                    Ok(job) => json_out(200, json!({"job": job_json(ctx, &etas(ctx, vec![job]).remove(0))})),
                     Err(e) => fail(409, "conflict", &e),
                 },
             }
@@ -407,7 +430,7 @@ pub fn route(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
         ("GET", ["jobs", id]) | ("GET", ["jobs", id, "result"]) | ("POST", ["jobs", id, "cancel"]) => {
             let Some(job) = id.parse().ok().and_then(|id| ctx.store.job(id)) else { return fail(404, "not_found", "no such job") };
             match (r.method.as_str(), segs.get(2)) {
-                ("GET", None) => json_out(200, json!({"job": etas(ctx, vec![job.clone()]).remove(0), "parts": ctx.store.parts(job.id).len()})),
+                ("GET", None) => json_out(200, json!({"job": job_json(ctx, &etas(ctx, vec![job.clone()]).remove(0)), "parts": ctx.store.parts(job.id).len()})),
                 ("GET", _) => {
                     let red = r.query.get("reducer").map(|s| pct_decode(s)).unwrap_or_else(|| job.reducer.clone());
                     match reduce::reduce(&job.kind, &red, &ctx.store.parts(job.id)) {

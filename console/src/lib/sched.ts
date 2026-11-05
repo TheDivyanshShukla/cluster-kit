@@ -146,6 +146,13 @@ export const POLICIES = [
 ] as const;
 export type PolicyId = (typeof POLICIES)[number]['value'];
 
+export const PLACEMENTS = [
+	{ value: '', label: 'Spread', hint: 'Use every PC that is free (default).' },
+	{ value: 'pack', label: 'Pack', hint: 'Fill PCs already working on this job first, then the biggest.' },
+	{ value: 'fastest', label: 'Fastest', hint: 'Give work to the quickest PCs first.' },
+	{ value: 'efficient', label: 'Efficient', hint: 'Use the fewest, fastest PCs that still finish in time.' }
+] as const;
+
 export const REDUCER_OPTIONS = [
 	{ value: '', label: 'Raw parts', hint: 'Parts as they come, no combining.' },
 	{ value: 'concat', label: 'Join parts', hint: 'All parts one after another.' },

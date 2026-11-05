@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { ArrowLeft, CircleAlert, Gauge, Hash, List, Lock, Send, Terminal, Timer, Upload } from '@lucide/svelte';
+	import { ArrowLeft, ChevronRight, CircleAlert, Gauge, Hash, List, Lock, Send, Terminal, Timer, Upload } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import SelectorBar from '#lib/components/SelectorBar.svelte';
 	import Listbox from '#lib/components/Listbox.svelte';
@@ -10,7 +10,7 @@
 	import { PRIORITIES } from '#lib/api/schema.ts';
 	import type { Estimate } from '#lib/api/schema.ts';
 	import { debounce, PRIORITY_LABEL } from '#lib/org.ts';
-	import { estimateText, parseItems, POLICIES, REDUCER_OPTIONS } from '#lib/sched.ts';
+	import { estimateText, parseItems, PLACEMENTS, POLICIES, REDUCER_OPTIONS } from '#lib/sched.ts';
 	import { roleNow } from '#lib/session.svelte.ts';
 	import { btnGhost, btnPrimary, card, field } from '#lib/ui.ts';
 
@@ -30,6 +30,7 @@
 	const items = $derived(form.kind === 'list' ? parseItems(form.itemsText) : []);
 	const nEff = $derived(form.kind === 'list' ? items.length : form.n);
 	const policyHint = $derived(POLICIES.find((p) => p.value === form.policy)?.hint ?? '');
+	const placeHint = $derived(PLACEMENTS.find((p) => p.value === form.placement)?.hint ?? '');
 	const redHint = $derived(REDUCER_OPTIONS.find((o) => o.value === form.reducerId)?.hint ?? '');
 
 	// "About 4 min on 23 PCs": asked after the person stops typing; stale answers are dropped.
@@ -191,6 +192,27 @@
 				<label class="block"><span class="mb-1 block text-xs font-medium">N</span><input class={field} type="number" min="1" step="1" inputmode="numeric" bind:value={form.reducerN} aria-invalid={!!errors.reducer} /><span class="text-bad mt-1 block text-xs">{errors.reducer ?? ''}</span></label>
 			{/if}
 		</div>
+
+		<details class="border-line group rounded-lg border" open={!!(form.max_pcs || form.placement || form.mem_mb) || undefined}>
+			<summary class="flex cursor-pointer items-center gap-1.5 px-3 py-2 text-[13px] font-medium"><ChevronRight class="size-4 transition-transform group-open:rotate-90" aria-hidden="true" />Advanced placement</summary>
+			<div class="space-y-4 px-3 pb-3">
+				<label class="block">
+					<span class="mb-1 block text-xs font-medium">Use at most this many PCs (empty = all)</span>
+					<input class={field} type="number" inputmode="numeric" min="1" step="1" placeholder="All PCs" bind:value={form.max_pcs} oninput={clear('max_pcs')} aria-invalid={!!errors.max_pcs} aria-describedby="e-max_pcs" />
+					<span id="e-max_pcs" class="text-bad mt-1 block text-xs">{errors.max_pcs ?? ''}</span>
+				</label>
+				<div>
+					<p class="mb-1 text-xs font-medium">Placement</p>
+					<Segmented legend="Placement" options={PLACEMENTS.map((p) => ({ value: p.value, label: p.label }))} bind:value={form.placement} />
+					<p class="text-muted-foreground mt-1 text-xs">{placeHint}</p>
+				</div>
+				<label class="block">
+					<span class="mb-1 block text-xs font-medium">Memory per copy, MB (optional)</span>
+					<input class={field} type="number" inputmode="numeric" min="1" step="1" placeholder="Not set" bind:value={form.mem_mb} oninput={clear('mem_mb')} aria-invalid={!!errors.mem_mb} aria-describedby="e-mem_mb" />
+					<span id="e-mem_mb" class="text-muted-foreground mt-1 block text-xs {errors.mem_mb ? 'text-bad' : ''}">{errors.mem_mb || 'Each PC runs only as many copies as fit in its free memory.'}</span>
+				</label>
+			</div>
+		</details>
 
 		<label class="block">
 			<span class="mb-1 block text-xs font-medium">Name (optional)</span>

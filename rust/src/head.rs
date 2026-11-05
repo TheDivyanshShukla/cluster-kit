@@ -33,6 +33,9 @@ pub struct Job {
     pub selector: Selector,       // which nodes may run it (ORG-04)
     pub priority: u8,
     pub policy: sched::ChunkPolicy, // SCH-06
+    pub max_pcs: u32,               // wave 10b: at most this many PCs hold its chunks; 0 = no limit
+    pub placement: String,          // spread | pack | fastest | efficient
+    pub mem_mb: u64,
 }
 
 impl Job {
@@ -82,6 +85,7 @@ pub struct Worker {
     pub calib: f64,           // SHA-256 MH/s from the join benchmark (FLT-06), cached by refresh()
     pub fed: u64,  // TASKs sent on this connection
     pub back: u64, // RESULT / FAILED frames received; a REQ credit is granted only while back <= fed (resent results get none)
+    pub told: BTreeSet<u64>, // jobs whose CTRL {job: mem_mb} this agent already got
     pub pending: Vec<(u64, u64, u64, u64)>, // HA-04: stored results waiting to be durable: (log seq, job, a, b); ACKed by durable_upto
 }
 
@@ -333,6 +337,34 @@ fn node_views(st: &State) -> Vec<NodeView> {
         .collect()
 }
 
+/// Does the job restrict where its chunks go (max_pcs, or a placement other than spread)?
+fn limited(j: &Job) -> bool {
+    j.max_pcs > 0 || !matches!(j.placement.as_str(), "" | "spread")
+}
+
+/// May node `wid` take a new chunk of `j` under its max_pcs and placement? Not limited = yes, without a scan.
+fn placed(st: &State, j: &Job, wid: u64) -> bool {
+    if !limited(j) {
+        return true;
+    }
+    let nodes: Vec<(u64, sched::PlaceNode)> = st
+        .workers
+        .iter()
+        .filter(|(_, w)| can_work(w) && j.selector.matches(&w.attrs) && (j.only.is_empty() || j.only.contains(&w.addr)))
+        .map(|(i, w)| {
+            let r = node_rate(st, w, j.kind);
+            (*i, sched::PlaceNode { node_id: nkey(w), rate: if r > 0.0 { r } else { w.calib * 1e6 }, threads: w.threads, holds: w.inflight.iter().any(|t| t.0 == j.id) })
+        })
+        .collect();
+    let (_, me) = match nodes.iter().find(|n| n.0 == wid) {
+        Some(n) => n,
+        None => return false,
+    };
+    let me = me.node_id.clone();
+    let pn: Vec<sched::PlaceNode> = nodes.into_iter().map(|n| n.1).collect();
+    sched::place(&j.placement, j.max_pcs, &pn).contains(&me)
+}
+
 /// Next chunk for `wid`: sched::pick_job chooses the job, sched::chunk_len the length, then the range comes from the job's list.
 /// ponytail: views are rebuilt per chunk, O(workers); cache them if a fleet of thousands shows it.
 fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
@@ -340,7 +372,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         return None;
     }
     let addr = st.workers.get(&wid)?.addr.clone();
-    let id = if st.policy.reserves.is_empty() && st.jobs.len() == 1 {
+    let id = if st.policy.reserves.is_empty() && st.jobs.len() == 1 && st.jobs.values().all(|j| !limited(j)) {
         // fast path, same answer as sched::pick_job with one job and no reserves (which is O(workers) with attrs cloned
         // per node, ~1 ms at 1,000 nodes, under the State lock, once per result)
         let (w, j) = (&st.workers[&wid], st.jobs.values().next()?);
@@ -350,7 +382,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         let jv: Vec<JobView> = st
             .jobs
             .values()
-            .map(|j| JobView { id: j.id, priority: j.priority, selector: j.selector.clone(), has_work: j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) })
+            .map(|j| JobView { id: j.id, priority: j.priority, selector: j.selector.clone(), has_work: j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) })
             .collect();
         sched::pick_job(wid, &views, &jv, &st.policy.reserves)?
     };
@@ -379,7 +411,7 @@ fn speculate_take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8
     if !st.policy.reserves.is_empty() && sched::reserved(&node_views(st), &st.policy.reserves).contains(&nkey(w)) {
         return None;
     }
-    for j in st.jobs.values().filter(|j| !j.has_work() && j.selector.matches(&w.attrs) && (j.only.is_empty() || j.only.contains(&w.addr))) {
+    for j in st.jobs.values().filter(|j| !j.has_work() && j.selector.matches(&w.attrs) && (j.max_pcs == 0 || (st.workers.values().filter(|o| o.inflight.iter().any(|t| t.0 == j.id)).count() as u32) < j.max_pcs) && (j.only.is_empty() || j.only.contains(&w.addr))) {
         let mut infl: Vec<sched::Inflight> = vec![];
         for (_, h) in st.workers.iter().filter(|(i, _)| **i != wid) {
             for k in h.inflight.iter().filter(|k| k.0 == j.id) {
@@ -588,6 +620,7 @@ fn start_job(ctx: &Ctx, st: &mut State, id: u64) {
     st.jobs.insert(id, Job {
         id, kind: spec.kind, arg: spec.arg, next: spec.end, end: spec.end, chunk, total, left, todo: left,
         requeue: todo.into_iter().rev().collect(), only: spec.only, started: Instant::now(), selector, priority: spec.priority, policy,
+        max_pcs: spec.max_pcs, placement: spec.placement, mem_mb: spec.mem_mb,
     });
     sync_brief(st);
     ctx.sh.1.notify_all();
@@ -1257,23 +1290,28 @@ fn ctrl_in(ctx: &Ctx, wid: u64, p: &[u8]) {
 fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>) {
     let sh = &ctx.sh;
     while credits.recv().is_ok() {
-        let (job, a, b, kind, arg) = {
+        let (job, a, b, kind, arg, mem) = {
             let mut st = sh.0.lock().unwrap();
             loop {
                 if !st.workers.contains_key(&wid) {
                     return; // disconnected; the reader already requeued our chunks
                 }
                 if let Some(t) = take(&mut st, wid).or_else(|| speculate_take(&mut st, wid)) {
+                    let mem = st.jobs.get(&t.0).map_or(0, |j| j.mem_mb);
                     let wk = st.workers.get_mut(&wid).unwrap();
+                    let mem = if mem > 0 && wk.told.insert(t.0) { mem } else { 0 };
                     wk.inflight.push((t.0, t.1, t.2));
                     wk.fed += 1;
                     wk.sent.insert((t.0, t.1, t.2), Instant::now());
-                    break t;
+                    break (t.0, t.1, t.2, t.3, t.4, mem);
                 }
                 // 2 s timeout: an idle node re-checks for an overdue chunk to copy (watchdog also wakes it every 5 s)
                 st = sh.1.wait_timeout(st, Duration::from_secs(2)).unwrap().0;
             }
         };
+        if mem > 0 {
+            ctrl_to(&w, serde_json::json!({"job": {"id": job, "mem_mb": mem}}));
+        }
         let mut p = pack(&[job, a, b]);
         p.push(kind);
         p.extend_from_slice(&arg);
@@ -1628,7 +1666,7 @@ struct Peer {
 }
 
 /// Connected PCs and the jobs that have work left as (selector, chunks left); None while dispatch is stopped.
-fn snap(ctx: &Ctx) -> (Vec<Peer>, Vec<(Selector, u64)>) {
+fn snap(ctx: &Ctx) -> (Vec<Peer>, Vec<(Selector, u64, u32)>) {
     let st = ctx.sh.0.lock().unwrap();
     let peers = st.workers.values().filter_map(|w| {
         let h = w.hello.as_ref()?;
@@ -1637,7 +1675,7 @@ fn snap(ctx: &Ctx) -> (Vec<Peer>, Vec<(Selector, u64)>) {
             busy: !w.inflight.is_empty() || w.presence == "busy", state: w.state.clone(), attrs: w.attrs.clone(), macs: h.inv.macs.len(),
         })
     });
-    let jobs = st.jobs.values().filter(|j| j.has_work()).map(|j| (j.selector.clone(), j.requeue.len() as u64 + (j.end.saturating_sub(j.next)) / j.chunk.max(1)));
+    let jobs = st.jobs.values().filter(|j| j.has_work()).map(|j| (j.selector.clone(), j.requeue.len() as u64 + (j.end.saturating_sub(j.next)) / j.chunk.max(1), j.max_pcs));
     (peers.collect(), jobs.collect())
 }
 
@@ -1807,7 +1845,14 @@ fn eco_tick(ctx: &Ctx) {
     };
     if cfg.wake_on_demand {
         let free = |s: &Selector| peers.iter().filter(|p| !asleep.contains(&p.id) && !p.busy && takes_tasks(&p.state) && s.matches(&p.attrs)).count();
-        let demand: Vec<(Selector, usize)> = jobs.iter().filter(|(s, _)| free(s) == 0).map(|(s, n)| (s.clone(), (*n).min(crate::tune::n("wake_max")) as usize)).collect();
+        let demand: Vec<(Selector, usize)> = jobs.iter().filter(|(s, ..)| free(s) == 0).map(|(s, n, m)| {
+            let mut k = (*n).min(crate::tune::n("wake_max")) as usize;
+            if *m > 0 {
+                // a limited job needs only max_pcs PCs in all, counting the matching ones already awake
+                k = k.min((*m as usize).saturating_sub(peers.iter().filter(|p| !asleep.contains(&p.id) && s.matches(&p.attrs)).count()));
+            }
+            (s.clone(), k)
+        }).filter(|d| d.1 > 0).collect();
         if !demand.is_empty() {
             let (rows, labels, pools) = (ctx.store.nodes(), ctx.store.labels(), ctx.store.pools());
             let labs: HashMap<u64, String> = ctx.store.labs().into_iter().map(|l| (l.id, l.name)).collect();
@@ -1827,7 +1872,7 @@ fn eco_tick(ctx: &Ctx) {
     }
     let awake = peers.iter().filter(|p| !p.virt && !asleep.contains(&p.id)).count();
     let cands: Vec<(String, u64, bool)> = peers.iter().filter(|p| !p.virt && !asleep.contains(&p.id)).map(|p| {
-        let protected = p.id == head || standbys.contains(&p.id) || p.busy || !takes_tasks(&p.state) || p.macs == 0 || jobs.iter().any(|(s, _)| s.matches(&p.attrs));
+        let protected = p.id == head || standbys.contains(&p.id) || p.busy || !takes_tasks(&p.state) || p.macs == 0 || jobs.iter().any(|(s, ..)| s.matches(&p.attrs));
         (p.id.clone(), idle.get(&p.id).map_or(0, |t| t.elapsed().as_secs()), protected)
     }).collect();
     let ids = choose_sleep(&cands, cfg.idle_min, awake, cfg.keep_awake);
@@ -2184,6 +2229,33 @@ mod tests {
         let st = c2.sh.0.lock().unwrap();
         let j = &st.jobs[&j3.id];
         assert_eq!((j.id, j.left, j.requeue.clone()), (j3.id, 10, vec![(0, 10)]));
+    }
+
+    #[test]
+    fn max_pcs_and_fastest_placement_in_take() {
+        let c = ctx();
+        let mut sp = spec(100_000);
+        sp.chunk = 1000;
+        sp.max_pcs = 3;
+        sp.placement = "fastest".into();
+        sp.policy = "fixed".into();
+        let j = submit(&c, sp).unwrap();
+        let mut st = c.sh.0.lock().unwrap();
+        for i in 1..=8u64 {
+            st.workers.insert(i, Worker { addr: format!("w{i}"), state: "active".into(), presence: "idle".into(), calib: i as f64, threads: 4, ..Default::default() });
+        }
+        let mut holders = BTreeSet::new();
+        for round in 0..3 {
+            for i in 1..=8u64 {
+                if let Some((jj, a, b, ..)) = take(&mut st, i) {
+                    st.workers.get_mut(&i).unwrap().inflight.push((jj, a, b));
+                    holders.insert(i);
+                }
+            }
+            assert!(holders.len() <= 3, "round {round}: {holders:?}");
+        }
+        assert_eq!(holders, BTreeSet::from([6, 7, 8]), "the three highest calib");
+        assert_eq!(st.jobs[&j.id].max_pcs, 3);
     }
 
     #[test]

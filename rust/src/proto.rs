@@ -112,6 +112,8 @@ pub struct Inventory {
 //   {"wol": ["aa:bb:..", ..]}       send Wake-on-LAN magic packets on this PC's subnet (a lab-local helper)
 //   {"standby_of": "ip:port"}       start `ck head --standby` on this PC for that head (once; HA-10)
 // agent -> head: {"standby_started": true} | {"standby_failed": "why"}
+//   {"job": {"id": J, "mem_mb": M}}  wave 10b, head -> agent before the first TASK of job J on that agent: cap copies
+//                                    of J's chunks at floor(free RAM x 0.8 / M) (M = 0: no cap)
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Hello {

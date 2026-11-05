@@ -16,6 +16,8 @@ import {
 	SwitchReply,
 	JobList,
 	JobOne,
+	JobRow,
+	JobHints,
 	JoinCode,
 	LabList,
 	LabOne,
@@ -53,6 +55,8 @@ export class ApiError extends Error {
 	}
 }
 
+// JobRow and NewJob strip the wave 10b fields; these keep them.
+const JobOneH = z.object({ job: JobRow.extend(JobHints.shape), parts: z.number().optional() });
 const TokenReply = z.object({ token: z.string() });
 const UserReply = z.object({ user: User });
 const PoolOne = z.object({ pool: PoolRow });
@@ -168,7 +172,7 @@ export const api = {
 	configApply: async (cfg: unknown) => void (await send('POST', '/api/v1/config', cfg)),
 	// jobs
 	jobs: (limit = 50, before?: number | null) => call('GET', `/api/v1/jobs${page(limit, before)}`, JobList),
-	job: (id: number) => call('GET', `/api/v1/jobs/${id}`, JobOne),
+	job: (id: number) => call('GET', `/api/v1/jobs/${id}`, JobOneH),
 	jobResult: async (id: number, reducer?: string) =>
 		(await send('GET', `/api/v1/jobs/${id}/result${reducer !== undefined ? `?reducer=${encodeURIComponent(reducer)}` : ''}`)).text(),
 	estimate: (n: number, kind: string, selector: string) =>
@@ -180,7 +184,7 @@ export const api = {
 	reservations: () => call('GET', '/api/v1/reservations', ReservationList),
 	addReservation: (r: { selector: string; start_ms: number; end_ms: number; note?: string }) => call('POST', '/api/v1/reservations', ReservationOne, r),
 	deleteReservation: async (id: number) => void (await send('DELETE', `/api/v1/reservations/${id}`)),
-	createJob: (j: NewJob) => call('POST', '/api/v1/jobs', JobOne, NewJob.parse(j)),
+	createJob: (j: NewJob) => call('POST', '/api/v1/jobs', JobOne, (NewJob.parse(j), j)),
 	cancelJob: (id: number) => call('POST', `/api/v1/jobs/${id}/cancel`, JobOne),
 	// events
 	events: (limit = 50, before?: number | null) => call('GET', `/api/v1/events${page(limit, before)}`, EventList),

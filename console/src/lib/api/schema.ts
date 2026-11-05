@@ -271,3 +271,12 @@ export const Candidate = z.object({
 });
 export const CandidateList = z.object({ candidates: z.array(Candidate) });
 export type Candidate = z.infer<typeof Candidate>;
+
+/** Wave 10b job fields (also on JobRow when the head sends them) */
+export const Placement = z.enum(['spread', 'pack', 'fastest', 'efficient']);
+export type Placement = z.infer<typeof Placement>;
+export const JobHints = z.object({
+	max_pcs: z.number().int().default(0),
+	placement: z.union([Placement, z.literal('')]).catch(''),
+	mem_mb: z.number().int().default(0)
+});

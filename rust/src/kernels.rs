@@ -135,10 +135,47 @@ pub fn sha_range(job: u64, a: u64, b: u64, nibbles: &[u8]) -> Vec<u8> {
     encode_hits(hits)
 }
 
+// Wave 10b: per-job memory hint (CTRL {"job": {"id", "mem_mb"}}); bounded, oldest ids dropped.
+static JOB_MEM: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Parse a CTRL body; Some((job, mem_mb)) for {"job": {"id": J, "mem_mb": M}}.
+pub fn parse_job_mem(p: &[u8]) -> Option<(u64, u64)> {
+    let v: serde_json::Value = serde_json::from_slice(p).ok()?;
+    let j = v.get("job")?;
+    Some((j.get("id")?.as_u64()?, j.get("mem_mb").and_then(|m| m.as_u64()).unwrap_or(0)))
+}
+
+/// Remember mem_mb for the job in a CTRL body (no-op for other CTRL messages).
+pub fn note_job_ctrl(p: &[u8]) {
+    if let Some((id, m)) = parse_job_mem(p) {
+        let mut v = JOB_MEM.lock().unwrap();
+        v.retain(|x| x.0 != id);
+        v.push((id, m));
+        if v.len() > 64 {
+            v.remove(0);
+        }
+    }
+}
+
+/// Copies of the program to run: min(threads, max(1, floor(free_mb * 0.8 / mem_mb))); mem_mb 0 = no cap.
+pub fn copy_count(threads: u64, free_mb: u64, mem_mb: u64) -> u64 {
+    if mem_mb == 0 { threads.max(1) } else { threads.min((free_mb * 4 / 5 / mem_mb).max(1)).max(1) }
+}
+
+fn copies_for(job: u64, threads: u64) -> u64 {
+    let m = JOB_MEM.lock().unwrap().iter().find(|x| x.0 == job).map_or(0, |x| x.1);
+    if m == 0 {
+        return threads;
+    }
+    let mut s = sysinfo::System::new();
+    s.refresh_memory();
+    copy_count(threads, s.available_memory() / 1048576, m)
+}
+
 // Split the chunk into one piece per thread and run the program on each piece in parallel,
 // so single-threaded programs use every core. Multi-threaded programs: start the worker with --threads 1.
 fn run_cmd_par(job: u64, cmd: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, String)> {
-    let parts = (rayon::current_num_threads() as u64).min(b - a).max(1);
+    let parts = (copies_for(job, rayon::current_num_threads() as u64)).min(b - a).max(1);
     let step = (b - a).div_ceil(parts);
     let res: Vec<_> = (0..parts)
         .into_par_iter()
@@ -158,7 +195,7 @@ fn run_list_par(job: u64, arg: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, 
     let (cmd, items) = (&arg[..split], arg.get(split + 1..).unwrap_or(&[]));
     let lines: Vec<&[u8]> = if items.is_empty() { vec![] } else { items.split(|c| *c == b'\n').collect() };
     let n = lines.len() as u64;
-    let parts = (rayon::current_num_threads() as u64).min(n).max(1);
+    let parts = copies_for(job, rayon::current_num_threads() as u64).min(n).max(1);
     let step = n.div_ceil(parts).max(1);
     let res: Vec<_> = (0..parts)
         .into_par_iter()
@@ -333,6 +370,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn copy_count_caps_by_ram() {
+        assert_eq!(copy_count(8, 10_000, 0), 8);
+        assert_eq!(copy_count(8, 10_000, 2_000), 4); // 8000 / 2000
+        assert_eq!(copy_count(8, 100, 2_000), 1);
+        assert_eq!(copy_count(2, 100_000, 100), 2);
+    }
+
+    #[test]
+    fn ctrl_job_parsed() {
+        assert_eq!(parse_job_mem(br#"{"job": {"id": 9, "mem_mb": 512}}"#), Some((9, 512)));
+        assert_eq!(parse_job_mem(br#"{"tune": {}}"#), None);
+        note_job_ctrl(br#"{"job": {"id": 4242, "mem_mb": 300}}"#);
+        assert!(JOB_MEM.lock().unwrap().contains(&(4242, 300)));
+    }
+
     #[test]
     fn cmd_exit_codes() {
         let e = cmd("echo oops >&2; exit 75", 0, 1).unwrap_err();

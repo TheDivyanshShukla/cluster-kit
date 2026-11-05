@@ -65,6 +65,10 @@ CREATE TABLE reservations (id INTEGER PRIMARY KEY AUTOINCREMENT, selector TEXT N
 CREATE TABLE items (job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, idx INTEGER NOT NULL, item TEXT NOT NULL, PRIMARY KEY (job_id, idx));
 ", "
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+", "
+ALTER TABLE jobs ADD COLUMN max_pcs INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN placement TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN mem_mb INTEGER NOT NULL DEFAULT 0;
 "];
 
 const NODE_SEL: &str = "SELECT node_id,host,addr,inventory,first_seen_ms,last_seen_ms,state,state_reason,state_by,lab_id,x,y,calib_mhs FROM nodes";
@@ -179,8 +183,8 @@ impl Store {
         let only = serde_json::to_string(&spec.only).map_err(|x| x.to_string())?;
         let c = self.db();
         c.execute(
-            "INSERT INTO jobs (name,kind,from_n,end_n,chunk,arg,only_json,submitter,selector,priority,policy,reducer,state,created_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'queued',?)",
-            params![spec.name, spec.kind as i64, spec.from as i64, spec.end as i64, spec.chunk as i64, spec.arg, only, spec.submitter, spec.selector, spec.priority as i64, spec.policy, spec.reducer, now_ms],
+            "INSERT INTO jobs (name,kind,from_n,end_n,chunk,arg,only_json,submitter,selector,priority,policy,reducer,max_pcs,placement,mem_mb,state,created_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?)",
+            params![spec.name, spec.kind as i64, spec.from as i64, spec.end as i64, spec.chunk as i64, spec.arg, only, spec.submitter, spec.selector, spec.priority as i64, spec.policy, spec.reducer, spec.max_pcs as i64, spec.placement, spec.mem_mb as i64, now_ms],
         )
         .map_err(e)?;
         let id = c.last_insert_rowid();
@@ -213,7 +217,7 @@ impl Store {
     /// The spec a job was created with (arg and only included), for resuming after a restart.
     pub fn spec(&self, id: u64) -> Option<JobSpec> {
         self.db()
-            .query_row("SELECT name,kind,from_n,end_n,chunk,arg,only_json,submitter,selector,priority,policy,reducer FROM jobs WHERE id=?", [id as i64], |r| {
+            .query_row("SELECT name,kind,from_n,end_n,chunk,arg,only_json,submitter,selector,priority,policy,reducer,max_pcs,placement,mem_mb FROM jobs WHERE id=?", [id as i64], |r| {
                 let only: String = r.get(6)?;
                 Ok(JobSpec {
                     name: r.get(0)?,
@@ -228,12 +232,19 @@ impl Store {
                     priority: r.get::<_, i64>(9)?.clamp(0, 255) as u8,
                     policy: r.get(10)?,
                     reducer: r.get(11)?,
+                    max_pcs: r.get::<_, i64>(12)?.clamp(0, u32::MAX as i64) as u32,
+                    placement: r.get(13)?,
+                    mem_mb: r.get::<_, i64>(14)?.max(0) as u64,
                     ..Default::default() // items via items()
                 })
             })
             .optional()
             .ok()
             .flatten()
+    }
+    /// (max_pcs, placement, mem_mb) of a job, for the job JSON.
+    pub fn job_limits(&self, id: u64) -> (u32, String, u64) {
+        self.spec(id).map(|s| (s.max_pcs, s.placement, s.mem_mb)).unwrap_or_default()
     }
     pub fn job(&self, id: u64) -> Option<JobRow> {
         self.db().query_row(&format!("{JOB_SEL} WHERE id=?"), [id as i64], job_row).optional().ok().flatten()
@@ -1198,8 +1209,8 @@ impl Store {
         let n = self
             .db()
             .execute(
-                "INSERT OR IGNORE INTO jobs (id,name,kind,from_n,end_n,chunk,arg,only_json,submitter,selector,priority,policy,reducer,state,created_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?)",
-                params![id as i64, spec.name, spec.kind as i64, spec.from as i64, spec.end as i64, spec.chunk as i64, spec.arg, only, spec.submitter, spec.selector, spec.priority as i64, spec.policy, spec.reducer, now_ms],
+                "INSERT OR IGNORE INTO jobs (id,name,kind,from_n,end_n,chunk,arg,only_json,submitter,selector,priority,policy,reducer,max_pcs,placement,mem_mb,state,created_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued',?)",
+                params![id as i64, spec.name, spec.kind as i64, spec.from as i64, spec.end as i64, spec.chunk as i64, spec.arg, only, spec.submitter, spec.selector, spec.priority as i64, spec.policy, spec.reducer, spec.max_pcs as i64, spec.placement, spec.mem_mb as i64, now_ms],
             )
             .map_err(e)?;
         if n == 0 {
@@ -1341,6 +1352,26 @@ mod tests_m4 {
         s.set_meta("k", "v").unwrap();
         assert_eq!((s.meta("k").as_deref(), s.nodes().len()), (Some("v"), 1));
         drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn job_max_pcs_placement_mem_survive_reopen_and_replay() {
+        let dir = tmp("m6");
+        let path = dir.join("head.db");
+        let sp = JobSpec { name: "p".into(), end: 4, chunk: 2, max_pcs: 7, placement: "spread".into(), mem_mb: 512, ..Default::default() };
+        {
+            let s = Store::open(&path).unwrap();
+            let j = s.create_job(&sp, 1).unwrap();
+            assert!(s.insert_job_with_id(50, &sp, 1).unwrap());
+            drop(s);
+            let s = Store::open(&path).unwrap();
+            for id in [j.id, 50] {
+                let b = s.spec(id).unwrap();
+                assert_eq!((b.max_pcs, b.placement.as_str(), b.mem_mb), (7, "spread", 512));
+                assert_eq!(s.job_limits(id), (7, "spread".to_string(), 512));
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

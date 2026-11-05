@@ -599,6 +599,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                     crate::tune::apply_remote(&t);
                 }
                 power_ctrl(&p, &w_r);
+                crate::kernels::note_job_ctrl(&p);
                 if let Some(c) = parse_cap(&p) {
                     cap_r.store(c.unwrap_or(0), Relaxed);
                     match c {

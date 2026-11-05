@@ -59,9 +59,12 @@ export interface JobForm {
 	reducerId: string;
 	reducerN: number | null;
 	itemsText: string;
+	max_pcs: number | null;
+	placement: '' | 'spread' | 'pack' | 'fastest' | 'efficient';
+	mem_mb: number | null;
 }
 
-export const emptyForm = (): JobForm => ({ kind: 'synth', name: '', from: 1, n: null, chunk: 0, sha: '', cmd: '', synth_ns: 1000, selector: '', priority: 'normal', policy: 'adaptive', reducerId: '', reducerN: 5, itemsText: '' });
+export const emptyForm = (): JobForm => ({ kind: 'synth', name: '', from: 1, n: null, chunk: 0, sha: '', cmd: '', synth_ns: 1000, selector: '', priority: 'normal', policy: 'adaptive', reducerId: '', reducerN: 5, itemsText: '', max_pcs: null, placement: '', mem_mb: null });
 
 const FRIENDLY: Record<string, string> = {
 	n: 'A whole number above 0.',
@@ -86,6 +89,7 @@ export function validateJob(f: JobForm): { value?: NewJob; errors: Record<string
 		const bad = checkItems(items);
 		if (bad) errors.items = bad;
 	}
+	for (const k of ['max_pcs', 'mem_mb'] as const) if (f[k] != null && !(Number.isInteger(f[k]) && f[k]! >= 0)) errors[k] = 'A whole number, 0 or more.';
 	const red = joinReducer(f.reducerId, f.reducerN);
 	if (red.error) errors.reducer = red.error;
 	if (Object.keys(errors).length) return { errors };
@@ -102,7 +106,10 @@ export function validateJob(f: JobForm): { value?: NewJob; errors: Record<string
 		reducer: red.value || undefined,
 		synth_ns: f.kind === 'synth' ? f.synth_ns! : undefined,
 		selector: f.selector.trim() || undefined,
-		priority: f.priority
+		priority: f.priority,
+		max_pcs: f.max_pcs || undefined,
+		placement: f.placement || undefined,
+		mem_mb: f.mem_mb || undefined
 	};
 	const p = NewJob.safeParse(body);
 	if (p.success) return { value: body, errors };

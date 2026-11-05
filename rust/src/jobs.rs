@@ -70,7 +70,19 @@ pub struct JobSpec {
     /// List job (JOB-01): the items; then from = 0, end = items.len(), and tasks are item index ranges. Stored apart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<String>,
+    /// Wave 10b (SCH-05): use at most this many PCs at once; 0 = no limit. Eco mode wakes only enough to reach it.
+    #[serde(default)]
+    pub max_pcs: u32,
+    /// Wave 10b (SCH-05): "" or "spread" (every matching PC), "pack" (fill fewer PCs fully first), "fastest" (highest
+    /// calibrated speed first), "efficient" (fewest PCs that meet the estimate; the rest may sleep).
+    #[serde(default)]
+    pub placement: String,
+    /// Wave 10b: memory one copy of the program needs, MB; agents run at most floor(free RAM x 0.8 / mem_mb) copies. 0 = unknown.
+    #[serde(default)]
+    pub mem_mb: u64,
 }
+
+pub const PLACEMENTS: &[&str] = &["spread", "pack", "fastest", "efficient"];
 
 pub fn normal_priority() -> u8 {
     2
@@ -92,6 +104,9 @@ impl Default for JobSpec {
             policy: String::new(),
             reducer: String::new(),
             items: vec![],
+            max_pcs: 0,
+            placement: String::new(),
+            mem_mb: 0,
         }
     }
 }
