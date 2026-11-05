@@ -52,6 +52,7 @@ pub const KNOBS: &[Knob] = &[
     k("member_window_s", "Head failover", 60.0, 5.0, 3600.0, "s", Head, "PCs seen within this window count toward the majority a new head waits for; ones that never return drop out this long after a takeover."),
     k("noq_grace_s", "Head failover", 10.0, 2.0, 600.0, "s", Head, "A head with standbys that has no majority for this long stops handing out work (split-brain guard)."),
     k("standby_step_s", "Head failover", 2.0, 0.5, 60.0, "s", Head, "Extra wait per place in the standby order, so standbys take over one at a time."),
+    k("failover_refused_s", "Head failover", 0.5, 0.0, 60.0, "s", Head, "Take over this long after the primary's PC refuses connections (its head process is gone, the PC is up), instead of waiting for silence. 0 = only silence."),
     k("ring_max", "Head failover", 100_000.0, 1_000.0, 10_000_000.0, "changes", Head, "Changes kept in memory for standbys that fall behind; older gaps need a full copy."),
     k("switchover_wait_s", "Head failover", 5.0, 1.0, 120.0, "s", Head, "Planned switchover: how long to wait for the standby to confirm."),
     k("client_failover_s", "Head failover", 60.0, 5.0, 3600.0, "s", Agent, "How long `ck run` keeps looking for a new head after losing one."),

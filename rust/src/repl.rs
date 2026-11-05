@@ -786,6 +786,7 @@ struct Sb {
     last_heard: Instant,
     epoch: Arc<AtomicU64>,
     old_primary: bool,
+    refused_since: Option<Instant>, // the primary's PC answers but nothing listens: its head process is gone
 }
 
 fn invalid(m: &str) -> io::Error {
@@ -945,7 +946,7 @@ pub fn run_standby(o: &crate::Opts) {
         std::thread::spawn(move || watch_beacons(e, h, c, s));
     }
     set_sb(|t| { t.role = "standby".into(); t.epoch = epoch.load(SeqCst); t.last_seq = num(store.meta("last_seq")); t.primary = head.lock().unwrap().clone() });
-    let mut sb = Sb { handover: false, priority: 0, peers: vec![], last_heard: Instant::now(), epoch: epoch.clone(), old_primary: false };
+    let mut sb = Sb { handover: false, priority: 0, peers: vec![], last_heard: Instant::now(), epoch: epoch.clone(), old_primary: false, refused_since: None };
     let mut backoff = Duration::from_millis(200);
     crate::say!("standby.follow", "standby: following {}", head.lock().unwrap());
     loop {
@@ -955,7 +956,8 @@ pub fn run_standby(o: &crate::Opts) {
             sb.last_heard = Instant::now();
         }
         let synced = store.meta("synced").as_deref() == Some("1");
-        if synced && (sb.handover || should_promote(sb.priority, sb.last_heard.elapsed().as_secs_f64())) {
+        let refused = sb.refused_since.is_some_and(|t| refused_promote(sb.priority, t.elapsed().as_secs_f64()));
+        if synced && (sb.handover || refused || should_promote(sb.priority, sb.last_heard.elapsed().as_secs_f64())) {
             let e = num(store.meta("epoch")).max(epoch.load(SeqCst)) + 1;
             let _ = store.set_meta("epoch", &e.to_string());
             let _ = store.set_meta("candidate", "1");
@@ -964,6 +966,8 @@ pub fn run_standby(o: &crate::Opts) {
             crate::say!("ha.blobs", "takeover: {added} copied blob(s) registered, {missing} missing");
             if sb.handover {
                 crate::say!("ha.promote", "standby: planned handover, promoting at epoch {e}");
+            } else if refused {
+                crate::say!("ha.promote", "standby: the primary's PC refuses connections (head process gone), promoting at epoch {e}");
             } else {
                 crate::say!("ha.promote", "standby: primary silent for {:.1}s, promoting at epoch {e}", sb.last_heard.elapsed().as_secs_f64());
             }
@@ -972,8 +976,15 @@ pub fn run_standby(o: &crate::Opts) {
         let mut targets = vec![head.lock().unwrap().clone()];
         targets.extend(sb.peers.iter().cloned());
         let mut ran = false;
-        for t in targets {
-            let Ok(s) = connect(&t) else { continue };
+        let mut head_refused = false;
+        for (i, t) in targets.into_iter().enumerate() {
+            let s = match connect(&t) {
+                Ok(s) => s,
+                Err(e) => {
+                    head_refused |= i == 0 && e.kind() == io::ErrorKind::ConnectionRefused;
+                    continue;
+                }
+            };
             *head.lock().unwrap() = t.clone();
             *cur.lock().unwrap() = s.try_clone().ok();
             set_sb(|x| { x.primary = t.clone(); x.connected = 1 });
@@ -985,7 +996,8 @@ pub fn run_standby(o: &crate::Opts) {
             backoff = Duration::from_millis(200);
             break;
         }
-        std::thread::sleep(backoff);
+        sb.refused_since = if head_refused && !ran { sb.refused_since.or(Some(Instant::now())) } else { None };
+        std::thread::sleep(if sb.refused_since.is_some() { Duration::from_millis(100) } else { backoff });
         if !ran {
             backoff = (backoff * 2).min(Duration::from_secs(1));
         }
@@ -1010,6 +1022,13 @@ pub fn hand_over(ctx: &Ctx, node: &str) -> Result<String, String> {
 /// Pure: should a standby with this priority promote after the primary has been silent this long?
 pub fn should_promote(priority: u32, silent_secs: f64) -> bool {
     silent_secs >= crate::proto::lost_after().as_secs_f64() + crate::tune::get("standby_step_s") * priority as f64
+}
+
+/// Pure: after the primary's PC has refused connections this long (a crash, not a network split: the PC answered), may
+/// a standby of this priority take over? Standbys still go one at a time (standby_step_s per place).
+pub fn refused_promote(priority: u32, refused_secs: f64) -> bool {
+    let r = crate::tune::get("failover_refused_s");
+    r > 0.0 && refused_secs >= r + crate::tune::get("standby_step_s") * priority as f64
 }
 
 /// Pure: may a head dispatch with `connected` agents out of `membership` known nodes?
@@ -1067,6 +1086,8 @@ mod tests {
         assert!(should_promote(0, 5.0));
         assert!(!should_promote(2, 8.0));
         assert!(should_promote(2, 9.0));
+        assert!(!refused_promote(0, 0.2) && refused_promote(0, 0.6), "a refusing primary PC: take over after 0.5 s");
+        assert!(!refused_promote(1, 2.0) && refused_promote(1, 2.6), "second standby waits one step longer");
         assert!(has_quorum(0, 0));
         assert!(!has_quorum(5, 10));
         assert!(has_quorum(6, 10));
@@ -1127,7 +1148,7 @@ mod tests {
         let client = TcpStream::connect(addr).unwrap();
         let (srv, _) = l.accept().unwrap();
         let killer = client.try_clone().unwrap();
-        let mut sb = Sb { handover: false, priority: 0, peers: vec![], last_heard: Instant::now(), epoch: Arc::new(AtomicU64::new(0)), old_primary: false };
+        let mut sb = Sb { handover: false, priority: 0, peers: vec![], last_heard: Instant::now(), epoch: Arc::new(AtomicU64::new(0)), old_primary: false, refused_since: None };
         let ok = std::thread::scope(|sc| {
             sc.spawn(|| {
                 let mut srv = srv;

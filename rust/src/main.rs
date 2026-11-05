@@ -51,6 +51,37 @@ mod api;
 use std::sync::atomic::Ordering::Relaxed;
 use std::{env, thread};
 
+/// The head holds about 2 file descriptors per PC. The usual soft limit (1,024 on Linux and under systemd) would stop it
+/// at about 500 PCs, so raise it to the hard limit (macOS refuses "unlimited": try smaller values). No-op elsewhere.
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn raise_nofile() {
+    #[repr(C)]
+    struct RLimit {
+        cur: u64,
+        max: u64,
+    }
+    extern "C" {
+        fn getrlimit(resource: i32, l: *mut RLimit) -> i32;
+        fn setrlimit(resource: i32, l: *const RLimit) -> i32;
+    }
+    const NOFILE: i32 = if cfg!(target_os = "linux") { 7 } else { 8 };
+    let mut l = RLimit { cur: 0, max: 0 };
+    // SAFETY: plain libc calls with a #[repr(C)] struct of the platform's rlim_t (u64 on 64-bit unix).
+    unsafe {
+        if getrlimit(NOFILE, &mut l) != 0 {
+            return;
+        }
+        for want in [l.max, 1 << 20, 65_536, 10_240] {
+            let n = RLimit { cur: want.min(l.max), max: l.max };
+            if n.cur <= l.cur || setrlimit(NOFILE, &n) == 0 {
+                return;
+            }
+        }
+    }
+}
+#[cfg(not(all(unix, target_pointer_width = "64")))]
+fn raise_nofile() {}
+
 pub struct Opts {
     pub name: String,
     pub head: Option<String>,
@@ -181,6 +212,9 @@ fn main() {
         }
     }
     proto::SPIN.store(o.spin, Relaxed);
+    if cmd == "head" {
+        raise_nofile();
+    }
     rayon::ThreadPoolBuilder::new().num_threads(o.threads).build_global().unwrap();
     match cmd.as_str() {
         "head" | "agent" | "worker" | "run" => log::init(

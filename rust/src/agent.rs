@@ -161,10 +161,14 @@ pub(crate) fn parse_last_head(t: &str) -> Option<(String, u64)> {
     Some((a, w.next().and_then(|e| e.strip_prefix("e=")).and_then(|e| e.parse().ok()).unwrap_or(0)))
 }
 
-/// 2 s after the first failure, doubling to 16 s, times a jitter of 0.75..1.25 (clock nanoseconds mixed with the pid).
+/// Reconnect delay. A session that ran a while (fails = 0) retries within 0..1 s, spread at random so a restarted head
+/// is not hit by every PC in the same millisecond. Further failures back off fast: 0.25, 0.5, 1, 2, 4 s (x 0.75..1.25).
 fn reconnect_delay(fails: u32) -> Duration {
     let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) ^ std::process::id().wrapping_mul(2654435761);
-    Duration::from_millis((1000u64 << fails.clamp(1, 4)) * (750 + (n % 500) as u64) / 1000)
+    if fails == 0 {
+        return Duration::from_millis((n % 1000) as u64);
+    }
+    Duration::from_millis((250u64 << (fails - 1).min(4)) * (750 + (n % 500) as u64) / 1000)
 }
 
 fn connect(addr: &str) -> io::Result<TcpStream> {
@@ -382,7 +386,7 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
     });
     let mut first = true;
     let unacked = Arc::new(Mutex::new(Unacked::new(0, 0))); // survives reconnects, even to another head
-    let mut fails = 0u32; // consecutive short or failed sessions: reconnect delay doubles (2 s .. 16 s) with jitter, so a restarted head is not hit by every PC at once
+    let mut fails = 0u32; // consecutive short or failed sessions: see reconnect_delay (0..1 s, then 0.25 s doubling to 4 s)
     loop {
         let began = Instant::now();
         // after a restart try the head we knew before waiting for a beacon
@@ -415,7 +419,7 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
             }
             Err(e) => crate::warnl!("agent.unreachable", "cannot reach head {ip}: {e}"),
         }
-        fails = if began.elapsed() > Duration::from_secs(20) { 0 } else { (fails + 1).min(3) };
+        fails = if began.elapsed() > Duration::from_secs(20) { 0 } else { (fails + 1).min(5) };
         thread::sleep(reconnect_delay(fails));
     }
 }
@@ -883,9 +887,10 @@ mod tests {
 mod backoff_tests {
     #[test]
     fn reconnect_delay_grows_and_is_bounded() {
-        for f in 0..8 {
+        assert!(super::reconnect_delay(0).as_millis() < 1000, "first retry within a second");
+        for f in 1..8 {
             let d = super::reconnect_delay(f).as_millis();
-            let base = 1000u128 << f.clamp(1, 4);
+            let base = 250u128 << (f - 1).min(4);
             assert!(d >= base * 3 / 4 && d <= base * 5 / 4, "fails {f}: {d} ms");
         }
     }

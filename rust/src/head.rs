@@ -1302,8 +1302,14 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     let mut upd = None;
     let mut credit = true;
     if let Some(w) = st.workers.get_mut(&wid) {
-        w.back += 1;
-        credit = w.back <= w.fed;
+        // A RESULT while nothing was fed on this connection is one the agent resent after a failover (it sends them before its
+        // first REQ): no credit, and not counted in `back`. Counting them left `back` R ahead of `fed`, so an agent with
+        // 2 or more resent results never got another credit and idled for good (r2: 200 agents, 388 resends each).
+        credit = false;
+        if w.fed > 0 {
+            w.back += 1;
+            credit = w.back <= w.fed;
+        }
         w.chunks += 1;
         w.numbers += b - a;
         w.secs += secs;
@@ -1602,12 +1608,15 @@ fn ctrl_in(ctx: &Ctx, wid: u64, p: &[u8]) {
         return;
     }
     let mut st = ctx.sh.0.lock().unwrap();
-    if crate::blobs::is_ctrl(&v) {
+    let blob = crate::blobs::is_ctrl(&v);
+    if blob {
         crate::blobs::on_ctrl(ctx, &mut st, wid, &v);
     }
     let Some(w) = st.workers.get_mut(&wid) else { return };
     let node = w.hello.as_ref().map(|h| h.node_id.clone());
+    let mut moved = blob; // what can change who may take a chunk: presence, or which blobs a PC holds
     if let Some(pr) = v["presence"].as_str().filter(|p| matches!(*p, "busy" | "idle")) {
+        moved |= w.presence != pr;
         w.presence = pr.into();
     }
     if let Some(m) = v["calib_mhs"].as_f64().filter(|m| *m > 0.0) {
@@ -1635,7 +1644,11 @@ fn ctrl_in(ctx: &Ctx, wid: u64, p: &[u8]) {
     if let Some(id) = node {
         publish_node(ctx, &st, &id);
     }
-    ctx.sh.1.notify_all(); // idle again: chunks flow; busy: the dispatcher re-checks
+    // Waking every feeder costs one lock grab per connected PC: only when there is work to hand out. Otherwise a join
+    // storm (each PC sends presence, calibration and its blob list) was O(PCs^2) lock grabs: 1,000 PCs took ~4 s to rejoin.
+    if moved && st.jobs.values().any(|j| j.has_work()) {
+        ctx.sh.1.notify_all(); // idle again: chunks flow; busy: the dispatcher re-checks
+    }
 }
 
 fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>) {
@@ -1928,6 +1941,16 @@ pub fn run(o: &Opts) {
     let bc = ctx.clone();
     thread::spawn(move || crate::blobs::head_loop(bc));
     let l = TcpListener::bind(("0.0.0.0", port())).unwrap_or_else(|e| die(&format!("TCP {}: {e}", port())));
+    #[cfg(unix)]
+    {
+        // std listens with a backlog of 128: after a restart 1,000 PCs connecting at once overflow it and get reset.
+        // A second listen() raises it; the kernel caps it at somaxconn (Linux 4096, macOS 128).
+        extern "C" {
+            fn listen(fd: i32, backlog: i32) -> i32;
+        }
+        use std::os::fd::AsRawFd;
+        unsafe { listen(l.as_raw_fd(), 4096) };
+    }
     let name = o.name.clone();
     let (cb, cw, n2) = (ctx.clone(), ctx.clone(), o.name.clone());
     thread::spawn(move || beacon(&cb, &name));
@@ -1950,7 +1973,11 @@ pub fn run(o: &Opts) {
     println!("HEAD ready  tcp://{ip}:{}  dashboard http://{ip}:{}  cluster '{}'", port(), dash_port(), o.name);
 
     let mut next_conn = 0u64;
-    for s in l.incoming().flatten() {
+    for s in l.incoming() {
+        let Ok(s) = s else {
+            thread::sleep(Duration::from_millis(100)); // EMFILE and friends: do not spin at 100% CPU
+            continue;
+        };
         next_conn += 1;
         let (ctx, wid) = (ctx.clone(), next_conn);
         let _ = thread::Builder::new().stack_size(2 << 20).spawn(move || {
@@ -2949,6 +2976,22 @@ mod tests {
         // credit: a result nobody was sent a TASK for (fed used up) gets none
         assert!(!finish_credit(&c, 1, &result(j.id, 30, 50)).unwrap());
         assert_eq!(left(&c), Some(30));
+    }
+
+    #[test]
+    fn resent_results_do_not_use_up_credits() {
+        // r2: an agent resends R results after a failover, before its first REQ (nothing fed yet): no credit for them, and the
+        // results of chunks fed afterwards still earn theirs (before, back ran R ahead of fed and the agent starved for good).
+        let c = ctx();
+        let j = submit(&c, JobSpec { chunk: 0, ..spec(1000) }).unwrap();
+        c.sh.0.lock().unwrap().workers.insert(1, Worker { addr: "a".into(), state: "active".into(), ..Default::default() });
+        for k in 0..5 {
+            assert!(!finish_credit(&c, 1, &result(j.id, k * 10, k * 10 + 10)).unwrap(), "resent result {k} earns no credit");
+        }
+        c.sh.0.lock().unwrap().workers.get_mut(&1).unwrap().fed = 2; // the agent's 2 REQs were answered with 2 TASKs
+        assert!(finish_credit(&c, 1, &result(j.id, 100, 110)).unwrap(), "first fed chunk's result earns a credit");
+        c.sh.0.lock().unwrap().workers.get_mut(&1).unwrap().fed = 3;
+        assert!(finish_credit(&c, 1, &result(j.id, 110, 120)).unwrap());
     }
 }
 
