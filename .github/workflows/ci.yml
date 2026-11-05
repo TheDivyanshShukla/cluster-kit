@@ -24,3 +24,20 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         working-directory: .
         run: bash scripts/chaos.sh
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]   # 3.9: the oldest python3 a lab PC may have (the SDK runner runs there)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s python/tests
+      - uses: astral-sh/setup-uv@v6
+        if: matrix.python == '3.12'
+      - name: ruff (latest): full type hints
+        if: matrix.python == '3.12'
+        run: uvx ruff@latest check .
