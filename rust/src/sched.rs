@@ -91,6 +91,8 @@ pub struct PlaceNode {
     pub threads: u32,
     /// already has chunks of this job in flight
     pub holds: bool,
+    /// wave 13: already caches the blobs the job needs (no transfer before it can start): preferred when the job is limited
+    pub cached: bool,
 }
 
 /// Wave 10b: node ids allowed to take a NEW chunk of one job now. `max_pcs` 0 = no limit. Never more than max_pcs
@@ -102,9 +104,9 @@ pub fn place(mode: &str, max_pcs: u32, nodes: &[PlaceNode]) -> std::collections:
     let mut v: Vec<&PlaceNode> = nodes.iter().collect();
     let by_rate = |a: &&PlaceNode, b: &&PlaceNode| b.rate.total_cmp(&a.rate).then_with(|| a.node_id.cmp(&b.node_id));
     match mode {
-        "pack" => v.sort_by(|a, b| b.holds.cmp(&a.holds).then(b.threads.cmp(&a.threads)).then_with(|| by_rate(a, b))),
-        "fastest" | "efficient" => v.sort_by(by_rate),
-        _ => v.sort_by(|a, b| b.holds.cmp(&a.holds).then_with(|| by_rate(a, b))),
+        "pack" => v.sort_by(|a, b| b.holds.cmp(&a.holds).then(b.cached.cmp(&a.cached)).then(b.threads.cmp(&a.threads)).then_with(|| by_rate(a, b))),
+        "fastest" | "efficient" => v.sort_by(|a, b| b.cached.cmp(&a.cached).then_with(|| by_rate(a, b))),
+        _ => v.sort_by(|a, b| b.holds.cmp(&a.holds).then(b.cached.cmp(&a.cached)).then_with(|| by_rate(a, b))),
     }
     let mut k = if max_pcs == 0 { v.len() } else { (max_pcs as usize).min(v.len()) };
     let total: f64 = v.iter().map(|n| n.rate).sum();
@@ -749,7 +751,7 @@ mod place_tests {
     use super::*;
 
     fn pn(id: &str, rate: f64, threads: u32, holds: bool) -> PlaceNode {
-        PlaceNode { node_id: id.into(), rate, threads, holds }
+        PlaceNode { node_id: id.into(), rate, threads, holds, cached: false }
     }
     fn ids(s: std::collections::BTreeSet<String>) -> Vec<String> {
         s.into_iter().collect()

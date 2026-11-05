@@ -80,6 +80,13 @@ pub struct JobSpec {
     /// Wave 10b: memory one copy of the program needs, MB; agents run at most floor(free RAM x 0.8 / mem_mb) copies. 0 = unknown.
     #[serde(default)]
     pub mem_mb: u64,
+    /// Wave 13 (docs/BULK.md): content-addressed blobs (sha256 hex) every PC must cache before it gets a chunk. They reach
+    /// the program as env CK_BLOBS and CK_BLOB_<i>.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobs: Vec<String>,
+    /// "auto" (default, ""), "direct" (every PC fetches from the head) or "peer" (PCs serve each other inside a /24).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub blob_mode: String,
 }
 
 pub const PLACEMENTS: &[&str] = &["spread", "pack", "fastest", "efficient"];
@@ -107,6 +114,8 @@ impl Default for JobSpec {
             max_pcs: 0,
             placement: String::new(),
             mem_mb: 0,
+            blobs: vec![],
+            blob_mode: String::new(),
         }
     }
 }
@@ -223,6 +232,13 @@ pub struct NodeRow {
     /// Calibration (FLT-06): this PC's SHA-256 rate in MH/s from a 3 s benchmark at join, if measured.
     #[serde(default)]
     pub calib_mhs: Option<f64>,
+    /// Wave 13: measured link speed (Mbit/s, head to this PC), round trip (ms) and when (ms), from the head's probe transfers.
+    #[serde(default)]
+    pub net_mbps: Option<f64>,
+    #[serde(default)]
+    pub rtt_ms: Option<f64>,
+    #[serde(default)]
+    pub probed_ms: Option<i64>,
 }
 
 /// ORG-09 node states. pending: joined, not approved. active: takes tasks. cordoned: no new tasks.

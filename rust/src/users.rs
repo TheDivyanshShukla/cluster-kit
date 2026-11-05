@@ -219,6 +219,9 @@ pub fn min_role(method: &str, path: &str) -> Option<Role> {
         (_, "/api/v1/me" | "/api/v1/bootstrap" | "/api/v1/login" | "/api/v1/logout") => return None,
         (_, "/api/v1/users" | "/api/v1/config") => Role::Admin,
         ("POST", "/api/v1/jobs" | "/api/v1/experiments") => Role::Researcher,
+        ("PUT", "/api/v1/blobs") => Role::Researcher,
+        ("GET" | "HEAD", _) if p.starts_with("/api/v1/blobs/") => Role::Researcher,
+        ("POST", "/api/v1/net/probe") => Role::Operator,
         ("POST", _) if p.starts_with("/api/v1/alerts/") && p.ends_with("/ack") => Role::Operator,
         ("POST", "/api/v1/ha/switchover") | ("PUT", "/api/v1/ha/settings" | "/api/v1/tunables") => Role::Admin,
         ("GET", "/api/v1/logs") => Role::Operator,
@@ -252,6 +255,7 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/nodes/power"), ("GET", "/power"), ("PUT", "/power"), ("GET", "/ha/settings"), ("PUT", "/ha/settings"),
     ("GET", "/tunables"), ("PUT", "/tunables"), ("GET", "/ha/candidates"),
     ("GET", "/logs"),
+    ("PUT", "/blobs"), ("GET", "/blobs"), ("GET", "/blobs/{sha}"), ("GET", "/net"), ("POST", "/net/probe"),
     ("GET", "/jobs/{id}/breakdown"), ("GET", "/alerts"), ("POST", "/alerts/{id}/ack"),
     ("POST", "/experiments"), ("GET", "/experiments"), ("GET", "/experiments/{id}"), ("GET", "/report"),
 ];

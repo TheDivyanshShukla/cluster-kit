@@ -73,6 +73,12 @@ pub const SNAPSHOT: u8 = 24; // primary -> standby: epoch u64, seq u64, then the
 pub const REPL: u8 = 25; // primary -> standby: one repl::Entry as JSON
 pub const REPL_ACK: u8 = 26; // standby -> primary: seq u64 applied
 pub const ACK: u8 = 27; // head -> worker: job, start, end (u64 each): that result is durable, drop your copy
+/// primary -> standby, for a database over SNAP_ONE bytes (one SNAPSHOT frame is capped by MAX_FRAME): SNAPSHOT_BEGIN
+/// (epoch u64, seq u64, total length u64), then SNAPSHOT_MORE frames (raw file bytes, SNAP_PIECE at most) until `total` arrived.
+pub const SNAPSHOT_BEGIN: u8 = 29;
+pub const SNAPSHOT_MORE: u8 = 30;
+pub const SNAP_ONE: u64 = 64 << 20;
+pub const SNAP_PIECE: usize = 32 << 20;
 pub const CANCEL_RANGE: u8 = 28; // head -> worker: job, start, end: stop or skip this one chunk (the other copy won)
 
 pub const KIND_SHA: u8 = 0; // arg = prefix as nibbles; body = (n u64, sha256 [u8; 32])*
@@ -193,10 +199,15 @@ pub fn send(s: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
 }
 
 pub fn recv(s: &mut impl Read) -> io::Result<(u8, Vec<u8>)> {
+    recv_max(s, MAX_FRAME)
+}
+
+/// `recv` with a smaller frame limit, for the first frame of a connection nobody has vouched for yet.
+pub fn recv_max(s: &mut impl Read, max: usize) -> io::Result<(u8, Vec<u8>)> {
     let mut h = [0u8; 5];
     s.read_exact(&mut h)?;
     let len = u32::from_le_bytes(h[1..5].try_into().unwrap()) as usize;
-    if len > MAX_FRAME {
+    if len > max {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
     }
     let mut p = vec![0; len];

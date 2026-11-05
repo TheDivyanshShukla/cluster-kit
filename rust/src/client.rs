@@ -71,7 +71,8 @@ pub fn run(o: &Opts) {
     p.extend_from_slice(&arg);
     let t = Instant::now();
     let (policy, reducer) = (std::env::var("CK_POLICY").unwrap_or_default(), std::env::var("CK_REDUCER").unwrap_or_default()); // until main.rs has --policy / --reducer
-    if o.selector.is_some() || o.priority.is_some() || !policy.is_empty() || !reducer.is_empty() {
+    let blobs = blob_shas(o);
+    if o.selector.is_some() || o.priority.is_some() || !policy.is_empty() || !reducer.is_empty() || !blobs.is_empty() {
         // SUBMIT_JSON carries selector and priority (the old SUBMIT cannot)
         let priority = match o.priority.as_deref() {
             None => crate::jobs::normal_priority(),
@@ -80,7 +81,7 @@ pub fn run(o: &Opts) {
         };
         let spec = crate::jobs::JobSpec {
             kind, from: o.from, end, chunk: o.chunk, arg: arg.clone(), only: only.split(',').filter(|a| !a.is_empty()).map(String::from).collect(),
-            selector: o.selector.clone().unwrap_or_default(), priority, policy, reducer, ..Default::default()
+            selector: o.selector.clone().unwrap_or_default(), priority, policy, reducer, blobs, blob_mode: std::env::var("CK_BLOB_MODE").unwrap_or_default(), ..Default::default()
         };
         send(&mut s, SUBMIT_JSON, &serde_json::to_vec(&spec).unwrap()).unwrap();
     } else {
@@ -101,6 +102,15 @@ pub fn run(o: &Opts) {
     eprintln!("{} numbers in {:.3}s = {:.1} M/s", o.n, t.elapsed().as_secs_f64(), o.n as f64 / t.elapsed().as_secs_f64() / 1e6);
 }
 
+/// `ck run --blob FILE` (repeatable): upload each file once and return the shas, in order (CK_BLOB_<i>).
+fn blob_shas(o: &Opts) -> Vec<String> {
+    std::env::var("CK_BLOB_FILES").unwrap_or_default().lines().filter(|f| !f.is_empty()).map(|f| {
+        let (sha, size, existed) = crate::jobcli::blob_upload(o, f).unwrap_or_else(|e| die(&e));
+        eprintln!("blob {} {size} bytes{}", &sha[..12.min(sha.len())], if existed { " (already on the head)" } else { "" });
+        sha
+    }).collect()
+}
+
 /// `ck run --list FILE --cmd PROG`: one item per line (empty lines skipped), each task runs PROG with its items on stdin (JOB-01).
 fn run_list(o: &Opts, file: &str) {
     let Some(cmd) = &o.cmd else { die("--list needs --cmd \"program\"") };
@@ -112,7 +122,7 @@ fn run_list(o: &Opts, file: &str) {
     let priority = o.priority.as_deref().and_then(|n| crate::jobs::PRIORITIES.iter().position(|p| *p == n).map(|i| i as u8).or_else(|| n.parse().ok())).unwrap_or_else(crate::jobs::normal_priority);
     let spec = crate::jobs::JobSpec {
         kind: KIND_LIST, from: 0, end: items.len() as u64, chunk: o.chunk, arg: cmd.as_bytes().to_vec(), selector: o.selector.clone().unwrap_or_default(), priority,
-        policy: std::env::var("CK_POLICY").unwrap_or_default(), reducer: std::env::var("CK_REDUCER").unwrap_or_default(), items, ..Default::default()
+        policy: std::env::var("CK_POLICY").unwrap_or_default(), reducer: std::env::var("CK_REDUCER").unwrap_or_default(), items, blobs: blob_shas(o), ..Default::default()
     };
     let n = spec.end;
     let (mut r, mut s) = connect_client(o);

@@ -77,6 +77,23 @@ fn audit(ctx: &Ctx, kind: &str, actor: &str, detail: &str) {
     }
 }
 
+/// The `cluster` snapshot, built at most once per ~second and shared by every SSE stream and GET /cluster, so N
+/// console viewers cost the dispatcher one State-lock pass per second instead of N (measured: 25 viewers + 5 pollers
+/// slowed dispatch ~20 % before this).
+pub fn cluster_cached(ctx: &Ctx) -> std::sync::Arc<String> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<Option<(Instant, Arc<String>)>>> = OnceLock::new();
+    let mut g = CACHE.get_or_init(Default::default).lock().unwrap(); // single flight: others wait for this build
+    if let Some((t, s)) = g.as_ref() {
+        if t.elapsed() < Duration::from_millis(900) {
+            return s.clone();
+        }
+    }
+    let s = Arc::new(cluster_json(ctx).to_string());
+    *g = Some((Instant::now(), s.clone()));
+    s
+}
+
 pub fn cluster_json(ctx: &Ctx) -> Value {
     let workers = {
         let st = ctx.sh.0.lock().unwrap();
@@ -209,7 +226,13 @@ pub fn job_spec(v: &Value, who: &Who) -> Result<JobSpec, String> {
         None | Some(Value::Null) => 0,
         Some(x) => uint(x).filter(|n| *n <= 16 << 20).ok_or("mem_mb must be a whole number of MB")?,
     };
-    Ok(JobSpec { max_pcs, placement, mem_mb, name, kind: k, from, end, chunk, arg, only, submitter: who.name.clone(), selector, priority, policy, reducer, items })
+    let blobs: Vec<String> = match v.get("blobs") {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Array(a)) => a.iter().map(|x| x.as_str().filter(|s| crate::blobs::valid_sha(s)).map(String::from)).collect::<Option<_>>().ok_or("blobs must be a list of sha256 hex strings")?,
+        _ => return Err("blobs must be a list of sha256 hex strings".into()),
+    };
+    let blob_mode = str_field(v, "blob_mode").unwrap_or("").to_string();
+    Ok(JobSpec { blobs, blob_mode, max_pcs, placement, mem_mb, name, kind: k, from, end, chunk, arg, only, submitter: who.name.clone(), selector, priority, policy, reducer, items })
 }
 
 /// Fill in the estimated finish of a running job (SCH-03).
@@ -225,6 +248,10 @@ fn job_json(ctx: &Ctx, j: &JobRow) -> Value {
     v["max_pcs"] = json!(max_pcs);
     v["placement"] = json!(placement);
     v["mem_mb"] = json!(mem_mb);
+    if let Some(sp) = ctx.store.spec(j.id).filter(|sp| !sp.blobs.is_empty()) {
+        v["blobs"] = json!(sp.blobs);
+        v["blob_mode"] = json!(sp.blob_mode);
+    }
     v
 }
 
@@ -331,7 +358,7 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
         }
         ("GET", ["users"]) => json_out(200, json!({"users": ctx.store.users()})),
         ("POST", ["users"]) => create_user(ctx, r, me),
-        ("GET", ["cluster"]) => json_out(200, cluster_json(ctx)),
+        ("GET", ["cluster"]) => Out::Plain { status: 200, ctype: "application/json", headers: vec![], body: cluster_cached(ctx).as_bytes().to_vec() },
         ("GET", ["nodes"]) => {
             let (on, org) = (online_ids(ctx), Org::load(ctx));
             let nodes: Vec<Value> = ctx.store.nodes().iter().map(|n| node_json(ctx, n, on.contains(&n.node_id), &org)).collect();
@@ -408,6 +435,9 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
             _ => fail(404, "not_found", "no such reservation"),
         },
         ("GET", ["estimate"]) => estimate(ctx, r),
+        ("GET", ["blobs"]) => blobs_list(ctx),
+        ("GET", ["net"]) => net_json(ctx),
+        ("POST", ["net", "probe"]) => net_probe(ctx, r),
         ("GET", ["config"]) => json_out(200, export_config(ctx)),
         ("POST", ["config"]) => config_import(ctx, r, me),
         ("POST", ["nodes", "state"]) => set_states(ctx, r, me),
@@ -450,7 +480,7 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
         ("GET", ["jobs", id]) | ("GET", ["jobs", id, "result"]) | ("POST", ["jobs", id, "cancel"]) => {
             let Some(job) = id.parse().ok().and_then(|id| ctx.store.job(id)) else { return fail(404, "not_found", "no such job") };
             match (r.method.as_str(), segs.get(2)) {
-                ("GET", None) => json_out(200, json!({"job": job_json(ctx, &etas(ctx, vec![job.clone()]).remove(0)), "parts": ctx.store.parts(job.id).len()})),
+                ("GET", None) => json_out(200, json!({"job": job_json(ctx, &etas(ctx, vec![job.clone()]).remove(0)), "parts": ctx.store.part_count(job.id)})),
                 ("GET", _) => {
                     let red = r.query.get("reducer").map(|s| pct_decode(s)).unwrap_or_else(|| job.reducer.clone());
                     match reduce::reduce(&job.kind, &red, &ctx.store.parts(job.id)) {
@@ -681,7 +711,7 @@ fn put_tunables(ctx: &Ctx, r: &Req, actor: &str) -> Out {
             _ => match x.as_f64() { Some(n) => changes.push((k.clone(), Some(n))), None => return bad(&format!("{k} must be a number or null")) },
         }
     }
-    let before: Vec<f64> = changes.iter().map(|(k, _)| crate::tune::get(k)).collect();
+    let before: Vec<f64> = changes.iter().map(|(k, _)| if crate::tune::knob(k).is_some() { crate::tune::get(k) } else { 0.0 }).collect();
     let json = match crate::tune::set(&changes) { Ok(j) => j, Err(e) => return bad(&e) };
     if let Err(e) = ctx.store.set_meta("tune", &json) {
         return fail(503, "unavailable", &e);
@@ -1009,8 +1039,99 @@ fn add_reservation(ctx: &Ctx, r: &Req, actor: &str) -> Out {
     }
 }
 
+fn blobs_list(ctx: &Ctx) -> Out {
+    let holders = ctx.sh.0.lock().unwrap().workers.values().flat_map(|w| w.have.iter().cloned()).fold(HashMap::<String, u64>::new(), |mut m, s| {
+        *m.entry(s).or_default() += 1;
+        m
+    });
+    let rows = ctx.store.blob_rows();
+    let total: u64 = rows.iter().map(|r| r.1).sum();
+    let list: Vec<Value> = rows.iter().map(|(sha, size, refs, c, l)| json!({"sha256": sha, "size": size, "refs": refs, "holders": holders.get(sha).copied().unwrap_or(0), "created_ms": c, "last_used_ms": l})).collect();
+    json_out(200, json!({"blobs": list, "store_bytes": total, "limit_bytes": (crate::tune::get("blob_store_gb") * 1073741824.0) as u64}))
+}
+
+fn net_json(ctx: &Ctx) -> Out {
+    let st = ctx.sh.0.lock().unwrap();
+    let mut labs: HashMap<String, Vec<f64>> = HashMap::new();
+    let nodes: Vec<Value> = st
+        .workers
+        .values()
+        .filter(|w| w.hello.as_ref().is_some_and(|h| !h.virtual_node))
+        .map(|w| {
+            let lab = crate::blobs::lab_of(&w.addr);
+            labs.entry(lab.clone()).or_default().extend(w.net_mbps);
+            let h = w.hello.as_ref().unwrap();
+            json!({"node_id": h.node_id, "host": h.host, "net_mbps": w.net_mbps, "rtt_ms": w.rtt_ms, "probed_ms": w.probed.map(|t| now_ms() - t.elapsed().as_millis() as i64), "lab": lab})
+        })
+        .collect();
+    drop(st);
+    let labs: Vec<Value> = labs.into_iter().map(|(lab, mut v)| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        json!({"lab": lab, "pcs": v.len(), "mbps": v.get(v.len() / 2)})
+    }).collect();
+    let (up, guess) = crate::blobs::head_uplink();
+    json_out(200, json!({"head_uplink_mbps": up, "head_uplink_assumed": guess, "head_bytes_sent": crate::blobs::SERVED.load(std::sync::atomic::Ordering::Relaxed), "nodes": nodes, "labs": labs}))
+}
+
+fn net_probe(ctx: &Ctx, r: &Req) -> Out {
+    let v = parse_body(r).unwrap_or(json!({}));
+    let ids: Vec<String> = v["node_ids"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+    let mut st = ctx.sh.0.lock().unwrap();
+    let burst = v["burst"].as_bool() == Some(true);
+    let mut n = 0;
+    for w in st.workers.values_mut().filter(|w| w.hello.as_ref().is_some_and(|h| !h.virtual_node && (ids.is_empty() || ids.contains(&h.node_id)))) {
+        // burst: every PC at once, to learn the head uplink; otherwise measure each PC's own link, two at a time
+        if burst {
+            (w.probe_now, w.probe_burst) = (true, true);
+        } else {
+            w.probed = None;
+        }
+        n += 1;
+    }
+    json_out(200, json!({"queued": n}))
+}
+
+/// New form: ?bytes=&work_s=&items=&selector=&max_pcs=&sha= (docs/API.md "Bulk distribution").
+fn estimate_bulk(ctx: &Ctx, r: &Req) -> Out {
+    let num = |k: &str| r.query.get(k).and_then(|s| s.parse::<f64>().ok()).filter(|n| n.is_finite() && *n >= 0.0);
+    let sel = match select::parse(&pct_decode(r.query.get("selector").map_or("", String::as_str))) {
+        Ok(s) => s,
+        Err(e) => return bad(&e),
+    };
+    let sha = r.query.get("sha").filter(|s| crate::blobs::valid_sha(s)).cloned();
+    let (bytes, work_s, items, max_pcs) = (num("bytes").unwrap_or(0.0), num("work_s").unwrap_or(0.0), num("items").unwrap_or(0.0) as u64, num("max_pcs").unwrap_or(0.0) as usize);
+    let (pcs, mut assumed) = crate::blobs::est_pcs(ctx, &sel, sha.as_deref());
+    let (up, guess) = crate::blobs::head_uplink();
+    if guess {
+        assumed.push("head_uplink");
+    }
+    let (fanout, seeds) = (crate::tune::n("blob_peer_fanout") as usize, crate::tune::n("blob_seeds") as usize);
+    let Some(p) = crate::blobs::plan(&pcs, bytes, work_s, items, up, fanout, seeds, max_pcs) else {
+        return json_out(200, json!({"pcs": 0, "matching_pcs": 0, "best": null, "why": "no PC can work now", "assumed": assumed}));
+    };
+    let alt = |a: &crate::blobs::Alt| json!({"strategy": a.strategy, "pcs": a.pcs, "transfer_s": a.transfer_s, "finish_s": a.finish_s});
+    let fin = |t: f64| t + p.compute_s + p.overhead_s;
+    let why = if bytes > 0.0 {
+        format!("data {}: {}, {} on {} PCs; {} would take {}", crate::blobs::human_bytes(bytes), p.best.strategy, crate::blobs::human_secs(p.best.transfer_s), p.best.pcs,
+            if p.best.strategy == "peer" { "direct" } else { "peer" }, crate::blobs::human_secs(if p.best.strategy == "peer" { p.transfer_direct_s } else { p.transfer_peer_s }))
+    } else {
+        "no data to move".to_string()
+    };
+    json_out(200, json!({
+        "pcs": p.best.pcs, "matching_pcs": pcs.len(), "bytes": bytes, "cached_pcs": pcs.iter().filter(|c| c.cached).count(), "work_s": work_s,
+        "compute_s": p.compute_s, "overhead_s": p.overhead_s,
+        "transfer_s": {"direct": p.transfer_direct_s, "peer": p.transfer_peer_s}, "finish_s": {"direct": fin(p.transfer_direct_s), "peer": fin(p.transfer_peer_s)},
+        "head_bytes": {"direct": p.head_bytes_direct, "peer": p.head_bytes_peer},
+        "best": {"strategy": p.best.strategy, "pcs": p.best.pcs, "finish_s": p.best.finish_s},
+        "alternatives": p.alternatives.iter().map(alt).collect::<Vec<_>>(), "why": why, "head_uplink_mbps": up, "assumed": assumed
+    }))
+}
+
 /// How long would n numbers take now (SCH-03)?
 fn estimate(ctx: &Ctx, r: &Req) -> Out {
+    if r.query.contains_key("bytes") || r.query.contains_key("work_s") {
+        return estimate_bulk(ctx, r);
+    }
     let n = r.query.get("n").and_then(|s| s.parse::<u64>().ok()).filter(|n| *n > 0);
     let Some(n) = n else { return bad("n must be a whole number above 0") };
     let sel = match select::parse(&pct_decode(r.query.get("selector").map_or("", String::as_str))) {
@@ -1310,7 +1431,8 @@ fn login(ctx: &Ctx, auth: &Auth, r: &Req) -> Out {
             with_cookie(json_out(200, json!({"user": {"name": w.name, "role": w.role.name()}})), session_cookie(&sid, 7 * 86400))
         }
         Err(LoginErr::Throttled) => {
-            audit(ctx, "user.login_failed", name, &format!("{} (throttled)", r.ip));
+            // no audit row: the 5th failure that caused the throttle is on record, and a flood of throttled tries must not
+            // write one event row (and one 8 KiB SSE frame per open console) per request
             fail(429, "too_many_requests", "too many failed sign-ins; try again in a few minutes")
         }
         Err(LoginErr::Bad) => {
@@ -1447,6 +1569,48 @@ pub fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// PUT /api/v1/blobs (streamed to disk) and GET/HEAD /api/v1/blobs/{sha} (streamed from disk). true = answered here;
+/// Err(request) = not signed in (fall through so the usual 401/403 is produced).
+fn blob_http(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request, path: &str, cookie: Option<&str>, bearer: Option<&str>) -> Result<(), tiny_http::Request> {
+    let method = rq.method().as_str().to_string();
+    // a job's own upload capability (env CK_BLOB_PUT_TOKEN on the PC): PUT only, only while that job is unfinished
+    let job_tok = bearer.and_then(crate::blobs::check_put_token).filter(|j| method == "PUT" && ctx.store.job(*j).is_some_and(|r| !r.state.finished()));
+    let who = match (job_tok, auth.who(&ctx.store, cookie, bearer).filter(|w| w.role >= Role::Researcher)) {
+        (Some(j), _) => Who { name: format!("job-{j}"), role: Role::Researcher },
+        (None, Some(w)) => w,
+        _ => return Err(rq),
+    };
+    let json_resp = |status: u16, v: Value| Response::from_data(v.to_string().into_bytes()).with_status_code(status).with_header(header("Content-Type", "application/json"));
+    if method == "PUT" {
+        let max = (crate::tune::get("blob_max_mb") * 1048576.0) as u64;
+        let res = crate::blobs::ingest(&mut rq.as_reader().take(max + 1), &crate::blobs::store_dir(), max);
+        let resp = match res {
+            Ok((sha, size, existed)) => {
+                ctx.store.put_blob(&sha, size, now_ms());
+                if !existed {
+                    audit(ctx, "blob.put", &who.name, &format!("{sha} {size} bytes"));
+                    crate::blobs::gc_store(ctx);
+                }
+                json_resp(200, json!({"sha256": sha, "size": size, "existed": existed}))
+            }
+            Err(e) => json_resp(400, json!({"error": {"code": "invalid_request", "message": format!("blob: {e}")}})),
+        };
+        let _ = rq.respond(resp);
+        return Ok(());
+    }
+    let sha = path.trim_start_matches("/api/v1/blobs/");
+    let file = crate::blobs::valid_sha(sha).then(|| crate::blobs::store_dir().join(sha)).and_then(|p| std::fs::File::open(p).ok().filter(|_| ctx.store.blob_size(sha).is_some()));
+    let Some(f) = file else {
+        let _ = rq.respond(json_resp(404, json!({"error": {"code": "not_found", "message": "no such blob"}})));
+        return Ok(());
+    };
+    ctx.store.touch_blob(sha, now_ms());
+    let len = f.metadata().map(|m| m.len() as usize).ok();
+    let r = Response::new(tiny_http::StatusCode(200), vec![header("Content-Type", "application/octet-stream")], f, len, None);
+    let _ = rq.respond(r);
+    Ok(())
+}
+
 fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
     let url = rq.url().to_string();
     let (path, q) = url.split_once('?').unwrap_or((&url, ""));
@@ -1455,6 +1619,12 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
     let cookie = hdr("Cookie").and_then(|c| c.split(';').filter_map(|p| p.trim().strip_prefix("ck_session=")).next().map(String::from));
     let bearer = hdr("Authorization").and_then(|a| a.strip_prefix("Bearer ").map(|t| t.trim().to_string()));
     let ip = rq.remote_addr().map_or(IpAddr::from([0, 0, 0, 0]), |a| a.ip());
+    if path.starts_with("/api/v1/blobs") && matches!(rq.method().as_str(), "PUT" | "GET" | "HEAD") && path != "/api/v1/blobs" || (path == "/api/v1/blobs" && rq.method().as_str() == "PUT") {
+        match blob_http(ctx, auth, rq, path, cookie.as_deref(), bearer.as_deref()) {
+            Ok(()) => return,
+            Err(r) => rq = r,
+        }
+    }
     let mut body = vec![];
     if matches!(rq.method().as_str(), "POST" | "PUT" | "PATCH") {
         // only a signed-in operator may send a big list-job body; everyone else is held to 1 MiB before anything is read
@@ -1479,9 +1649,14 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
             rq.respond(r)
         }
         Out::Sse => {
+            if SSE_OPEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= SSE_MAX {
+                SSE_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = rq.respond(Response::from_string("too many open event streams").with_status_code(503));
+                return;
+            }
             let c = ctx.clone();
             let (c2, mut last) = (ctx.clone(), String::new());
-            let sse = Sse::new(ctx.bus.subscribe(), move || cluster_json(&c).to_string()).with_ha(move || {
+            let sse = Sse::new(ctx.bus.subscribe(), move || cluster_cached(&c).to_string()).with_ha(move || {
                 let sig = ha_sig(&c2);
                 (sig != last).then(|| {
                     last = sig;
@@ -1492,10 +1667,19 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
             for (k, v) in [("Content-Type", "text/event-stream"), ("Cache-Control", "no-cache"), ("X-Accel-Buffering", "no")] {
                 r.add_header(header(k, v));
             }
-            rq.respond(r)
+            // an open stream lives for hours: it gets its own thread, so 32 browser tabs cannot use up the request pool
+            // and leave every API call (and the console itself) waiting
+            thread::spawn(move || {
+                let _ = rq.respond(r);
+                SSE_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            });
+            return
         }
     };
 }
+
+static SSE_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const SSE_MAX: usize = 512; // ponytail: one thread per viewer; an async server would lift this
 
 /// Blocks serving HTTP.
 pub fn serve(ctx: Arc<Ctx>) {

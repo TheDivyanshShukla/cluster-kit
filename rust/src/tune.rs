@@ -96,6 +96,17 @@ pub const KNOBS: &[Knob] = &[
     k("alert_head_cpu_pct", "Alerts", 85.0, 10.0, 100.0, "%", Head, "head_hot: head process CPU above this for 60 s."),
     k("alert_standby_lag", "Alerts", 5000.0, 1.0, 100_000_000.0, "changes", Head, "standby_behind: replication lag above this for 30 s."),
     k("alert_no_standby_s", "Alerts", 60.0, 5.0, 86_400.0, "s", Head, "no_standby: fewer standbys than the target for this long."),
+    // network (src/blobs.rs, docs/BULK.md)
+    k("blob_store_gb", "Network", 50.0, 0.1, 100_000.0, "GB", Head, "Blob store on the head; above this the least recently used blobs no job names are deleted."),
+    k("blob_cache_gb", "Network", 20.0, 0.1, 100_000.0, "GB", Agent, "Blob cache on each PC; above this the least recently used blobs are deleted."),
+    k("blob_peer_fanout", "Network", 4.0, 1.0, 64.0, "PCs", Both, "How many PCs one PC serves a blob to at once (peer distribution)."),
+    k("blob_piece_mb", "Network", 4.0, 0.25, 256.0, "MB", Both, "Blob transfer piece size; each piece has its own sha256 so a broken transfer resumes."),
+    k("blob_seeds", "Network", 2.0, 1.0, 64.0, "PCs", Head, "Peer distribution: PCs per lab the head sends a blob to first; the rest get it from peers."),
+    k("blob_max_mb", "Network", 4096.0, 1.0, 1_000_000.0, "MB", Head, "Largest single blob accepted by PUT /api/v1/blobs."),
+    k("net_probe_mb", "Network", 16.0, 0.1, 1024.0, "MB", Head, "Size of the probe transfer that measures a PC's link speed."),
+    k("net_probe_every_s", "Network", 3600.0, 10.0, 604_800.0, "s", Head, "How often idle PCs get their link speed measured again."),
+    k("blob_auto_kb", "Network", 64.0, 1.0, 1_048_576.0, "KB", Both, "SDK: arguments and results above this size travel as blobs."),
+    k("head_uplink_mbps_cap", "Network", 0.0, 0.0, 1_000_000.0, "Mbit/s", Head, "Head uplink used in estimates; 0 = learned from parallel transfers."),
     // logging (src/log.rs, docs/LOGGING.md)
     k("log_level", "Logging", 3.0, 0.0, 4.0, "level", Both, "What is written to ck-data/logs: 0 off, 1 error, 2 warn, 3 info, 4 debug."),
     k("log_chunks", "Logging", 0.0, 0.0, 1.0, "0/1", Both, "1 = also log every chunk dispatch and result (debug lines; a lot of output on big jobs)."),

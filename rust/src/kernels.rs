@@ -235,7 +235,11 @@ fn run_cmd_par(job: u64, cmd: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, S
 fn run_list_par(job: u64, arg: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, String)> {
     let split = arg.iter().position(|c| *c == 0).unwrap_or(arg.len());
     let (cmd, items) = (&arg[..split], arg.get(split + 1..).unwrap_or(&[]));
-    let lines: Vec<&[u8]> = if items.is_empty() { vec![] } else { items.split(|c| *c == b'\n').collect() };
+    let lines: Vec<std::borrow::Cow<[u8]>> = if items.is_empty() {
+        vec![]
+    } else {
+        items.split(|c| *c == b'\n').map(|l| if l.starts_with(b"@blob:") { std::borrow::Cow::Owned(crate::blobs::resolve_item(l)) } else { std::borrow::Cow::Borrowed(l) }).collect()
+    };
     let n = lines.len() as u64;
     let parts = pieces_for(job, n, copies_for(job, rayon::current_num_threads() as u64)).min(n).max(1);
     let step = n.div_ceil(parts).max(1);
@@ -318,6 +322,7 @@ fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, stdin: Option<&
     let attempt = env::var("CK_ATTEMPT").unwrap_or_else(|_| "1".into());
     c.env("CK_JOB", job.to_string()).env("CK_TASK", format!("{job}:{a}-{b}")).env("CK_ATTEMPT", attempt)
         .env("CK_THREADS", pieces.to_string()).env("CK_START", a.to_string()).env("CK_END", b.to_string()).env("CK_SCRATCH", &scratch);
+    c.envs(crate::blobs::env_for(job)); // wave 13: CK_BLOBS, CK_BLOB_<i>
     let out = match stdin {
         None => c.output(),
         Some(items) => c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().and_then(|mut ch| {

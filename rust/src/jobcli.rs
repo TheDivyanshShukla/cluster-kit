@@ -183,6 +183,7 @@ pub const CLI_MAP: &[(&str, &str, &str)] = &[
     ("GET", "/windows", "ck admin windows"), ("POST", "/windows", "ck admin window"), ("DELETE", "/windows/{id}", "ck admin window-rm"),
     ("GET", "/reservations", "ck admin reservations"), ("POST", "/reservations", "ck admin reservation"), ("DELETE", "/reservations/{id}", "ck admin reservation-rm"),
     ("GET", "/estimate", "ck admin estimate"),
+    ("PUT", "/blobs", "ck blob put FILE"), ("GET", "/blobs", "ck blob ls"), ("GET", "/blobs/{sha}", "ck blob get SHA > file"), ("GET", "/net", "ck admin net"), ("POST", "/net/probe", "ck admin net probe"),
     ("GET", "/config", "ck admin config-export"), ("POST", "/config", "ck admin config-import"),
 ];
 
@@ -230,7 +231,7 @@ fn fmt_local(ms: i64, offset_min: i64) -> String {
 }
 
 fn usage_admin() -> ! {
-    die("usage: ck admin nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | heads | tune [KEY VALUE|default] | alerts [ack ID] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
+    die("usage: ck admin nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | net [probe] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | heads | tune [KEY VALUE|default] | alerts [ack ID] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
 }
 
 fn send(o: &Opts, method: &str, path: &str, body: Value) -> Value {
@@ -391,6 +392,20 @@ pub fn admin(o: &Opts) {
         Some("reservation-rm") => {
             send(o, "DELETE", &format!("/api/v1/reservations/{}", num(o, 1)), Value::Null);
             println!("deleted reservation {}", num(o, 1));
+        }
+        Some("net") => {
+            if rest.get(1).map(String::as_str) == Some("probe") {
+                let v = send(o, "POST", "/api/v1/net/probe", serde_json::json!({}));
+                return println!("probing {} PC(s); run `ck admin net` in a few seconds", dash(&v["queued"]));
+            }
+            let v = call(o, "GET", "/api/v1/net");
+            println!("head uplink {} Mbit/s{}   head bytes sent {}", dash(&v["head_uplink_mbps"]), if v["head_uplink_assumed"] == true { " (assumed)" } else { "" }, dash(&v["head_bytes_sent"]));
+            for n in v["nodes"].as_array().into_iter().flatten() {
+                println!("  {:<18} lab {:<12} {:>9} Mbit/s  rtt {:>7} ms", dash(&n["host"]), dash(&n["lab"]), n["net_mbps"].as_f64().map_or("-".into(), |x| format!("{x:.0}")), n["rtt_ms"].as_f64().map_or("-".into(), |x| format!("{x:.2}")));
+            }
+            for l in v["labs"].as_array().into_iter().flatten() {
+                println!("lab {:<12} {} PCs, median {} Mbit/s", dash(&l["lab"]), dash(&l["pcs"]), dash(&l["mbps"]));
+            }
         }
         Some("estimate") => {
             let v = call(o, "GET", &format!("/api/v1/estimate?n={}&selector={}", num(o, 1), enc(&rest[2..].join(" "))));
@@ -554,5 +569,49 @@ mod tests {
         assert!(parse_reply(b"junk").is_err());
         let j = serde_json::json!({"id": 3, "state": "done", "kind": "sha", "done": 10, "total": 10, "submitter": "ann", "name": "x"});
         assert!(row(&j).contains("done") && row(&j).contains("ann"));
+    }
+}
+
+/// Upload a file as a blob over the HTTP API, streaming it (no copy in memory): (sha256, size, existed).
+pub fn blob_upload(o: &Opts, file: &str) -> Result<(String, u64, bool), String> {
+    let host = o.head.clone().unwrap_or_else(|| "127.0.0.1".into());
+    let mut f = std::fs::File::open(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let mut s = TcpStream::connect((host.as_str(), dash_port())).map_err(|e| format!("cannot reach the head at {host}:{}: {e}", dash_port()))?;
+    let tok = std::env::var("CK_TOKEN").map(|t| format!("Authorization: Bearer {}\r\n", t.trim())).unwrap_or_default();
+    s.write_all(format!("PUT /api/v1/blobs HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\n{tok}\r\n").as_bytes()).map_err(|e| e.to_string())?;
+    std::io::copy(&mut f, &mut s).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(Duration::from_secs(600))).ok();
+    let mut raw = vec![];
+    s.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    let v = ok_json(parse_reply(&raw)?)?;
+    Ok((v["sha256"].as_str().unwrap_or("").to_string(), v["size"].as_u64().unwrap_or(0), v["existed"].as_bool().unwrap_or(false)))
+}
+
+/// `ck blob put FILE | ls | get SHA`
+pub fn blob(o: &Opts) {
+    match o.rest.first().map(String::as_str) {
+        Some("put") => {
+            let f = o.rest.get(1).unwrap_or_else(|| die("usage: ck blob put FILE"));
+            let (sha, size, existed) = blob_upload(o, f).unwrap_or_else(|e| die(&e));
+            println!("{sha}  {size} bytes{}", if existed { "  (already stored)" } else { "" });
+        }
+        Some("ls") => {
+            let v = call(o, "GET", "/api/v1/blobs");
+            println!("{:<64} {:>12} {:>5} {:>7}", "SHA256", "BYTES", "JOBS", "PCS");
+            for b in v["blobs"].as_array().into_iter().flatten() {
+                println!("{:<64} {:>12} {:>5} {:>7}", dash(&b["sha256"]), dash(&b["size"]), dash(&b["refs"]), dash(&b["holders"]));
+            }
+            println!("store {} bytes of {}", dash(&v["store_bytes"]), dash(&v["limit_bytes"]));
+        }
+        Some("get") => {
+            let sha = o.rest.get(1).unwrap_or_else(|| die("usage: ck blob get SHA > file"));
+            let r = request(o, "GET", &format!("/api/v1/blobs/{sha}"), None, &[]).unwrap_or_else(|e| die(&e));
+            if r.status >= 400 {
+                die(&ok_json(r).unwrap_err());
+            }
+            std::io::stdout().write_all(&r.body).ok();
+        }
+        _ => die("usage: ck blob put FILE | ls | get SHA   (head: --head IP; auth: CK_TOKEN)"),
     }
 }

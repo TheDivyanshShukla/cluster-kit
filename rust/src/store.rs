@@ -78,9 +78,16 @@ CREATE TABLE experiments (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NU
   raw_csv TEXT NOT NULL, runs_jsonl TEXT NOT NULL, sim TEXT);
 CREATE TABLE samples (ts_ms INTEGER PRIMARY KEY, online INTEGER NOT NULL, busy INTEGER NOT NULL, rate REAL NOT NULL, energy_j REAL NOT NULL);
 CREATE TABLE job_stats (job_id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+", "
+CREATE TABLE blobs (sha TEXT PRIMARY KEY, size INTEGER NOT NULL, created_ms INTEGER NOT NULL, last_used_ms INTEGER NOT NULL);
+ALTER TABLE jobs ADD COLUMN blobs TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE jobs ADD COLUMN blob_mode TEXT NOT NULL DEFAULT '';
+ALTER TABLE nodes ADD COLUMN net_mbps REAL;
+ALTER TABLE nodes ADD COLUMN rtt_ms REAL;
+ALTER TABLE nodes ADD COLUMN probed_ms INTEGER;
 "];
 
-const NODE_SEL: &str = "SELECT node_id,host,addr,inventory,first_seen_ms,last_seen_ms,state,state_reason,state_by,lab_id,x,y,calib_mhs FROM nodes";
+const NODE_SEL: &str = "SELECT node_id,host,addr,inventory,first_seen_ms,last_seen_ms,state,state_reason,state_by,lab_id,x,y,calib_mhs,net_mbps,rtt_ms,probed_ms FROM nodes";
 
 fn node_row(r: &Row) -> rusqlite::Result<NodeRow> {
     Ok(NodeRow {
@@ -97,6 +104,9 @@ fn node_row(r: &Row) -> rusqlite::Result<NodeRow> {
         x: r.get::<_, Option<i64>>(10)?.map(|v| v as u32),
         y: r.get::<_, Option<i64>>(11)?.map(|v| v as u32),
         calib_mhs: r.get(12)?,
+        net_mbps: r.get(13)?,
+        rtt_ms: r.get(14)?,
+        probed_ms: r.get(15)?,
     })
 }
 
@@ -198,6 +208,7 @@ impl Store {
         .map_err(e)?;
         let id = c.last_insert_rowid();
         drop(c);
+        self.set_job_blobs(id as u64, spec);
         if !spec.items.is_empty() {
             if let Err(x) = self.put_items(id as u64, &spec.items) {
                 let _ = self.db().execute("DELETE FROM jobs WHERE id=?", [id]);
@@ -226,8 +237,9 @@ impl Store {
     /// The spec a job was created with (arg and only included), for resuming after a restart.
     pub fn spec(&self, id: u64) -> Option<JobSpec> {
         self.db()
-            .query_row("SELECT name,kind,from_n,end_n,chunk,arg,only_json,submitter,selector,priority,policy,reducer,max_pcs,placement,mem_mb FROM jobs WHERE id=?", [id as i64], |r| {
+            .query_row("SELECT name,kind,from_n,end_n,chunk,arg,only_json,submitter,selector,priority,policy,reducer,max_pcs,placement,mem_mb,blobs,blob_mode FROM jobs WHERE id=?", [id as i64], |r| {
                 let only: String = r.get(6)?;
+                let blobs: String = r.get(15)?;
                 Ok(JobSpec {
                     name: r.get(0)?,
                     kind: r.get::<_, i64>(1)? as u8,
@@ -244,6 +256,8 @@ impl Store {
                     max_pcs: r.get::<_, i64>(12)?.clamp(0, u32::MAX as i64) as u32,
                     placement: r.get(13)?,
                     mem_mb: r.get::<_, i64>(14)?.max(0) as u64,
+                    blobs: serde_json::from_str(&blobs).unwrap_or_default(),
+                    blob_mode: r.get(16)?,
                     ..Default::default() // items via items()
                 })
             })
@@ -288,6 +302,10 @@ impl Store {
         st.query_map([job as i64], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get(2)?)))
             .map(|m| m.flatten().collect())
             .unwrap_or_default()
+    }
+    /// How many parts a job has stored (a COUNT: GET /jobs/ID used to read every part body just to take `.len()`).
+    pub fn part_count(&self, job: u64) -> u64 {
+        self.db().query_row("SELECT COUNT(*) FROM parts WHERE job_id=?", [job as i64], |r| r.get::<_, i64>(0)).unwrap_or(0) as u64
     }
     /// Completed ranges of a job, merged and ordered ([1,5) + [5,9) = [1,9)).
     pub fn done_ranges(&self, job: u64) -> Vec<(u64, u64)> {
@@ -1089,6 +1107,41 @@ impl Store {
         let (a, b) = (a.min(i64::MAX as u64) as i64, b.min(i64::MAX as u64) as i64);
         st.query_map(params![job as i64, a, b], |r| r.get(0)).map(|m| m.flatten().collect()).unwrap_or_default()
     }
+    // ---- wave 13: blobs (docs/BULK.md)
+    /// Store the blob list and mode of a job (columns apart from the main insert so the old statements stay as they are).
+    pub fn set_job_blobs(&self, id: u64, spec: &JobSpec) {
+        if spec.blobs.is_empty() && spec.blob_mode.is_empty() {
+            return;
+        }
+        let b = serde_json::to_string(&spec.blobs).unwrap_or_else(|_| "[]".into());
+        let _ = self.db().execute("UPDATE jobs SET blobs=?, blob_mode=? WHERE id=?", params![b, spec.blob_mode, id as i64]);
+    }
+    pub fn put_blob(&self, sha: &str, size: u64, now_ms: i64) {
+        let _ = self.db().execute(
+            "INSERT INTO blobs (sha,size,created_ms,last_used_ms) VALUES (?1,?2,?3,?3) ON CONFLICT(sha) DO UPDATE SET last_used_ms=?3",
+            params![sha, size as i64, now_ms],
+        );
+    }
+    pub fn blob_size(&self, sha: &str) -> Option<u64> {
+        self.db().query_row("SELECT size FROM blobs WHERE sha=?", [sha], |r| r.get::<_, i64>(0)).optional().ok().flatten().map(|n| n as u64)
+    }
+    pub fn touch_blob(&self, sha: &str, now_ms: i64) {
+        let _ = self.db().execute("UPDATE blobs SET last_used_ms=? WHERE sha=?", params![now_ms, sha]);
+    }
+    /// (sha, size, refs, created_ms, last_used_ms), newest first. refs = unfinished jobs that name the blob.
+    pub fn blob_rows(&self) -> Vec<(String, u64, u64, i64, i64)> {
+        let c = self.db();
+        let Ok(mut st) = c.prepare(
+            "SELECT sha,size,(SELECT COUNT(*) FROM jobs WHERE state IN ('queued','running') AND blobs LIKE '%\"' || blobs.sha || '\"%'),created_ms,last_used_ms FROM blobs ORDER BY created_ms DESC",
+        ) else { return vec![] };
+        st.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64, r.get(3)?, r.get(4)?))).map(|m| m.flatten().collect()).unwrap_or_default()
+    }
+    pub fn delete_blob(&self, sha: &str) {
+        let _ = self.db().execute("DELETE FROM blobs WHERE sha=?", [sha]);
+    }
+    pub fn set_node_net(&self, node_id: &str, mbps: f64, rtt_ms: f64, now_ms: i64) {
+        let _ = self.db().execute("UPDATE nodes SET net_mbps=?, rtt_ms=?, probed_ms=? WHERE node_id=?", params![mbps, rtt_ms, now_ms, node_id]);
+    }
     pub fn set_node_calib(&self, node_id: &str, mhs: f64) -> Result<(), String> {
         match self.db().execute("UPDATE nodes SET calib_mhs=? WHERE node_id=?", params![mhs, node_id]).map_err(e)? {
             0 => Err(format!("no node {node_id}")),
@@ -1253,6 +1306,7 @@ impl Store {
         if n == 0 {
             return Ok(false);
         }
+        self.set_job_blobs(id, spec);
         if !spec.items.is_empty() {
             if let Err(x) = self.put_items(id, &spec.items) {
                 let _ = self.db().execute("DELETE FROM jobs WHERE id=?", [id as i64]);

@@ -102,6 +102,8 @@ struct Inner {
     persisted: u64,
     ring: VecDeque<Entry>,
     ring_bytes: usize,
+    /// keep the ring until this instant even with no standby linked (a standby that blinks off replays instead of copying the database)
+    ring_until: Option<Instant>,
     links: Vec<Link>, // order = standby priority
     next_link: u64,
     members: HashMap<String, Instant>,
@@ -156,6 +158,7 @@ fn init(ctx: &Ctx) -> MutexGuard<'_, Inner> {
         g.last = num(st.meta("last_seq")) + 100;
         g.persisted = g.last;
         let _ = st.set_meta("last_seq", &g.last.to_string());
+        ensure_fence_key(st);
         g.candidate = st.meta("candidate").as_deref() == Some("1");
         let saved = st.meta("membership").unwrap_or_default();
         for id in serde_json::from_str::<Vec<String>>(&saved).unwrap_or_default() {
@@ -180,27 +183,41 @@ pub fn status(ctx: &Ctx) -> Status {
 
 const RING_BYTES: usize = 64 << 20;
 
-/// Rough memory of a ring entry: 32 bytes per element of a part body, plus a little for the rest.
+/// Rough memory of a ring entry: 32 bytes per element of a part body; any other entry (config, job with its list items)
+/// by its JSON size, so the byte bound sees them too.
 fn entry_cost(e: &Entry) -> usize {
-    256 + e.data.get("body").and_then(|b| b.as_array()).map_or(0, |a| a.len() * 32)
+    256 + e.data.get("body").and_then(|b| b.as_array()).map_or_else(|| e.data.to_string().len(), |a| a.len() * 32)
 }
 
 /// Append an entry to the change log and send it to the standbys. Returns its seq.
 /// Safe to call while holding the head's State lock (never takes it).
 pub fn record(ctx: &Ctx, kind: &str, data: serde_json::Value) -> u64 {
+    record_with(ctx, kind, || data)
+}
+
+/// Like `record`, but `data` is only built when someone can use it: a part body becomes one JSON number per byte
+/// (~32 bytes each), so with no standby (and none in the last two minutes) building it for every result was pure waste
+/// (a 1 MB result: ~30 ms and 32 MB under the State lock).
+pub fn record_with(ctx: &Ctx, kind: &str, data: impl FnOnce() -> serde_json::Value) -> u64 {
     let mut g = init(ctx);
     g.last += 1;
-    let e = Entry { seq: g.last, epoch: g.epoch, kind: kind.into(), data };
-    // Bounded by count and by memory: a "part" body is a JSON array of numbers (~32 bytes per result byte in memory),
-    // so 100,000 big results would fill the head's RAM. A standby behind the dropped entries gets a snapshot instead.
-    let cost = entry_cost(&e);
-    while g.ring.len() >= crate::tune::n("ring_max") as usize || (g.ring_bytes + cost > RING_BYTES && !g.ring.is_empty()) {
-        let Some(old) = g.ring.pop_front() else { break };
-        g.ring_bytes = g.ring_bytes.saturating_sub(entry_cost(&old));
+    if g.links.is_empty() && !g.ring_until.is_some_and(|t| Instant::now() < t) {
+        // nobody to send to or replay for: an empty ring keeps "the ring is the latest entries" true (plan() then sends a snapshot)
+        g.ring.clear();
+        g.ring_bytes = 0;
+    } else {
+        let e = Entry { seq: g.last, epoch: g.epoch, kind: kind.into(), data: data() };
+        // Bounded by count and by memory: a "part" body is a JSON array of numbers (~32 bytes per result byte in memory),
+        // so 100,000 big results would fill the head's RAM. A standby behind the dropped entries gets a snapshot instead.
+        let cost = entry_cost(&e);
+        while g.ring.len() >= crate::tune::n("ring_max") as usize || (g.ring_bytes + cost > RING_BYTES && !g.ring.is_empty()) {
+            let Some(old) = g.ring.pop_front() else { break };
+            g.ring_bytes = g.ring_bytes.saturating_sub(entry_cost(&old));
+        }
+        g.ring_bytes += cost;
+        g.ring.push_back(e.clone());
+        g.links.retain(|l| l.tx.send(e.clone()).is_ok());
     }
-    g.ring_bytes += cost;
-    g.ring.push_back(e.clone());
-    g.links.retain(|l| l.tx.send(e.clone()).is_ok());
     let seq = g.last;
     let due = seq - g.persisted >= 64;
     if due {
@@ -309,7 +326,46 @@ pub fn config_entry(ctx: &Ctx) -> Value {
 }
 
 /// Store meta keys copied to standbys inside "config" entries (power, standby target, every tunable).
-pub const SETTINGS_META: &[&str] = &["power", "ha_settings", "tune", "asleep"];
+pub const SETTINGS_META: &[&str] = &["power", "ha_settings", "tune", "asleep", "fence_key"];
+
+/// Fence key: 32 random bytes in store meta (replicated to standbys, so a promoted standby has it). Epoch beacons that
+/// can fence a head or redirect a standby are signed with it; an unsigned `ck/1` beacon is only for agents, who follow
+/// it but cannot be harmed by it beyond a failed connect. Without this, one UDP packet from any host on the LAN
+/// ("ck/1 lab 1.2.3.4:7700 e=999") made the primary drop every agent and restart as a standby of 1.2.3.4.
+pub fn fence_key(st: &Store) -> Option<Vec<u8>> {
+    st.meta("fence_key").map(|h| unhex(&h)).filter(|k| k.len() == 32)
+}
+
+/// The standby's copy of the key, for watch_beacons (set at start, after a snapshot and after each config entry).
+static SB_FENCE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+fn sb_fence(st: &Store) {
+    *SB_FENCE.lock().unwrap() = fence_key(st);
+}
+
+pub fn ensure_fence_key(st: &Store) {
+    if fence_key(st).is_none() {
+        let _ = st.set_meta("fence_key", &hex(&crate::auth::nonce()));
+    }
+}
+
+/// "ck/f <name> <ip:port> e=<epoch> m=<hex mac>" (a head's signed beacon, sent beside the plain one).
+pub fn fence_msg(key: &[u8], name: &str, addr: &str, epoch: u64) -> String {
+    let body = format!("{name} {addr} e={epoch}");
+    format!("ck/f {body} m={}", hex(&crate::auth::hmac_sha256(key, body.as_bytes())[..16]))
+}
+
+/// (cluster name, "ip:port", epoch) of a signed beacon whose MAC checks out under `key`.
+pub fn fence_check(key: &[u8], text: &str) -> Option<(String, String, u64)> {
+    let (body, mac) = text.strip_prefix("ck/f ")?.trim().rsplit_once(" m=")?;
+    let want = hex(&crate::auth::hmac_sha256(key, body.as_bytes())[..16]);
+    if !crate::auth::ct_eq(want.as_bytes(), mac.trim().as_bytes()) {
+        return None;
+    }
+    let (rest, e) = body.rsplit_once(" e=")?;
+    let (name, addr) = rest.rsplit_once(' ')?;
+    Some((name.trim().to_string(), addr.to_string(), e.trim().parse().ok()?))
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Plan {
@@ -403,6 +459,33 @@ pub fn link_key(node_key: &[u8], salt: &[u8]) -> [u8; 32] {
     crate::auth::hmac_sha256(node_key, &[b"ck-repl/1 ".as_slice(), salt].concat())
 }
 
+/// Send the database copy at `file`: one SNAPSHOT frame up to SNAP_ONE (older standbys read that), else a BEGIN frame and
+/// 32 MiB pieces streamed from disk. One frame was capped by MAX_FRAME (256 MiB): past it the standby refused the frame
+/// ("frame too large"), reconnected at once and the primary made a fresh copy each time (46 copies in 25 s, head frozen
+/// 0.5 s per copy, standby never synced).
+fn send_snapshot(w: &mut impl Write, htx: &mut Half, file: &Path, epoch: u64, seq: u64) -> io::Result<()> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(file)?;
+    let total = f.metadata()?.len();
+    let mut head = epoch.to_le_bytes().to_vec();
+    head.extend_from_slice(&seq.to_le_bytes());
+    if total <= proto::SNAP_ONE {
+        let mut p = head;
+        f.read_to_end(&mut p)?;
+        return htx.send(w, proto::SNAPSHOT, &p);
+    }
+    head.extend_from_slice(&total.to_le_bytes());
+    htx.send(w, proto::SNAPSHOT_BEGIN, &head)?;
+    let mut buf = vec![0u8; proto::SNAP_PIECE];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        htx.send(w, proto::SNAPSHOT_MORE, &buf[..n])?;
+    }
+}
+
 /// Serve one standby connection (head.rs calls this for a HELLO_S, after admission). Blocks until it drops.
 /// `sk`: the link key in a secured fleet (see Half), None with CK_FLEET=open.
 pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>) -> std::io::Result<()> {
@@ -419,6 +502,7 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
         g.next_link += 1;
         let lid = g.next_link;
         g.links.push(Link { id: lid, node: h.node_id.clone(), peer, tx, acked: if snapshot { 0 } else { seq } });
+        g.ring_until = Some(Instant::now() + Duration::from_secs(120));
         sync_status(ctx, &g);
         let first = hello_entry(&g, lid, if snapshot { "snapshot" } else { "replay" });
         (lid, snapshot, replay, g.last, g.epoch, first)
@@ -448,12 +532,9 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
             put_entry(&mut w, &mut htx, &first)?;
             if snapshot {
                 let tmp = std::env::temp_dir().join(format!("ck-snap-{}-{lid}.db", std::process::id()));
-                let made = ctx.store.snapshot_to(&tmp).map_err(io::Error::other).and_then(|_| std::fs::read(&tmp));
+                let sent = ctx.store.snapshot_to(&tmp).map_err(io::Error::other).and_then(|_| send_snapshot(&mut w, &mut htx, &tmp, epoch, snap_seq));
                 let _ = std::fs::remove_file(&tmp);
-                let mut p = epoch.to_le_bytes().to_vec();
-                p.extend_from_slice(&snap_seq.to_le_bytes());
-                p.extend_from_slice(&made?);
-                htx.send(&mut w, proto::SNAPSHOT, &p)?;
+                sent?;
             }
             for e in &replay {
                 put_entry(&mut w, &mut htx, e)?;
@@ -486,6 +567,7 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
     {
         let mut g = init(ctx);
         g.links.retain(|l| l.id != lid);
+        g.ring_until = Some(Instant::now() + Duration::from_secs(120));
         sync_status(ctx, &g);
     }
     crate::head::durable_upto(ctx, durable_seq(ctx)); // fewer standbys can mean more is durable
@@ -512,7 +594,10 @@ pub fn apply(st: &Store, e: &Entry) -> Result<(), String> {
             let state = d.get("state").and_then(|x| x.as_str()).and_then(JobState::parse).ok_or("state: bad state")?;
             st.set_state(u("job")?, state, d.get("ms").and_then(|x| x.as_i64()).unwrap_or_else(now_ms), d.get("error").and_then(|x| x.as_str()))?;
         }
-        "config" => apply_config(st, d)?,
+        "config" => {
+            apply_config(st, d)?;
+            sb_fence(st);
+        }
         "membership" => st.set_meta("membership", &d.get("nodes").cloned().unwrap_or_default().to_string())?,
         _ => {}
     }
@@ -599,15 +684,41 @@ fn install_snapshot(store: &mut Store, path: &Path, body: &[u8]) -> Result<(), S
     let tmp = path.with_file_name("head.db.tmp");
     let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
     f.write_all(body).and_then(|_| f.sync_all()).map_err(|e| e.to_string())?;
+    drop(f);
+    install_snapshot_file(store, path).map_err(|e| e.to_string())
+}
+
+/// The snapshot is already written to head.db.tmp next to `path`.
+fn install_snapshot_file(store: &mut Store, path: &Path) -> io::Result<()> {
+    let tmp = path.with_file_name("head.db.tmp");
+    install_tmp(store, path, &tmp).map_err(io::Error::other)
+}
+
+fn install_tmp(store: &mut Store, path: &Path, tmp: &Path) -> Result<(), String> {
     drop(std::mem::replace(store, Store::memory())); // closes the old file
     for ext in ["-wal", "-shm"] {
         let mut o = path.as_os_str().to_owned();
         o.push(ext);
         let _ = std::fs::remove_file(o);
     }
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    std::fs::rename(tmp, path).map_err(|e| e.to_string())?;
     *store = Store::open(path)?;
     Ok(())
+}
+
+/// After a snapshot is installed: remember its position, ack it.
+#[allow(clippy::too_many_arguments)]
+fn snapshot_done(store: &mut Store, sb: &mut Sb, s: &mut TcpStream, tx: &mut Half, applied: &mut u64, epoch: u64, seq: u64, bytes: usize) -> io::Result<()> {
+    crate::lg!(Info, "standby.snapshot", {"epoch": epoch, "seq": seq, "bytes": bytes});
+    for (k, v) in [("last_seq", seq), ("epoch", epoch)] {
+        store.set_meta(k, &v.to_string()).map_err(io::Error::other)?;
+    }
+    store.set_meta("synced", "1").map_err(io::Error::other)?;
+    sb_fence(store);
+    *applied = seq;
+    sb.epoch.store(epoch, SeqCst);
+    set_sb(|t| { t.epoch = epoch; t.last_seq = seq });
+    tx.send(s, proto::REPL_ACK, &seq.to_le_bytes())
 }
 
 // ---------------------------------------------------------------- standby side
@@ -647,6 +758,7 @@ fn session(store: &mut Store, path: &Path, mut s: TcpStream, sb: &mut Sb) -> io:
     let kp = crate::identity::key_path(&node);
     // admission happens in plain frames; after the primary's sealed HEARTBEAT (salt) everything goes through Half
     let (mut key, mut rx, mut tx): (Option<Vec<u8>>, Half, Half) = (None, Half::plain(), Half::plain());
+    let mut big: Option<(std::fs::File, u64, u64, u64)> = None; // a snapshot arriving in pieces: file, bytes left, epoch, seq
     loop {
         let (k, mut p) = rx.recv(&mut r)?;
         sb.last_heard = Instant::now();
@@ -676,18 +788,26 @@ fn session(store: &mut Store, path: &Path, mut s: TcpStream, sb: &mut Sb) -> io:
                 key = Some(p);
             }
             proto::DENIED => return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("primary refused this PC: {}", String::from_utf8_lossy(&p)))),
+            proto::SNAPSHOT_BEGIN => {
+                let tmp = path.with_file_name("head.db.tmp");
+                big = Some((std::fs::File::create(&tmp)?, u64_at(&p, 16)?, u64_at(&p, 0)?, u64_at(&p, 8)?));
+            }
+            proto::SNAPSHOT_MORE => {
+                let Some((f, left, _, _)) = big.as_mut() else { return Err(invalid("snapshot piece without a start")) };
+                f.write_all(&p)?;
+                *left = left.checked_sub(p.len() as u64).ok_or_else(|| invalid("snapshot longer than announced"))?;
+                if *left == 0 {
+                    let (f, _, epoch, seq) = big.take().unwrap();
+                    f.sync_all()?;
+                    drop(f);
+                    install_snapshot_file(store, path)?;
+                    snapshot_done(store, sb, &mut s, &mut tx, &mut applied, epoch, seq, p.len())?;
+                }
+            }
             proto::SNAPSHOT => {
                 let (epoch, seq) = (u64_at(&p, 0)?, u64_at(&p, 8)?);
                 install_snapshot(store, path, &p[16..]).map_err(io::Error::other)?;
-                crate::lg!(Info, "standby.snapshot", {"epoch": epoch, "seq": seq, "bytes": p.len()});
-                for (k, v) in [("last_seq", seq), ("epoch", epoch)] {
-                    store.set_meta(k, &v.to_string()).map_err(io::Error::other)?;
-                }
-                store.set_meta("synced", "1").map_err(io::Error::other)?;
-                applied = seq;
-                sb.epoch.store(epoch, SeqCst);
-                set_sb(|t| { t.epoch = epoch; t.last_seq = seq });
-                tx.send(&mut s, proto::REPL_ACK, &seq.to_le_bytes())?;
+                snapshot_done(store, sb, &mut s, &mut tx, &mut applied, epoch, seq, p.len())?;
             }
             proto::REPL => {
                 let e: Entry = serde_json::from_slice(&p).map_err(|_| invalid("bad REPL entry"))?;
@@ -730,18 +850,21 @@ fn connect(target: &str) -> io::Result<TcpStream> {
     TcpStream::connect_timeout(&a, Duration::from_secs(1))
 }
 
-/// Best effort: a beacon with a higher epoch than the primary we follow means a standby promoted; follow that head.
+/// Best effort: a signed beacon (see fence_key) with a higher epoch than the primary we follow means a standby promoted;
+/// follow that head. Unsigned beacons are ignored here (any host could forge one and make us copy its database).
 fn watch_beacons(epoch: Arc<AtomicU64>, head: Arc<Mutex<String>>, cur: Arc<Mutex<Option<TcpStream>>>, switch: Arc<Mutex<Option<String>>>) {
     let Ok(sock) = UdpSocket::bind(("0.0.0.0", proto::disc_port())) else { return }; // agents on this PC may hold the port
     let mut buf = [0u8; 512];
     while let Ok((n, _)) = sock.recv_from(&mut buf) {
-        let text = String::from_utf8_lossy(&buf[..n]).to_string();
-        let mut t = text.split_whitespace();
-        let (Some("ck/1"), addr, e) = (t.next(), text.split_whitespace().find(|x| x.contains(':')), text.split_whitespace().find_map(|x| x.strip_prefix("e=").and_then(|v| v.parse::<u64>().ok()))) else { continue };
-        let (Some(addr), Some(e)) = (addr, e) else { continue };
+        let Ok(text) = std::str::from_utf8(&buf[..n]) else { continue };
+        if !text.starts_with("ck/f ") {
+            continue;
+        }
+        let key = SB_FENCE.lock().unwrap().clone(); // from the standby's own database; changes with the first snapshot
+        let Some((_, addr, e)) = key.and_then(|k| fence_check(&k, text)) else { continue };
         let same = head.lock().unwrap().split(':').next() == addr.split(':').next();
         if e > epoch.load(SeqCst) && !same {
-            *switch.lock().unwrap() = Some(addr.to_string());
+            *switch.lock().unwrap() = Some(addr);
             if let Some(s) = cur.lock().unwrap().take() {
                 let _ = s.shutdown(std::net::Shutdown::Both);
             }
@@ -755,6 +878,7 @@ pub fn run_standby(o: &crate::Opts) {
     let first = o.head.clone().unwrap_or_else(|| crate::die("--standby needs --head PRIMARY_IP"));
     let path = crate::store::default_path();
     let mut store = Store::open(&path).unwrap_or_else(|e| crate::die(&format!("database: {e}")));
+    sb_fence(&store);
     let epoch = Arc::new(AtomicU64::new(num(store.meta("epoch"))));
     let head = Arc::new(Mutex::new(first));
     let (cur, switch): (Arc<Mutex<Option<TcpStream>>>, Arc<Mutex<Option<String>>>) = Default::default();
@@ -862,6 +986,19 @@ mod tests {
         let mut c = Half::new(sk, 0);
         assert!(c.recv(&mut &wire[..]).is_err(), "tampered frame refused");
         assert!(Half::new(link_key(b"other", b"salt"), 0).recv(&mut &wire[..]).is_err(), "wrong key refused");
+    }
+
+    #[test]
+    fn signed_fence_beacons() {
+        let st = Store::memory();
+        ensure_fence_key(&st);
+        let k = fence_key(&st).unwrap();
+        assert_eq!(fence_key(&st), Some(k.clone()), "the key is made once");
+        let m = fence_msg(&k, "my lab", "10.0.0.2:7700", 7);
+        assert_eq!(fence_check(&k, &m), Some(("my lab".into(), "10.0.0.2:7700".into(), 7)));
+        assert_eq!(fence_check(&[1u8; 32], &m), None, "other key");
+        assert_eq!(fence_check(&k, &m.replace("e=7", "e=9")), None, "tampered epoch");
+        assert_eq!(fence_check(&k, "ck/1 lab 10.0.0.2:7700 e=999"), None, "plain beacons never fence");
     }
 
     #[test]

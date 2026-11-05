@@ -23,6 +23,7 @@
 
 mod agent;
 mod auth;
+mod blobs;
 mod client;
 mod dash;
 #[cfg(feature = "gpu")]
@@ -163,6 +164,11 @@ fn main() {
             // read by client.rs / jobcli.rs from the environment (one place that already handles them)
             "--policy" => std::env::set_var("CK_POLICY", args.next().unwrap_or_else(|| die("--policy needs fixed|guided|adaptive"))),
             "--reducer" => std::env::set_var("CK_REDUCER", args.next().unwrap_or_else(|| die("--reducer needs a value"))),
+            "--blob" => {
+                let f = args.next().unwrap_or_else(|| die("--blob needs a file"));
+                let all = std::env::var("CK_BLOB_FILES").map(|v| format!("{v}\n{f}")).unwrap_or(f);
+                std::env::set_var("CK_BLOB_FILES", all);
+            }
             "--list" => std::env::set_var("CK_LIST_FILE", args.next().unwrap_or_else(|| die("--list needs a file"))),
             // first join of a PC (FLT-04); the agent reads it from CK_JOIN_CODE
             "--code" => std::env::set_var("CK_JOIN_CODE", args.next().unwrap_or_else(|| die("--code needs a value"))),
@@ -195,6 +201,7 @@ fn main() {
         "ping" => client::ping(&o),
         "install" => install::run(&o),
         "job" => jobcli::run(&o),
+        "blob" => jobcli::blob(&o),
         "admin" => jobcli::admin(&o),
         "token" => jobcli::token(&o),
         "sim" => sim::run(&o),

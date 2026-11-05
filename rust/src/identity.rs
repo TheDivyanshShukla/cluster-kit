@@ -8,7 +8,8 @@ use std::sync::OnceLock;
 /// Stable id: sha256 of the OS machine id (never sent raw), first 16 hex chars; else a random id kept in a file.
 pub fn node_id() -> String {
     static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(|| match machine_id() {
+    // CK_NODE_ID: several agents on one machine (tests) need distinct identities
+    ID.get_or_init(|| match std::env::var("CK_NODE_ID").ok().filter(|v| !v.is_empty()).map(Some).unwrap_or_else(machine_id) {
         Some(m) => hash_id(&m),
         None => persisted_random(),
     })

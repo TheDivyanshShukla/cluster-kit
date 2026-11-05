@@ -640,7 +640,7 @@ pub fn day(v: &Value) -> Value {
         let mut taken = vec![false; n];
         let mut assigned: Vec<Vec<usize>> = vec![vec![]; jobs.len()];
         for &j in &order {
-            let cands: Vec<sched::PlaceNode> = (0..n).filter(|&i| pcs[i].st == 2 && t >= pcs[i].down_until && !blocked[i] && !taken[i]).map(|i| sched::PlaceNode { node_id: ids[i].clone(), rate: pcs[i].rate, threads: pcs[i].threads, holds: jobs[j].holders[i] }).collect();
+            let cands: Vec<sched::PlaceNode> = (0..n).filter(|&i| pcs[i].st == 2 && t >= pcs[i].down_until && !blocked[i] && !taken[i]).map(|i| sched::PlaceNode { node_id: ids[i].clone(), rate: pcs[i].rate, threads: pcs[i].threads, holds: jobs[j].holders[i], cached: false }).collect();
             for id in sched::place(&jobs[j].place, jobs[j].max_pcs, &cands) {
                 let i: usize = id.parse().unwrap();
                 taken[i] = true;
@@ -652,7 +652,7 @@ pub fn day(v: &Value) -> Value {
                 let wanted = if jobs[j].max_pcs == 0 { n } else { jobs[j].max_pcs as usize };
                 let booting = (0..n).filter(|&i| pcs[i].st == 1 && !blocked[i]).count();
                 if hold + booting < wanted {
-                    let all: Vec<sched::PlaceNode> = (0..n).filter(|&i| !blocked[i] && !taken[i] && pcs[i].st == 0).map(|i| sched::PlaceNode { node_id: ids[i].clone(), rate: pcs[i].rate, threads: pcs[i].threads, holds: false }).collect();
+                    let all: Vec<sched::PlaceNode> = (0..n).filter(|&i| !blocked[i] && !taken[i] && pcs[i].st == 0).map(|i| sched::PlaceNode { node_id: ids[i].clone(), rate: pcs[i].rate, threads: pcs[i].threads, holds: false, cached: false }).collect();
                     let need = (wanted - hold - booting) as u32;
                     for id in sched::place(&jobs[j].place, if jobs[j].max_pcs == 0 { 0 } else { need }, &all).into_iter().take(need as usize) {
                         let i: usize = id.parse().unwrap();

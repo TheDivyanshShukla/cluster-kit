@@ -370,6 +370,9 @@ mod tests {
             x: Some(3),
             y: Some(0),
             calib_mhs: None,
+            net_mbps: None,
+            rtt_ms: None,
+            probed_ms: None,
         }
     }
     const INV: &str = r#"{"cpu_model":"Intel i5-10400F","cores_physical":6,"cores_logical":12,"ram_bytes":17179869184,"os":"Ubuntu 24.04","kernel":"6","arch":"x86_64","ck_version":"2"}"#;

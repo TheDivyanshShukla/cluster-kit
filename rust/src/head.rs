@@ -36,6 +36,11 @@ pub struct Job {
     pub max_pcs: u32,               // wave 10b: at most this many PCs hold its chunks; 0 = no limit
     pub placement: String,          // spread | pack | fastest | efficient
     pub mem_mb: u64,
+    pub blobs: Vec<String>, // wave 13: every blob of the job, in env order (CK_BLOB_<i>)
+    pub blob_mode: String,
+    pub shared: Vec<String>, // job-wide blobs (code): every PC that takes a chunk needs them
+    pub shards: Vec<String>, // blobs named by @blob: items; item_sha[i] = 0 or 1 + index into shards
+    pub item_sha: Vec<u32>,
 }
 
 impl Job {
@@ -87,6 +92,20 @@ pub struct Worker {
     pub back: u64, // RESULT / FAILED frames received; a REQ credit is granted only while back <= fed (resent results get none)
     pub told: BTreeSet<u64>, // jobs whose CTRL {job: mem_mb} this agent already got
     pub pending: Vec<(u64, u64, u64, u64)>, // HA-04: stored results waiting to be durable: (log seq, job, a, b); ACKed by durable_upto
+    // wave 13 (src/blobs.rs)
+    pub have: std::collections::HashSet<String>, // blobs this PC caches (it reports them)
+    pub blob_port: u16,                          // its blob port; 0 = it does not serve (or is virtual)
+    pub fetching: HashMap<String, crate::blobs::Fetch>,
+    pub avoid: std::collections::HashSet<u64>,   // peers whose transfer to this PC failed
+    pub told_b: BTreeSet<u64>,                   // jobs whose CTRL {job_blobs} this agent already got
+    pub net_mbps: Option<f64>,
+    pub rtt_ms: Option<f64>,
+    pub probed: Option<Instant>,
+    pub probing: Option<Instant>,
+    pub probe_now: bool,
+    pub probe_burst: bool, // this probe only teaches the head its uplink: all PCs at once share it, so the per-PC speed is not stored
+    pub blob_rep: bool,                        // the agent has reported its cache at least once
+    pub staged: Option<(u64, u64, u64)>,       // a chunk reserved for this PC until its blobs have arrived (also in inflight)
 }
 
 #[derive(Default)]
@@ -247,8 +266,53 @@ fn nkey(w: &Worker) -> String {
 }
 
 /// A node may be given new chunks: state allows it, no time rule blocks it, nobody is using it.
-fn can_work(w: &Worker) -> bool {
+pub(crate) fn can_work(w: &Worker) -> bool {
     takes_tasks(&w.state) && !w.blocked && w.presence != "busy"
+}
+
+/// Is a blob missing on this node for chunk [a, b) of the job (job-wide blobs plus the shards its items name)?
+/// Virtual nodes never run programs: nothing is missing. A real agent that has not reported its cache yet counts as missing.
+pub(crate) fn chunk_missing(w: &Worker, j: &Job, a: u64, b: u64) -> bool {
+    if j.blobs.is_empty() || w.hello.as_ref().is_some_and(|h| h.virtual_node) {
+        return false;
+    }
+    !w.blob_rep || crate::blobs::chunk_blobs(&j.shared, &j.shards, &j.item_sha, a, b).iter().any(|b| !w.have.contains(b))
+}
+
+/// A chunk of the job near the front of its unassigned work that `w` already has the blobs for (same length as `len`).
+fn cached_chunk(w: &Worker, j: &Job, len: u64) -> Option<(u64, u64)> {
+    let mut cand: Vec<(u64, u64)> = vec![];
+    for r in j.requeue.iter().rev().take(8) {
+        let mut s = r.0;
+        while s < r.1 && cand.len() < 64 {
+            cand.push((s, (s + len).min(r.1)));
+            s += len.max(1);
+        }
+    }
+    let mut s = j.next;
+    while s < j.end && cand.len() < 128 {
+        cand.push((s, (s + len).min(j.end)));
+        s += len.max(1);
+    }
+    cand.into_iter().find(|c| !chunk_missing(w, j, c.0, c.1))
+}
+
+/// Take [s, e) out of the job's unassigned work.
+fn cut(j: &mut Job, s: u64, e: u64) {
+    if let Some(i) = j.requeue.iter().position(|r| r.0 <= s && e <= r.1) {
+        let r = j.requeue.remove(i);
+        if e < r.1 {
+            j.requeue.push((e, r.1));
+        }
+        if r.0 < s {
+            j.requeue.push((r.0, s));
+        }
+    } else if s >= j.next && e <= j.end {
+        if s > j.next {
+            j.requeue.push((j.next, s));
+        }
+        j.next = e;
+    }
 }
 
 /// Units per second of a node for a kind: the measured EWMA, else (SHA only) the join benchmark; 0 = unknown.
@@ -394,7 +458,7 @@ fn placed(st: &State, j: &Job, wid: u64) -> bool {
         .filter(|(_, w)| can_work(w) && j.selector.matches(&w.attrs) && (j.only.is_empty() || j.only.contains(&w.addr)))
         .map(|(i, w)| {
             let r = node_rate(st, w, j.kind);
-            (*i, sched::PlaceNode { node_id: nkey(w), rate: if r > 0.0 { r } else { w.calib * 1e6 }, threads: w.threads, holds: w.inflight.iter().any(|t| t.0 == j.id) })
+            (*i, sched::PlaceNode { node_id: nkey(w), rate: if r > 0.0 { r } else { w.calib * 1e6 }, threads: w.threads, holds: w.inflight.iter().any(|t| t.0 == j.id), cached: !j.blobs.is_empty() && j.blobs.iter().all(|b| w.have.contains(b)) })
         })
         .collect();
     let (_, me) = match nodes.iter().find(|n| n.0 == wid) {
@@ -411,6 +475,23 @@ fn placed(st: &State, j: &Job, wid: u64) -> bool {
 fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
     if st.halted || st.gated {
         return None;
+    }
+    if let Some((sj, a, b)) = st.workers.get(&wid)?.staged {
+        // wave 13: a chunk is reserved for this PC while its blobs arrive
+        let Some(j) = st.jobs.get(&sj) else {
+            let w = st.workers.get_mut(&wid)?;
+            w.staged = None;
+            w.inflight.retain(|t| *t != (sj, a, b));
+            return None;
+        };
+        if chunk_missing(&st.workers[&wid], j, a, b) {
+            return None;
+        }
+        let out = (sj, a, b, j.kind, j.arg.clone());
+        let w = st.workers.get_mut(&wid)?;
+        w.staged = None;
+        w.inflight.retain(|t| *t != (sj, a, b)); // feed() records it as sent
+        return Some(out);
     }
     let addr = st.workers.get(&wid)?.addr.clone();
     let id = if st.policy.reserves.is_empty() && st.jobs.len() == 1 && st.jobs.values().all(|j| !limited(j)) {
@@ -434,7 +515,22 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
     let min = if j.kind == KIND_LIST { 1 } else { 1_000 };
     let len = sched::chunk_len(j.policy, j.chunk, j.total, remaining, node_rate, fleet_rate, nodes, min, crate::tune::n("max_chunk")).max(1);
     let j = st.jobs.get_mut(&id)?;
-    let (a, b) = next_chunk(&mut j.requeue, &mut j.next, j.end, len)?;
+    let (mut a, mut b) = next_chunk(&mut j.requeue, &mut j.next, j.end, len)?;
+    if !j.blobs.is_empty() && chunk_missing(&st.workers[&wid], j, a, b) {
+        // prefer a chunk whose blobs this PC already holds; else reserve this one and let the head stage its blobs
+        if let Some((s, e)) = cached_chunk(&st.workers[&wid], j, len) {
+            j.requeue.push((a, b));
+            cut(j, s, e);
+            (a, b) = (s, e);
+        }
+        if chunk_missing(&st.workers[&wid], j, a, b) {
+            let w = st.workers.get_mut(&wid)?;
+            w.staged = Some((id, a, b));
+            w.inflight.push((id, a, b));
+            return None;
+        }
+    }
+    let j = st.jobs.get_mut(&id)?;
     if !j.has_work() {
         // nothing unassigned is left: from now on idle PCs are in the tail
         let t = j.started.elapsed().as_secs_f64();
@@ -670,10 +766,24 @@ fn start_job(ctx: &Ctx, st: &mut State, id: u64) {
         complete(ctx, st, id, 0, 0.0);
         return;
     }
+    let (mut shared, mut shards, mut item_sha) = (spec.blobs.clone(), vec![], vec![]);
+    if spec.kind == KIND_LIST && !spec.blobs.is_empty() {
+        let mut idx: HashMap<String, u32> = HashMap::new();
+        for it in ctx.store.items(id, 0, spec.end) {
+            item_sha.push(crate::blobs::item_blob(&it).map_or(0, |sha| {
+                let n = idx.len() as u32;
+                *idx.entry(sha.to_string()).or_insert_with(|| {
+                    shards.push(sha.to_string());
+                    n + 1
+                })
+            }));
+        }
+        shared.retain(|b| !idx.contains_key(b));
+    }
     st.jobs.insert(id, Job {
         id, kind: spec.kind, arg: spec.arg, next: spec.end, end: spec.end, chunk, total, left, todo: left,
         requeue: todo.into_iter().rev().collect(), only: spec.only, started: Instant::now(), selector, priority: spec.priority, policy,
-        max_pcs: spec.max_pcs, placement: spec.placement, mem_mb: spec.mem_mb,
+        max_pcs: spec.max_pcs, placement: spec.placement, mem_mb: spec.mem_mb, blobs: spec.blobs, blob_mode: spec.blob_mode, shared, shards, item_sha,
     });
     let p = paused_now(st);
     st.acct.insert(id, crate::research::Acct { paused0: p, ..Default::default() });
@@ -941,7 +1051,9 @@ fn watch_epoch(ctx: Arc<Ctx>, name: String) {
     while let Ok((n, _)) = s.recv_from(&mut b) {
         let Ok(t) = std::str::from_utf8(&b[..n]) else { continue };
         let own = local_ip().map_or(String::new(), |i| format!("{i}:{}", port()));
-        if let Some(e) = higher_epoch(t, &name, &own, crate::repl::epoch(&ctx)) {
+        // only a beacon signed with the cluster's fence key can fence this head (a plain "ck/1" one is forgeable)
+        let signed = crate::repl::fence_key(&ctx.store).and_then(|k| crate::repl::fence_check(&k, t)).map(|(n, a, e)| format!("ck/1 {n} {a} e={e}"));
+        if let Some(e) = signed.and_then(|t| higher_epoch(&t, &name, &own, crate::repl::epoch(&ctx))) {
             halt(&ctx);
             let addr = t.split_whitespace().nth(2).unwrap_or("").to_string();
             crate::say!("ha.fence", "! FENCED: the head at {addr} has epoch {e} (mine is {}). Dispatching stopped, agents closed; restarting as its standby", crate::repl::epoch(&ctx));
@@ -1143,7 +1255,7 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     acct_kept(&mut st, job, wid, b - a, secs);
     // HA-03/04: log the part; ACK when the standbys have it too. repl::record / durable_seq are called under the State
     // lock (order State -> repl), so repl must call durable_upto without holding its own locks.
-    let seq = crate::repl::record(ctx, "part", serde_json::json!({ "job": job, "a": a, "b": b, "body": &p[RESULT_HDR..] }));
+    let seq = crate::repl::record_with(ctx, "part", || serde_json::json!({ "job": job, "a": a, "b": b, "body": &p[RESULT_HDR..] }));
     let mut sends: Sends = vec![];
     if seq <= crate::repl::durable_seq(ctx) {
         sends.extend(ack_now(&st));
@@ -1332,6 +1444,9 @@ fn read_results(r: &mut impl Read, mac: &mut Option<FrameMac>, ctx: &Ctx, wid: u
 fn ctrl_in(ctx: &Ctx, wid: u64, p: &[u8]) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(p) else { return };
     let mut st = ctx.sh.0.lock().unwrap();
+    if crate::blobs::is_ctrl(&v) {
+        crate::blobs::on_ctrl(ctx, &mut st, wid, &v);
+    }
     let Some(w) = st.workers.get_mut(&wid) else { return };
     let node = w.hello.as_ref().map(|h| h.node_id.clone());
     if let Some(pr) = v["presence"].as_str().filter(|p| matches!(*p, "busy" | "idle")) {
@@ -1368,7 +1483,7 @@ fn ctrl_in(ctx: &Ctx, wid: u64, p: &[u8]) {
 fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>) {
     let sh = &ctx.sh;
     while credits.recv().is_ok() {
-        let (job, a, b, kind, arg, mem) = {
+        let (job, a, b, kind, arg, mem, jb) = {
             let mut st = sh.0.lock().unwrap();
             loop {
                 if !st.workers.contains_key(&wid) {
@@ -1376,13 +1491,16 @@ fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>
                 }
                 if let Some(t) = take(&mut st, wid).or_else(|| speculate_take(&mut st, wid)) {
                     let mem = st.jobs.get(&t.0).map_or(0, |j| j.mem_mb);
+                    let blobs = st.jobs.get(&t.0).map(|j| j.blobs.clone()).unwrap_or_default();
                     let wk = st.workers.get_mut(&wid).unwrap();
                     let mem = if mem > 0 && wk.told.insert(t.0) { mem } else { 0 };
+                    // cmd and list jobs always get this CTRL once: it carries the job-scoped blob upload token too
+                    let jb = ((!blobs.is_empty() || matches!(t.3, KIND_CMD | KIND_LIST)) && wk.told_b.insert(t.0)).then_some(blobs);
                     wk.inflight.push((t.0, t.1, t.2));
                     wk.fed += 1;
                     wk.sent.insert((t.0, t.1, t.2), Instant::now());
                     crate::lgc!("chunk.dispatch", {"job": t.0, "a": t.1, "b": t.2, "wid": wid});
-                    break (t.0, t.1, t.2, t.3, t.4, mem);
+                    break (t.0, t.1, t.2, t.3, t.4, mem, jb);
                 }
                 // 2 s timeout: an idle node re-checks for an overdue chunk to copy (watchdog also wakes it every 5 s)
                 st = sh.1.wait_timeout(st, Duration::from_secs(2)).unwrap().0;
@@ -1390,6 +1508,9 @@ fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>
         };
         if mem > 0 {
             ctrl_to(&w, serde_json::json!({"job": {"id": job, "mem_mb": mem}}));
+        }
+        if let Some(jb) = jb {
+            ctrl_to(&w, serde_json::json!({"job_blobs": {"id": job, "blobs": jb, "put": {"port": dash_port(), "token": crate::blobs::put_token(job)}}}));
         }
         let mut p = pack(&[job, a, b]);
         p.push(kind);
@@ -1530,6 +1651,23 @@ fn submit_with(ctx: &Ctx, mut spec: JobSpec, sub: Option<mpsc::Sender<(u8, Vec<u
     if spec.end <= spec.from {
         return Err("nothing to do: the range is empty".into());
     }
+    // wave 13: items may name blobs (@blob:<sha>...); the job needs those too, and every blob must exist on this head
+    for it in &spec.items {
+        if let Some(sha) = crate::blobs::item_blob(it) {
+            if !spec.blobs.iter().any(|b| b == sha) {
+                spec.blobs.push(sha.to_string());
+            }
+        }
+    }
+    if let Some(b) = spec.blobs.iter().find(|b| !crate::blobs::valid_sha(b) || ctx.store.blob_size(b).is_none()) {
+        return Err(format!("unknown blob {b}: upload it first (PUT /api/v1/blobs)"));
+    }
+    if !spec.blob_mode.is_empty() && !matches!(spec.blob_mode.as_str(), "auto" | "direct" | "peer") {
+        return Err("blob_mode must be auto, direct or peer".into());
+    }
+    for b in &spec.blobs {
+        ctx.store.touch_blob(b, now_ms());
+    }
     parse_sel(&spec.selector)?;
     if spec.priority as usize >= PRIORITIES.len() {
         return Err(format!("priority must be 0..{} ({})", PRIORITIES.len() - 1, PRIORITIES.join(", ")));
@@ -1597,6 +1735,8 @@ pub fn run(o: &Opts) {
     thread::spawn(move || power_loop(pc));
     let rc = ctx.clone();
     thread::spawn(move || research_loop(rc));
+    let bc = ctx.clone();
+    thread::spawn(move || crate::blobs::head_loop(bc));
     let l = TcpListener::bind(("0.0.0.0", port())).unwrap_or_else(|e| die(&format!("TCP {}: {e}", port())));
     let name = o.name.clone();
     let (cb, cw, n2) = (ctx.clone(), ctx.clone(), o.name.clone());
@@ -1624,7 +1764,12 @@ pub fn run(o: &Opts) {
         thread::spawn(move || {
             let mut s = s;
             let _ = s.set_nodelay(true);
-            let _ = match recv(&mut s) { // hello is read unbuffered so nothing is left in a buffer
+            // nobody has vouched for this connection yet: a hello is small and must arrive soon. Without the limits a
+            // silent TCP connect held a thread forever and a 256 MiB "hello" was allocated before it was read.
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            let first = crate::proto::recv_max(&mut s, 1 << 20);
+            let _ = s.set_read_timeout(None);
+            let _ = match first { // hello is read unbuffered so nothing is left in a buffer
                 Ok((HELLO_W, p)) => serve_worker(s, ctx, &p, wid),
                 Ok((HELLO_C, _)) => serve_client(s, ctx),
                 Ok((HELLO_S, p)) => serve_standby_conn(s, ctx, &p),
@@ -1655,8 +1800,13 @@ fn beacon(ctx: &Ctx, name: &str) {
             Some(ip) => format!("ck/1 {name} {ip}:{} e={e}", port()), // FLT-05: agents connect to this address; M4: head term
             None => format!("ck/1 {name}"),
         };
+        // signed copy for heads and standbys (repl::fence_key); agents ignore it
+        let signed = local_ip().zip(crate::repl::fence_key(&ctx.store)).map(|(ip, k)| crate::repl::fence_msg(&k, name, &format!("{ip}:{}", port()), e));
         for p in &extra {
             let _ = s.send_to(msg.as_bytes(), ("127.0.0.1", *p));
+            if let Some(m) = &signed {
+                let _ = s.send_to(m.as_bytes(), ("127.0.0.1", *p));
+            }
         }
         let mut targets = vec!["255.255.255.255".to_string()];
         if let Some(IpAddr::V4(ip)) = local_ip() {
@@ -1665,6 +1815,9 @@ fn beacon(ctx: &Ctx, name: &str) {
         }
         for t in &targets {
             let _ = s.send_to(msg.as_bytes(), (t.as_str(), disc_port()));
+            if let Some(m) = &signed {
+                let _ = s.send_to(m.as_bytes(), (t.as_str(), disc_port()));
+            }
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -2340,6 +2493,43 @@ mod tests {
         }
         assert_eq!(holders, BTreeSet::from([6, 7, 8]), "the three highest calib");
         assert_eq!(st.jobs[&j.id].max_pcs, 3);
+    }
+
+    #[test]
+    fn chunks_need_only_their_own_shard_blobs() {
+        let c = ctx();
+        let shas: Vec<String> = (1..=4u8).map(|i| crate::blobs::hex(&[i; 32])).collect();
+        for s in &shas {
+            c.store.put_blob(s, 10, 0);
+        }
+        let code = crate::blobs::hex(&[9u8; 32]);
+        c.store.put_blob(&code, 10, 0);
+        let items: Vec<String> = shas.iter().map(|s| format!("@blob:{s}")).collect();
+        let sp = JobSpec { kind: KIND_LIST, items, chunk: 1, blobs: vec![code.clone()], arg: b"x".to_vec(), ..spec(4) };
+        let j = submit(&c, sp).unwrap();
+        let mut st = c.sh.0.lock().unwrap();
+        assert_eq!((st.jobs[&j.id].shared.clone(), st.jobs[&j.id].shards.len()), (vec![code.clone()], 4));
+        let mk = |have: &[&String]| Worker { addr: "a".into(), state: "active".into(), presence: "idle".into(), blob_rep: true, hello: Some(Hello { node_id: "n".into(), ..Default::default() }), have: have.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        // a PC holding the code and shard 3 is given the chunk of shard 3 first, although chunk 0 is next in line
+        st.workers.insert(1, mk(&[&code, &shas[2]]));
+        let t = take(&mut st, 1).expect("ready chunk");
+        assert_eq!((t.1, t.2), (2, 3), "locality: the chunk whose shard it caches");
+        st.workers.get_mut(&1).unwrap().inflight.push((t.0, t.1, t.2));
+        // a PC with nothing gets a chunk reserved, not dispatched; only that chunk's blobs are wanted
+        st.workers.insert(2, mk(&[]));
+        assert!(take(&mut st, 2).is_none());
+        let (_, a, b) = st.workers[&2].staged.expect("staged");
+        let need = crate::blobs::chunk_blobs(&st.jobs[&j.id].shared, &st.jobs[&j.id].shards, &st.jobs[&j.id].item_sha, a, b);
+        assert_eq!(need.len(), 2, "code + one shard, not all four: {need:?}");
+        assert!(st.workers[&2].inflight.contains(&(j.id, a, b)), "a lost PC would requeue it");
+        // once the blobs arrive the same chunk goes out
+        let w = st.workers.get_mut(&2).unwrap();
+        need.iter().for_each(|n| {
+            w.have.insert(n.clone());
+        });
+        let t = take(&mut st, 2).expect("now ready");
+        assert_eq!((t.1, t.2), (a, b));
+        assert!(st.workers[&2].staged.is_none() && !st.workers[&2].inflight.contains(&(j.id, a, b)));
     }
 
     #[test]
