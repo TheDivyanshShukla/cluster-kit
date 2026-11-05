@@ -159,3 +159,155 @@ The mock (scripts/mock-api.ts) streams chunk and node events at a realistic rate
 failover at 30 s, a recruit). There are screenshots at 1440 and 390 in light and dark, and a 3-frame capture of a failover.
 An FPS probe with 1,000 mock PCs stays ≥ 30 fps (log `performance.now()` frame times in a test page). check, test and
 build pass; scrollWidth equals the viewport; 0 console errors.
+
+## 8. App shell: the page never scrolls; panels do (user, 2026-11-05)
+
+"The whole page should not scroll. Some areas or widgets can scroll (logs, search). Sorting and filters too, and it
+should all make sense."
+
+### Shell
+- `html, body` are fixed at `100dvh`, `overflow: hidden`. The layout is a CSS grid: a sidebar (desktop) or top bar
+  (phone) and a main area. The main area is `min-height: 0` and a grid of panels sized to the viewport (no
+  `min-h-screen` stacks that overflow).
+- Every page is a **dashboard of panels**. A panel has a fixed header (title, count, the panel's own filter / sort
+  controls, actions) and a body that scrolls on its own (`overflow: auto`, `overscroll-behavior: contain`, a thin
+  styled scrollbar, and a shadow fade at the top or bottom edge when there is more). Only these scroll: tables, lists,
+  logs/event rails, long forms (inside their panel), and the settings list.
+- Charts, the canvas, the topology and the big numbers never scroll: they scale to their panel (ResizeObserver).
+- **Desktop ≥ 1024 px:** panels sit side by side in a page-specific grid (`grid-template-areas`).
+- **Tablet 640–1023 px:** two columns, panels resize.
+- **Phone < 640 px:** a single column with one panel visible at a time, switched by a segmented tab strip under the
+  page title (e.g. Live: Canvas | Events | Timeline; Nodes: List | Map | Details). The active tab lives in the URL
+  (`?tab=`). There is still no page scroll; the active panel's body scrolls.
+- Keyboard: `Tab` moves through the panels; `/` focuses the current page's search; `Esc` clears it.
+
+### Lists: one toolbar pattern everywhere (`ListToolbar.svelte` + `lib/listing.ts`, pure and tested)
+- **Search** (debounced 150 ms; matches the useful text fields, highlights matches).
+- **Filters as chips:** the facets that make sense for that list only, each with counts. For example:
+  - Nodes: state, lab, power, in use;
+  - Jobs: state, kind, priority, submitter;
+  - Events / Logs: kind group (job, node, ha, power, tune, auth, api), level, actor, time range (15 m, 1 h, 24 h,
+    custom);
+  - Candidates: eligible only;
+  - Tunables: group, changed only, source.
+- **Sort:** a click on a column header toggles asc / desc with an arrow. Default sorts:
+  - Nodes: state severity (lost first), then lab, then name (natural sort, so pc-2 comes before pc-10);
+  - Jobs: running first, then newest;
+  - Events: newest;
+  - Candidates: score.
+- **Filters persist:** filter, sort and search live in the URL (`?q=&state=&sort=`), so a view can be shared and
+  survives a reload.
+- **Row count:** "Showing 37 of 212" plus a Clear filters button when anything is active. There is an empty state per
+  list ("No PCs match lab=B, lost. Clear filters").
+- **Big lists** (> 500 rows) render windowed: only the visible rows plus a buffer, with a fixed row height. Logs and
+  events load more as you reach the end (cursor `next`). A live-updating list keeps your scroll position, and when you
+  are scrolled away from the top a "12 new" pill appears instead of jumping.
+
+### Pages under the shell (examples)
+
+| Page | Desktop panels | What scrolls |
+| --- | --- | --- |
+| Overview | numbers, head topology, mini canvas, jobs, recent events | jobs, events |
+| Live | canvas, event rail, timeline | event rail |
+| Nodes | list (toolbar) + details or actions | list, details |
+| Jobs | list + selected job's detail | list, parts/log |
+| Events / Logs | toolbar + list + a detail drawer for a JSON line | list |
+| System | head and standbys, candidates, power, all settings | candidates, settings |
+
+### Acceptance
+- At 1440 × 900, 1024 × 768 and 390 × 844, on every page, `document.scrollingElement.scrollHeight <= innerHeight`
+  and `scrollWidth <= innerWidth`, in light and dark, with real-sized data (mock: 200 nodes, 50 jobs, 2,000 events).
+- Every list has search, its facet chips, header sort and URL state, with tests for `listing.ts` (filter, sort,
+  natural sort, URL round-trip).
+- Windowing holds 10,000 rows without jank (frame ≤ 16 ms on scroll in the probe).
+
+## 9. Research-grade polish: professional, usable, impressive (user, 2026-11-05)
+
+Audience: senior scientists and researchers. They want dense, precise, honest information, with no decoration that
+carries no data. The tone is that of an instrument panel (think a lab instrument or a good observability tool), not
+a marketing page.
+
+### Visual language
+- **Typography:** one sans family (the current one) plus tabular monospaced numbers (`num` class, `font-variant-numeric:
+  tabular-nums`) for every figure.
+  - Units are always shown, in a muted style after the number ("4.57 GH/s", "98.0 %", "312 kWh").
+  - Uncertainty shows where we have it: "± 1.4 %" and the range of repeats on charts.
+- **Density:** compact rows (32 px), 13 px body text, 11 px captions. Whitespace separates groups, not items.
+- **Colour:**
+  - state colours only (ok / warn / bad / busy / idle), plus one accent;
+  - job hues come from a fixed 8-colour scheme that is colour-blind safe (Okabe-Ito order), defined as tokens;
+  - no gradients except in the heat overlays.
+- **Charts** (one small helper, no library unless it earns its size):
+  - hairline axes, labelled units, no chart junk;
+  - hover gives exact values;
+  - every chart has "Download CSV" and "Copy as PNG".
+
+### Canvas v2: more information, better shapes (`/live` and the wall)
+
+**Shapes carry meaning:**
+- the head is a hexagon (Crown), standbys are smaller hexagons, and a relay (future) would be a diamond;
+- a PC is a rounded square;
+- a lab is a soft region with a header strip.
+
+**Semantic zoom** (the level of detail grows as you zoom in, never cluttered at any zoom):
+
+| Zoom | What a PC shows |
+| --- | --- |
+| far, under 6 px per PC | a filled point, coloured by the active layer |
+| mid | a rounded square: fill = layer value; a ring = CPU busy share; a left stripe = current job hue; a small corner badge for in use / asleep / waking / lost |
+| near, over 40 px | a mini card: host, job, rate (MH/s or items/s), CPU % and RAM % bars, threads, last event |
+
+**Layers** (a segmented switch, with a legend and a scale bar for each):
+
+| Layer | Fill |
+| --- | --- |
+| Status | default |
+| Load | CPU % |
+| Throughput | rate relative to the fleet's best |
+| Job | job hue |
+| Power | awake / asleep / energy when known |
+| Reliability | losses in 24 h |
+| Head fitness | head_score from /api/v1/ha/candidates |
+
+**Lab header strip:** name, PCs (busy / awake / total), lab throughput, the share of the cluster's work, and power
+(W, when known).
+
+**Overlays:**
+- flow particles, kept;
+- optional "flow bundles": one curved band per lab from the head, with width = tasks/s;
+- event ripples, kept;
+- a selection halo.
+
+**Navigation:**
+- a minimap in the corner at near zoom;
+- "fit all", "fit lab", "follow job J" (keeps that job's PCs in view);
+- the URL holds the layer, zoom and selection.
+
+**Side panel on click:** tabs for Info (inventory, calibration, head score parts), Activity (sparkline of rate and
+CPU for the last 30 minutes, from history), Events, Actions.
+
+### Global search and command palette (UI-12): `Ctrl/Cmd+K` and the `/` key in the top bar
+- **One box finds everything:**
+  - PCs (host, id, lab, label), jobs (id, name, submitter), users, labs, pools;
+  - settings (tunable key, help text), pages;
+  - recent events and log lines (the server's logs API with a text filter; debounced, cancellable);
+  - actions ("drain pc-12", "sleep lab B", "make pc-18 head", "new job", "set lost_after_s").
+- **Ranking:** fuzzy, with type prefixes (`pc:`, `job:`, `set:`, `>` for actions) and recent items first.
+- **Results are grouped by type and keyboard driven:** ↑ / ↓ to move, Enter to open, ⇥ to switch group. An action
+  opens its confirm dialog; nothing runs silently.
+- **Role-aware:** actions above your role are shown disabled, with the role they need.
+- **Selector awareness:** typing a selector (`lab=A state=lost`) offers "show these on the canvas / in Nodes".
+
+### Research features worth adding (proposals, built when approved)
+1. **Experiment notebook:** each `experiment.py` run, with its provenance, lives on a page showing speed-up,
+   efficiency and Karp-Flatt plots, with the sim prediction overlaid on the measured points (SIM-04 by eye), plus
+   export as CSV, PDF figures and a BibTeX-ready caption.
+2. **Job comparison:** pick 2–4 jobs and compare makespan, efficiency, chunk-size distribution, per-PC rates and the
+   time lost to stragglers.
+3. **Per-job efficiency breakdown:** where the time went: compute, dispatch waiting, tail, recomputation after a loss,
+   failover pause.
+4. **Alerts** (OBS-05), with thresholds as tunables:
+   - a PC slower than its peers (median − 3 MAD), a flaky PC, the head busy above 70 %;
+   - a standby behind by more than N changes, a reserve about to break.
+5. **A Run report** for the press and paper: one page per day, with throughput, PCs, failures recovered, energy and
+   headline numbers, plus a printable PDF.

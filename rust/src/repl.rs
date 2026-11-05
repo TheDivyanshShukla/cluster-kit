@@ -101,6 +101,7 @@ struct Inner {
     last: u64,
     persisted: u64,
     ring: VecDeque<Entry>,
+    ring_bytes: usize,
     links: Vec<Link>, // order = standby priority
     next_link: u64,
     members: HashMap<String, Instant>,
@@ -177,15 +178,27 @@ pub fn status(ctx: &Ctx) -> Status {
     ctx.repl.status.lock().unwrap().clone()
 }
 
+const RING_BYTES: usize = 64 << 20;
+
+/// Rough memory of a ring entry: 32 bytes per element of a part body, plus a little for the rest.
+fn entry_cost(e: &Entry) -> usize {
+    256 + e.data.get("body").and_then(|b| b.as_array()).map_or(0, |a| a.len() * 32)
+}
+
 /// Append an entry to the change log and send it to the standbys. Returns its seq.
 /// Safe to call while holding the head's State lock (never takes it).
 pub fn record(ctx: &Ctx, kind: &str, data: serde_json::Value) -> u64 {
     let mut g = init(ctx);
     g.last += 1;
     let e = Entry { seq: g.last, epoch: g.epoch, kind: kind.into(), data };
-    if g.ring.len() >= crate::tune::n("ring_max") as usize {
-        g.ring.pop_front();
+    // Bounded by count and by memory: a "part" body is a JSON array of numbers (~32 bytes per result byte in memory),
+    // so 100,000 big results would fill the head's RAM. A standby behind the dropped entries gets a snapshot instead.
+    let cost = entry_cost(&e);
+    while g.ring.len() >= crate::tune::n("ring_max") as usize || (g.ring_bytes + cost > RING_BYTES && !g.ring.is_empty()) {
+        let Some(old) = g.ring.pop_front() else { break };
+        g.ring_bytes = g.ring_bytes.saturating_sub(entry_cost(&old));
     }
+    g.ring_bytes += cost;
     g.ring.push_back(e.clone());
     g.links.retain(|l| l.tx.send(e.clone()).is_ok());
     let seq = g.last;

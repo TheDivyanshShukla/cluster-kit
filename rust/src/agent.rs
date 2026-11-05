@@ -520,6 +520,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     let w = Arc::new(Mutex::new(Out { s: w, mac: mac_w }));
     let send_w = |kind: u8, p: &[u8]| w.lock().unwrap().put(kind, p);
     CANCELLED.store(0, Relaxed); // job ids restart with each head
+    crate::kernels::reset_piece_costs();
     CANCELLED_RANGE.0.store(u64::MAX, Relaxed);
     // HA-04: results the previous head never ACKed go first; the head dedups them and ACKs.
     // Each RESULT is also a request, so the pipeline fills from them. ponytail: still PIPELINE extra REQs; a few surplus chunks wait in the queue.

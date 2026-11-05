@@ -295,6 +295,33 @@ impl Store {
         out
     }
 
+    /// Like done_ranges but only the part that touches [a, b): the primary key answers in O(log parts) instead of
+    /// reading every part of the job (a result used to cost O(parts), so a 30,000-part job slowed down 2x).
+    /// Relies on stored parts being disjoint (the head drops overlapping results).
+    pub fn done_in(&self, job: u64, a: u64, b: u64) -> Vec<(u64, u64)> {
+        let c = self.db();
+        let row = |r: &rusqlite::Row| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64));
+        let mut out: Vec<(u64, u64)> = vec![];
+        if let Ok(mut st) = c.prepare_cached("SELECT start,\"end\" FROM parts WHERE job_id=? AND start<=? ORDER BY start DESC LIMIT 1") {
+            if let Ok(Some(p)) = st.query_row(params![job as i64, a as i64], row).map(Some).or_else(|e| if matches!(e, rusqlite::Error::QueryReturnedNoRows) { Ok(None) } else { Err(e) }) {
+                if p.1 > a {
+                    out.push(p);
+                }
+            }
+        }
+        if let Ok(mut st) = c.prepare_cached("SELECT start,\"end\" FROM parts WHERE job_id=? AND start>? AND start<? ORDER BY start") {
+            if let Ok(rows) = st.query_map(params![job as i64, a as i64, b as i64], row) {
+                for (s, en) in rows.flatten() {
+                    match out.last_mut() {
+                        Some(l) if s <= l.1 => l.1 = l.1.max(en),
+                        _ => out.push((s, en)),
+                    }
+                }
+            }
+        }
+        out
+    }
+
     // ---- events / audit (OBS-04)
     pub fn log_event(&self, ts_ms: i64, kind: &str, actor: &str, detail: &str) -> Result<EventRow, String> {
         crate::log::event(kind, actor, detail); // the one place head events reach the log
@@ -1374,5 +1401,21 @@ mod tests_m4 {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod done_in_tests {
+    use super::*;
+    #[test]
+    fn done_in_matches_done_ranges_window() {
+        let s = Store::memory();
+        for (a, b) in [(0, 10), (10, 20), (30, 40), (50, 60)] {
+            s.add_part(1, a, b, b"x").unwrap();
+        }
+        assert_eq!(s.done_in(1, 5, 15), vec![(0, 20)]);
+        assert_eq!(s.done_in(1, 20, 30), vec![]);
+        assert_eq!(s.done_in(1, 25, 55), vec![(30, 40), (50, 60)]);
+        assert_eq!(s.done_in(2, 0, 100), vec![]);
     }
 }

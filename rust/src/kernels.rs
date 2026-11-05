@@ -172,15 +172,57 @@ fn copies_for(job: u64, threads: u64) -> u64 {
     copy_count(threads, s.available_memory() / 1048576, m)
 }
 
+// A process start costs 10-40 ms (python3 more). Splitting a chunk of cheap items over every thread starts many
+// processes for nothing (2,000 SDK items: 640 python starts). So from a job's second chunk on, a piece must
+// carry about PIECE_SECS of work: pieces = ceil(items x measured seconds per item / PIECE_SECS), at most `copies`.
+// The first chunk of a job (no measurement yet) still uses every copy. The measured cost includes the start itself,
+// so cheap items settle at one or two pieces and slow items (>= PIECE_SECS x copies / items) keep all copies.
+const PIECE_SECS: f64 = 0.25;
+static PIECE_COST: std::sync::Mutex<Vec<(u64, f64)>> = std::sync::Mutex::new(Vec::new());
+
+fn pieces_for(job: u64, items: u64, copies: u64) -> u64 {
+    let c = PIECE_COST.lock().unwrap().iter().find(|x| x.0 == job).map(|x| x.1);
+    match c {
+        Some(c) => ((items as f64 * c / PIECE_SECS).ceil() as u64).clamp(1, copies.max(1)),
+        None => copies,
+    }
+}
+
+/// Forget all measurements (the agent calls this when it joins a head: job ids restart with each head).
+pub fn reset_piece_costs() {
+    PIECE_COST.lock().unwrap().clear();
+}
+
+/// Remember seconds per item (all pieces' busy time / items) for the job; bounded like JOB_MEM.
+fn note_piece_cost(job: u64, items: u64, parts: u64, wall: f64) {
+    if items == 0 {
+        return;
+    }
+    let busy = wall * parts.min(rayon::current_num_threads() as u64) as f64;
+    let x = busy / items as f64;
+    let mut v = PIECE_COST.lock().unwrap();
+    match v.iter_mut().find(|e| e.0 == job) {
+        Some(e) => e.1 = 0.5 * e.1 + 0.5 * x,
+        None => {
+            v.push((job, x));
+            if v.len() > 64 {
+                v.remove(0);
+            }
+        }
+    }
+}
+
 // Split the chunk into one piece per thread and run the program on each piece in parallel,
 // so single-threaded programs use every core. Multi-threaded programs: start the worker with --threads 1.
 fn run_cmd_par(job: u64, cmd: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, String)> {
-    let parts = (copies_for(job, rayon::current_num_threads() as u64)).min(b - a).max(1);
+    let parts = pieces_for(job, b - a, copies_for(job, rayon::current_num_threads() as u64)).min(b - a).max(1);
     let step = (b - a).div_ceil(parts);
+    let t = Instant::now();
     let res: Vec<_> = (0..parts)
         .into_par_iter()
         .map(|i| run_cmd(cmd, job, parts, a + i * step, (a + (i + 1) * step).min(b)))
         .collect();
+    note_piece_cost(job, b - a, parts, t.elapsed().as_secs_f64());
     let fails: Vec<&(bool, String)> = res.iter().filter_map(|r| r.as_ref().err()).collect();
     if let Some(first) = fails.first() {
         return Err((fails.iter().all(|f| f.0), first.1.clone()));
@@ -195,8 +237,9 @@ fn run_list_par(job: u64, arg: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, 
     let (cmd, items) = (&arg[..split], arg.get(split + 1..).unwrap_or(&[]));
     let lines: Vec<&[u8]> = if items.is_empty() { vec![] } else { items.split(|c| *c == b'\n').collect() };
     let n = lines.len() as u64;
-    let parts = copies_for(job, rayon::current_num_threads() as u64).min(n).max(1);
+    let parts = pieces_for(job, n, copies_for(job, rayon::current_num_threads() as u64)).min(n).max(1);
     let step = n.div_ceil(parts).max(1);
+    let t = Instant::now();
     let res: Vec<_> = (0..parts)
         .into_par_iter()
         .filter(|i| i * step < n)
@@ -207,6 +250,7 @@ fn run_list_par(job: u64, arg: &[u8], a: u64, b: u64) -> Result<Vec<u8>, (bool, 
             run_cmd_in(cmd, job, parts, a + lo as u64, a + hi as u64, Some(&stdin))
         })
         .collect();
+    note_piece_cost(job, n, parts, t.elapsed().as_secs_f64());
     let _ = b; // the item count, not b, drives the split; the head sends exactly b - a items
     let fails: Vec<&(bool, String)> = res.iter().filter_map(|r| r.as_ref().err()).collect();
     if let Some(first) = fails.first() {
@@ -318,6 +362,15 @@ mod tests {
     }
 
     #[test]
+    fn cheap_items_get_fewer_pieces() {
+        assert_eq!(pieces_for(9_000_001, 31, 10), 10, "no measurement: every copy");
+        note_piece_cost(9_000_001, 31, 10, 0.02); // 0.2 s busy for 31 items
+        assert_eq!(pieces_for(9_000_001, 31, 10), 1);
+        note_piece_cost(9_000_002, 31, 10, 2.0); // 20 s busy for 31 items: slow
+        assert_eq!(pieces_for(9_000_002, 31, 10), 10);
+    }
+
+    #[test]
     fn synth_duration_and_cancel() {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
         let ns = 1_000_000u64.to_le_bytes(); // 1 ms per number
@@ -404,19 +457,19 @@ mod tests {
         let arg = |c: &str| [c.as_bytes(), b"\0", items.as_bytes()].concat();
         let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
         // 10 items over 3 threads: pieces of 4, 4, 2 lines
-        let out = pool.install(|| run_list_par(1, &arg("sh -c 'wc -l'"), 100, 110)).unwrap();
+        let out = pool.install(|| run_list_par(7700, &arg("sh -c 'wc -l'"), 100, 110)).unwrap();
         let counts: Vec<u32> = String::from_utf8(out).unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
         assert_eq!(counts, [4, 4, 2]);
         // order, env range and stdin content
-        let out = pool.install(|| run_list_par(1, &arg("sh -c 'echo $CK_START-$CK_END; cat'"), 100, 110)).unwrap();
+        let out = pool.install(|| run_list_par(7702, &arg("sh -c 'echo $CK_START-$CK_END; cat'"), 100, 110)).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "100-104\n0\n1\n2\n3\n104-108\n4\n5\n6\n7\n108-110\n8\n9\n");
         // exit codes
-        let e = pool.install(|| run_list_par(1, &arg("sh -c 'exit 75'"), 0, 10)).unwrap_err();
+        let e = pool.install(|| run_list_par(7703, &arg("sh -c 'exit 75'"), 0, 10)).unwrap_err();
         assert!(e.0, "{e:?}");
-        let e = pool.install(|| run_list_par(1, &arg("sh -c 'echo bad >&2; exit 2'"), 0, 10)).unwrap_err();
+        let e = pool.install(|| run_list_par(7704, &arg("sh -c 'echo bad >&2; exit 2'"), 0, 10)).unwrap_err();
         assert!(!e.0 && e.1 == "exit 2: bad", "{e:?}");
         // a program that ignores stdin is fine
-        assert!(run_list_par(1, &arg("true"), 0, 10).is_ok());
+        assert!(run_list_par(7705, &arg("true"), 0, 10).is_ok());
     }
 
     #[test]

@@ -1060,7 +1060,7 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
         return Ok((ack_now(&st), credit)); // stale (cancelled or finished job): the agent may drop its copy
     }
     // After a head restart gaps are re-chunked differently, so a resent RESULT can overlap parts already stored.
-    let done = ctx.store.done_ranges(job);
+    let done = ctx.store.done_in(job, a, b);
     let cov = covered(a, b, &done);
     if cov == b - a {
         return Ok((ack_now(&st), credit)); // everything in it is stored already
@@ -1094,7 +1094,7 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
         }
     }
     // chunks that overlap the new part without being identical: stop them, queue what is still uncovered
-    let (mut lost, done) = (vec![], ctx.store.done_ranges(job));
+    let mut lost = vec![];
     for w in st.workers.values_mut() {
         let ov: Vec<_> = w.inflight.iter().filter(|t| t.0 == job && t.1 < b && a < t.2).copied().collect();
         for t in ov {
@@ -1110,7 +1110,7 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     }
     for (x, y) in lost {
         if !held(&st, (job, x, y)) {
-            requeue_missing(&mut st, job, gaps(x, y, &done));
+            requeue_missing(&mut st, job, gaps(x, y, &ctx.store.done_in(job, x, y)));
         }
     }
     sh.1.notify_all();
