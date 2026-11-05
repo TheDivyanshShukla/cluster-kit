@@ -1,0 +1,173 @@
+# Head HTTP API v1
+
+Served by `ck head` on the dashboard port (`CK_PORT` + 2, default 7702), together with the console. Contract between `rust/src/api.rs` and `console/src/lib/api/schema.ts`. Change both together.
+
+## Conventions
+
+- JSON in and out. Times are Unix milliseconds (`*_ms`). Big counts are plain numbers (all fit in 2^53).
+- Errors: HTTP status plus `{"error": {"code": "...", "message": "..."}}`. Codes: `invalid_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 404, `conflict` 409, `too_many_requests` 429, `unavailable` 503.
+- Pages: `?limit=` (default 50, max 500) and `?before=<id>`; the reply has `next` (the `before` value for the next page) or `null`.
+
+## Authentication
+
+- **Modes.** `CK_AUTH=off` gives open mode: everyone is an anonymous admin. Use it only for development on 127.0.0.1. Otherwise auth is required.
+- **First run.** While no user exists, `POST /api/v1/bootstrap` creates the first admin. It is only accepted from 127.0.0.1.
+- **Console.** The console uses a session cookie, `ck_session` (HttpOnly, SameSite=Strict), set by login or bootstrap.
+- **CLI.** The CLI sends `Authorization: Bearer <token>`. Tokens come from `POST /api/v1/tokens` and are stored hashed.
+- **Roles.** `viewer` < `researcher` < `operator` < `admin`. Each route below names the minimum role.
+
+| Method and path | Role | Body | Reply |
+| --- | --- | --- | --- |
+| GET `/api/v1/me` | none | | `{"user": {"name","role"} or null, "mode": "open" or "required", "needs_bootstrap": bool}` |
+| POST `/api/v1/bootstrap` | none, 127.0.0.1 only, only while no users exist | `{"name","password"}` (password at least 12 characters) | `{"user"}` and the session cookie |
+| POST `/api/v1/login` | none | `{"name","password"}` | `{"user"}` and the session cookie; 401 on a wrong name or password; 429 after 5 failures in 5 minutes |
+| POST `/api/v1/logout` | none | | `{}` |
+| POST `/api/v1/tokens` | viewer | | `{"token": "ckt_..."}`, shown once |
+| GET `/api/v1/users` | admin | | `{"users": [{"name","role","created_ms"}]}` |
+| POST `/api/v1/users` | admin | `{"name","password","role"}` | `{"user"}` |
+
+## Cluster
+
+| Method and path | Role | Reply |
+| --- | --- | --- |
+| GET `/api/v1/cluster` | viewer | `{"now_ms", "workers": [Worker], "job": JobRow or null}`. `job` is the running job. |
+| GET `/api/v1/nodes` | viewer | `{"nodes": [NodeRow]}`: every PC ever seen, with `inventory` parsed as an object |
+
+Worker has the same fields as `/stats`: `id`, `addr`, `threads`, `chunks`, `numbers`, `secs`, `rate`, `busy`, `cpu`, `mem_used`, `mem_total`, `version`, `node_id`, `host`, `virtual`, `inv`, `presence`, `blocked`, `cap`, `energy_j` (CPU package joules since the agent started, from Linux RAPL; 0 when unknown or virtual).
+
+## Jobs
+
+JobRow fields:
+
+| Field | Meaning |
+| --- | --- |
+| `id`, `name` | job number and label |
+| `kind` | `sha`, `cmd` or `synth` |
+| `from`, `end` | the range, as `[from, end)` |
+| `chunk`, `total` | chunk size and total numbers |
+| `done` | numbers completed so far |
+| `state` | `queued`, `running`, `done`, `cancelled` or `failed` |
+| `submitter` | who submitted it |
+| `created_ms`, `started_ms`, `finished_ms` | timestamps; the last two are null until set |
+| `error` | null, or the reason it failed |
+
+| Method and path | Role | Body | Reply |
+| --- | --- | --- | --- |
+| GET `/api/v1/jobs` | viewer | | `{"jobs": [JobRow], "next"}`, newest first |
+| POST `/api/v1/jobs` | researcher | see below | `{"job": JobRow}` |
+| GET `/api/v1/jobs/{id}` | viewer | | `{"job": JobRow, "parts": n}` |
+| GET `/api/v1/jobs/{id}/result` | viewer | | `text/plain` result, described below |
+| POST `/api/v1/jobs/{id}/cancel` | researcher for own jobs, operator for any | | `{"job": JobRow}`; 409 if the job already finished |
+
+POST `/api/v1/jobs` body: `{"name"?: string, "kind": "sha"|"cmd"|"synth", "from"?: number = 1, "n": number, "chunk"?: number = 0, "sha"?: hex string up to 64 characters, "cmd"?: string, "synth_ns"?: number, "only"?: [addr]}`. Exactly the field for the chosen kind must be present. Submitting `cmd` jobs needs operator.
+
+Result format by kind:
+
+- `sha`: one `"<n> <sha256 hex>"` line per hit, sorted by n.
+- `cmd`: each part's stdout, ordered by start.
+- `synth`: the number of numbers counted.
+
+## Fleet: nodes, labs, approvals (M1 wave 3)
+
+NodeRow (GET `/api/v1/nodes`, `/api/v1/nodes/{id}`): `{node_id, host, addr, inventory (object), first_seen_ms, last_seen_ms, state, state_reason, state_by, lab_id, x, y, online (bool: connected now)}`.
+States: `pending` (joined, waiting for approval, gets no tasks), `active`, `cordoned` (no new tasks), `draining` (finishes its tasks, then becomes `cordoned`), `maintenance`, `retired`.
+
+| Method and path | Role | Body | Reply |
+| --- | --- | --- | --- |
+| GET `/api/v1/nodes/{id}` | viewer | | `{"node"}` |
+| POST `/api/v1/nodes/state` | operator | `{"node_ids": [..], "state", "reason"?}` | `{"nodes": [NodeRow]}`; also used to approve: state `active` on pending nodes |
+| PUT `/api/v1/nodes/{id}/place` | operator | `{"lab_id", "x", "y"}` or `{"lab_id": null}` to unplace | `{"node"}`; 409 `seat taken` |
+| GET `/api/v1/labs` | viewer | | `{"labs": [{id, name, w, h, created_ms}]}` |
+| POST `/api/v1/labs` | operator | `{"name", "w", "h"}` (1..=64 each) | `{"lab"}` |
+| PATCH `/api/v1/labs/{id}` | operator | any of `name`, `w`, `h` | `{"lab"}` |
+| DELETE `/api/v1/labs/{id}` | operator | | `{}`; its nodes become unplaced |
+| POST `/api/v1/join-codes` | operator | `{"uses"?: 1..=500 = 50, "ttl_min"?: 1..=10080 = 120, "auto_approve"?: false}` | `{"code": "XXXX-XXXX-XXXX", "expires_ms", "uses", "auto_approve"}`, shown once |
+
+Agents join with `ck agent --code XXXX-XXXX-XXXX` (first time only; the PC then keeps its own key). With `CK_FLEET=open` on the head, any agent is admitted without a code.
+The SSE stream also sends `node`: a NodeRow, whenever one changes (join, loss, state, placement).
+
+## Organisation: selectors, labels, pools, caps, reserves (M2)
+
+Selector language (rust/src/select.rs header): space-separated terms, all must hold. `key=value`, `key!=value`, `key>=N`, `key<=N`, `key>N`, `key<N`, `key` (present), `!key` (absent), `key=a,b` (any), `key=pre*` (prefix), quotes for spaces. Keys: node, host, addr, state, online, lab, x, y, pool, cores, threads, ram_gb, cpu, arch, os, class, virtual, plus free labels.
+
+Jobs: POST `/api/v1/jobs` also takes `"selector"?: string` (validated; 400 with the parser's message) and `"priority"?: "urgent"|"high"|"normal"|"low"|"background"` (default normal). JobRow gains `selector` (string) and `priority` (0..4, 0 = urgent). Several jobs may run at once; GET `/api/v1/cluster` returns `"jobs": [JobRow]` (all running) in addition to `"job"` (the first, for old clients).
+
+| Method and path | Role | Body | Reply |
+| --- | --- | --- | --- |
+| GET `/api/v1/select?q=SELECTOR` | viewer | | `{"count", "node_ids": [..], "error": null or message}`: preview which PCs match |
+| PUT `/api/v1/nodes/{id}/labels` | operator | `{"key": "value" or null, ...}` (null removes) | `{"node"}`; NodeRow gains `labels: {key: value}`, `pools: [name]`, `class` |
+| GET `/api/v1/pools` | viewer | | `{"pools": [{name, members, note}]}` |
+| PUT `/api/v1/pools/{name}` | operator | `{"members": [node_id], "note"?}` | `{"pool"}` |
+| DELETE `/api/v1/pools/{name}` | operator | | `{}` |
+| GET `/api/v1/caps` | viewer | | `{"caps": [{id, selector, max_threads, note}]}` |
+| POST `/api/v1/caps` | operator | `{"selector", "max_threads", "note"?}` | `{"cap"}` |
+| DELETE `/api/v1/caps/{id}` | operator | | `{}` |
+| GET `/api/v1/reserves` | viewer | | `{"reserves": [{id, selector, keep_n, keep_pct, note, held: [node_id]}]}`; `held` = PCs kept free right now |
+| POST `/api/v1/reserves` | operator | `{"selector", "keep_n"?, "keep_pct"?, "note"?}` | `{"reserve"}` |
+| DELETE `/api/v1/reserves/{id}` | operator | | `{}` |
+| GET `/api/v1/config` | admin | | the whole setup as JSON: `{"version": 1, labs, placements, labels, pools, caps, reserves}` (ORG-11) |
+| POST `/api/v1/config?dry_run=1` | admin | that JSON | `{"changes": [human-readable lines]}`; without dry_run it applies them |
+
+## Smart scheduling, time rules, list jobs (M3)
+
+POST `/api/v1/jobs` also takes:
+- `"policy"?: "adaptive" | "guided" | "fixed"` (default adaptive; "fixed" reproduces the paper's engine);
+- `"reducer"?: "" | "concat" | "lines" | "sum" | "count" | "sort" | "top:N"` (how GET result combines parts);
+- `"kind": "list"` with `"items": [string, ...]` (1..=1,000,000 items, each <= 4 KiB) and `"cmd"`: each task runs the command with its items on stdin, one per line (operator role, like cmd). `from`/`n` are ignored for list jobs.
+
+JobRow gains `policy`, `reducer`, `eta_ms` (estimated finish time, null when unknown or not running); `kind` may be `list`.
+GET `/api/v1/jobs/{id}/result?reducer=sum` reduces on the fly with another reducer.
+NodeRow gains `calib_mhs` (benchmark at join) and `presence` (`"busy"` while someone uses the PC, else `"idle"`).
+Worker (in /cluster and /stats) gains `presence`, `blocked` (a window or reservation forbids work now), `cap` (effective thread cap).
+
+| Method and path | Role | Body | Reply |
+| --- | --- | --- | --- |
+| GET `/api/v1/windows` | viewer | | `{"windows": [{id, selector, days, start, end, action, cap_threads, note, active_now}]}` |
+| POST `/api/v1/windows` | operator | `{"selector", "days": "mon-fri", "start": "09:00", "end": "17:00", "action": "block"|"cap", "cap_threads"?, "note"?}` | `{"window"}` |
+| DELETE `/api/v1/windows/{id}` | operator | | `{}` |
+| GET `/api/v1/reservations` | viewer | | `{"reservations": [{id, selector, start_ms, end_ms, note, active_now}]}` (current and future) |
+| POST `/api/v1/reservations` | operator | `{"selector", "start_ms", "end_ms", "note"?}` | `{"reservation"}` |
+| DELETE `/api/v1/reservations/{id}` | operator | | `{}` |
+| GET `/api/v1/estimate?n=&kind=&selector=` | viewer | | `{"matching_pcs", "fleet_rate", "eta_secs" or null}`: how long a job of n numbers would take now (SCH-03) |
+
+Times of day use the head's `CK_TZ_OFFSET_MIN` (default 330, India).
+
+## High availability (M4)
+
+| Method and path | Role | Reply |
+| --- | --- | --- |
+| GET `/api/v1/ha` | viewer | `{"role": "primary"|"standby"|"candidate", "epoch", "last_seq", "durable_seq", "standbys": [{"node_id", "acked_seq", "lag"}], "membership", "connected", "dispatching"}` |
+| POST `/api/v1/ha/switchover` | admin | `{"to": STANDBY_NODE_ID}` -> 202 `{"to": addr}`; 409 if it is not a connected standby or does not confirm within 5 s. HA-07 planned switchover: this head stops dispatching, waits until the standby applied a "promote" entry, then re-runs itself as that head's standby; agents and `ck run` follow the higher epoch. CLI: `ck admin switchover NODE` |
+
+The SSE stream also sends `ha` (the same JSON) when the role, epoch or the standby set changes. A standby head serves only `/api/v1/ha`, `/api/v1/me`, login and the console (read-only "standby" banner); everything else answers 503 `{"error": {"code": "unavailable", "message": "this head is a standby; the primary is <addr>"}}`.
+
+## Events and audit
+
+| Method and path | Role | Reply |
+| --- | --- | --- |
+| GET `/api/v1/events` | viewer | `{"events": [EventRow], "next"}`, newest first; EventRow = `{"id","ts_ms","kind","actor","detail"}` |
+| GET `/api/v1/stream` | viewer | Server-Sent Events, described below |
+
+`/api/v1/stream` sends three event types:
+
+- `cluster`: the GET `/api/v1/cluster` JSON, every second.
+- `job`: a JobRow, whenever a job changes.
+- `event`: an EventRow, whenever one is logged.
+
+A `: ping` comment line goes out every 15 s.
+
+## Legacy
+
+GET `/stats` (and `/stats?detail=1`) stays unchanged for the old dashboard (`/legacy`) and existing scripts.
+
+## Power and dynamic heads (wave 7: NET-06, HA-10)
+
+| Method and path | Role | Body | Reply |
+| --- | --- | --- | --- |
+| POST `/api/v1/nodes/power` | operator | `{"node_ids": [..], "action": "sleep"\|"wake"}` | `{"nodes": [NodeRow]}`. sleep: CTRL `{"power":"sleep"}` to each connected PC, which is then remembered as asleep. wake: Wake-on-LAN magic packets for each PC's MACs (inventory `macs`), sent by the head and by one connected agent on the same /24 (CTRL `{"wol": [...]}`), state "waking" until it reconnects. 409 for a PC with no known MAC (wake) or not connected (sleep). |
+| GET `/api/v1/power` | viewer | | `{"power": PowerSettings, "asleep": [node_id]}` |
+| PUT `/api/v1/power` | operator | PowerSettings | same as GET. mode `off` or `eco`; idle_min 1-1440; keep_awake 0-10000 |
+| GET `/api/v1/ha/settings` | viewer | | `{"settings": HaSettings}` |
+| PUT `/api/v1/ha/settings` | admin | HaSettings | same as GET. target_standbys 0-5; selector parses (ORG-04) |
+
+PowerSettings `{"mode": "off"|"eco", "idle_min": 15, "keep_awake": 4, "wake_on_demand": true}`; HaSettings `{"target_standbys": 2, "selector": "!virtual"}` (rust/src/jobs.rs). NodeRow gains `power`: `awake` | `asleep` | `waking`. Events: `power.sleep`, `power.wake`, `ha.recruit`. Eco mode never sleeps the head PC, a standby, a PC with work in flight, or below keep_awake awake PCs; with wake_on_demand, queued work that has no free PC wakes asleep PCs that match its selector. Dynamic heads: every 10 s the primary checks its standby count and, if short, sends one matching agent (not virtual, not already a standby, a lab without a standby first) CTRL `{"standby_of": "<head ip:port>"}`; that agent starts `ck head --standby` beside itself.

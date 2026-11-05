@@ -470,6 +470,7 @@ def monte_carlo(n: int, seed: int) -> int:
 
 
 def cmd_bench(args) -> None:
+    t_all = time.perf_counter()
     client = _connect(args.scheduler)
     order, hosts = host_table(client)
     max_nodes = min(args.max_nodes or len(order), len(order))
@@ -485,7 +486,7 @@ def cmd_bench(args) -> None:
     for total in args.total:
         total = int(total)
         print(f"== workload {total:,} samples ==")
-        print(f"{'PCs':>4}{'procs':>7}{'median s':>11}{'speedup':>9}{'effic.':>9}{'pi':>10}")
+        print(f"{'PCs':>4}{'procs':>7}{'median s':>11}{'speedup':>9}{'effic.':>9}{'pi':>10}  each run s")
         t1 = None
         for n in range(1, max_nodes + 1):
             allowed = [a for h in order[:n] for a in hosts[h]]
@@ -506,7 +507,8 @@ def cmd_bench(args) -> None:
             pi = 4 * hits / ((total // chunks) * chunks)
             summary.append({"workload": total, "pcs": n, "procs": len(allowed),
                             "median_s": round(med, 4), "speedup": round(sp, 3), "efficiency": round(eff, 3)})
-            print(f"{n:>4}{len(allowed):>7}{med:>11.2f}{sp:>8.2f}x{eff:>8.0%}{pi:>10.5f}")
+            print(f"{n:>4}{len(allowed):>7}{med:>11.2f}{sp:>8.2f}x{eff:>8.0%}{pi:>10.5f}  "
+                  + " ".join(f"{x:.2f}" for x in times))
         print()
 
     for fname, rows in (("results_raw.csv", raw), ("results_summary.csv", summary)):
@@ -516,6 +518,7 @@ def cmd_bench(args) -> None:
             w.writerows(rows)
     plot(summary, max_nodes)
     print("Saved: results_raw.csv, results_summary.csv, scaling.png")
+    print(f"Total benchmark time: {time.perf_counter() - t_all:.1f} s")
 
 
 def plot(summary: list[dict], max_nodes: int) -> None:

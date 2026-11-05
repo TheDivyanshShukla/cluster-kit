@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from distributed import Client
+from distributed import Client, as_completed
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 from cluster import SCHED_PORT, host_table  # noqa: E402
@@ -54,8 +54,18 @@ def main() -> None:
         futs = client.map(hash_range, starts, [min(s + chunk, n + 1) for s in starts],
                           prefix=args.prefix, pure=False)
 
+    done = {f.key: time.perf_counter() - t for f in as_completed(futs)}
     hits = [x for part in client.gather(futs) for x in part]
-    print(f"\n{len(hits)} hashes start with '{args.prefix}' in 1..{n:,}  ({time.perf_counter() - t:.2f}s)")
+    total = time.perf_counter() - t
+    # each PC's time = when its last chunk finished
+    per_pc: dict[str, float] = {}
+    for key, addrs in client.who_has(futs).items():
+        host = addrs[0].split("://")[-1].rsplit(":", 1)[0] if addrs else "?"
+        per_pc[host] = max(per_pc.get(host, 0.0), done[key])
+    print()
+    for host, secs in sorted(per_pc.items()):
+        print(f"PC {host}: done in {secs:.2f}s")
+    print(f"\n{len(hits)} hashes start with '{args.prefix}' in 1..{n:,}  (total {total:.2f}s)")
     for i, h in hits[:10]:
         print(f"  {i:>12,}  {h}")
 

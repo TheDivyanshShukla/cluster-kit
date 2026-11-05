@@ -1,65 +1,44 @@
-# Watch swarm plan (Wave 0 frozen 2026-10-29)
+# Swarm plan: wave 7, power modes (sleep / wake) and dynamic heads (auto-recruited standbys), plus the 1,000-PC ceiling
+status: running        updated: 2026-11-05
+Waves 1-6 are done (records: docs/loop/STATE.md, docs/CONSOLE_REQUIREMENTS.md Part C).
 
-Product spec: `docs/VISION_IMPLEMENTATION_PLAN.md`. Agent sheet: `docs/VISION_AGENT_TASKS.md`. Read both once; this file overrides them where it is more specific.
+User ask (2026-11-05): "different modes and methods and full control on systems: make them sleep so they are power
+efficient and turn them on on command; dynamic heads, multiple heads as per need, recovery at every failure".
+Requirement IDs: NET-06 (Wake-on-LAN, power), HA-10 (new: keep N standbys, recruit a replacement after every failover).
 
-## Baseline
+## Contracts (frozen; lead-owned; need a change? exact code in your report)
+- `rust/src/proto.rs`: `Inventory.macs: Vec<String>`; the CTRL JSON keys comment block right below Inventory
+  (`power`, `wol`, `standby_of` head -> agent; `standby_started` / `standby_failed` agent -> head).
+- `rust/src/jobs.rs`: `PowerSettings` (store meta "power", JSON) and `HaSettings` (store meta "ha_settings", JSON), with defaults.
+- `docs/API.md` section "Power and dynamic heads (wave 7)": routes, bodies, replies, events, and the eco / recruit rules.
+- `console/src/lib/api/schema.ts`: `NodeRow.power`, `PowerSettings`, `PowerReply`, `HaSettings`, `HaSettingsReply`.
+- No store.rs change: settings and the asleep list live in store meta (`ctx.store.meta(k)` / `set_meta(k, v)`); meta "asleep" = JSON list of node ids the head put to sleep.
+- No new crates or npm packages.
 
-- Shared working directory, no worktrees, no commits by agents. The coordinator commits.
-- `cargo test --manifest-path rust/Cargo.toml --no-default-features --features watch --bin cw --offline` = 53 passing at Wave 0.
-- Unrelated changes (do not touch, do not stage): `examples/*.py`, `python/cluster.py`, `results_*.csv`, `scaling.png`.
-- Test media: `vision/footage/people-detection.mp4`, `vision/footage/person-bicycle-car-detection.mp4`. Model: `vision/models/yolov5n.onnx` (COCO 80, no weapon, no holding). FFmpeg/ffprobe at `/opt/homebrew/bin`.
-- Legacy data: `vision/data/seen.jsonl` (2366 lines), `events.jsonl`, `audit.jsonl`, `thumbs/`. Never modify. Tests use `CW_ROOT=<tmpdir>`.
+## Rules for every agent
+- Touch ONLY the files you own. Read anything. No git commits, pushes, stashes or `git add`. No secrets.
+- Rust: `cd rust && CARGO_TARGET_DIR=target-<dir> cargo test --offline --release --no-default-features` (b1 target-a1, b2 target-b2, b3 target-b3, b5 target-a3).
+  Keep the crate compiling after each edit; a break in a file you do not own: wait a minute and retry.
+- Every `ck` process: `CK_PORT=<your port>`, `CK_DATA=<scratchpad>/data...`, `CK_KEY_DIR=<scratchpad>/keys`, `CK_FLEET=open`,
+  `CK_PRESENCE=off`, `CK_POWER_DRY=1` (NEVER let a test suspend this Mac), kill everything you start.
+  Scratchpad: `/private/tmp/claude-501/-Users-divyansh-Desktop-code-divy-cluster-kit/3503507e-9975-404d-a2ea-555606dce1c0/scratchpad/w7<you>/`.
+- Style: short, comments only where non-obvious, `ponytail:` on deliberate shortcuts, a test per non-trivial piece.
+  Report <= 12 lines: built / files / check output / open problems / integration notes.
 
-## Frozen contracts
+## Tasks
+| id | agent | owns (exclusive) | acceptance check | status |
+|----|-------|------------------|------------------|--------|
+| T31 | b1 | `rust/src/identity.rs`, `rust/src/agent.rs`, `rust/src/presence.rs` | MACs in inventory (Linux /sys/class/net/*/address, macOS `ifconfig`/`networksetup`, Windows `getmac /fo csv /nh`; skip lo and all-zero); pure `magic_packet(mac) -> [u8; 102]` + test; CTRL `power: sleep` runs the OS suspend (Linux `systemctl suspend`, macOS `pmset sleepnow`, Windows `rundll32.exe powrprof.dll,SetSuspendState 0,1,0`), CK_POWER_DRY=1 only logs `power: would sleep now`; CTRL `wol` sends magic packets to 255.255.255.255:9 and the /24 broadcast:9; CTRL `standby_of` spawns once `ck head --standby --head ADDR --no-local-worker` with CK_DATA=<agent CK_DATA or ck-data>/standby, reports `standby_started`/`standby_failed` | todo |
+| T32 | b2 | `rust/src/head.rs` | pub fns for the API: `power(ctx, ids, "sleep"/"wake", actor) -> Result<Vec<String>, String>`, `power_settings_changed(ctx)`, `ha_settings_changed(ctx)`, `power_state(ctx, node_id) -> &'static str` ("awake"/"asleep"/"waking"); WoL from the head (pure helper may live in agent.rs: call `crate::agent::magic_packet`) plus CTRL wol to one connected agent on the same /24; eco tick every 30 s per docs/API.md rules (never the head PC, a standby, a PC with work in flight; keep keep_awake awake; wake_on_demand wakes asleep PCs matching a queued job's selector); asleep list in meta "asleep", a PC that reconnects leaves it; HA-10 recruit tick every 10 s (repl::standby_count vs HaSettings.target_standbys, candidate = connected, real, matches selector, not already standby, prefer a lab with no standby; one CTRL standby_of per 60 s); events power.sleep / power.wake / ha.recruit; unit tests for the pure choosers (who to sleep, who to wake, whom to recruit) | done (live run pending) |
+| T33 | b3 | `rust/src/api.rs`, `rust/src/users.rs`, `rust/src/jobcli.rs`, `rust/src/dash.rs` | the 5 routes in docs/API.md wave 7 with validation, roles in users::min_role and ROUTES, NodeRow JSON gains `power` (head::power_state), CLI `ck admin sleep ID..`, `ck admin wake ID..`, `ck admin power [off|eco] [IDLE_MIN] [KEEP_AWAKE]`, `ck admin standbys [N] [SELECTOR]` (CLI_MAP parity test passes); until b2's pub fns land, stub calls behind the exact signatures in T32 and tell the lead | todo |
+| T34 | b4 | `console/src/**` except `schema.ts`, `app.css`; `console/scripts/mock-api.ts` | Nodes: Sleep / Wake actions (operator) with confirm, an Asleep / Waking badge on rows and map tiles (dimmed tile, moon icon); Settings: Power card (mode off/eco, idle minutes, keep awake, wake on demand) and a "Standby heads to keep" control (target 0-5, selector with preview via GET /api/v1/select) in the HA panel; mock routes for all of it; `bun run check`, `bun test`, `bun run build` green; screenshots 1440 and 390 (JPEG q70, look once, delete .playwright-mcp after) | done |
+| T35 | b5 | read-only investigation (edits nothing in src; may write files only in its scratchpad) | find why 1,000 agents cap at ~440 tasks/s with the head at ~29 % CPU and agents near 0 % (one process or 4 processes of 250 make no difference; 200 agents reach ~2,100 tasks/s). Reproduce, profile (`sample <pid> 5` on macOS, per-thread states), read head.rs dispatch/feeder/heartbeat paths; report the root cause with evidence and an exact patch (diff text) for head.rs that b2 or the lead can apply | todo |
 
-- `rust/src/watch/domain.rs` — every shared type, `Store` trait, `ApiError`, `IndexBatch`, ID derivation (`observation_id`, `detection_id`, `stable_id`). Read it fully before writing code.
-- `rust/src/watch/contracts/*.v1.json` — fixtures; `domain::tests::fixtures_parse` keeps them valid.
-- Time = `i64` microseconds. `media_time_us` always; `capture_time_utc_us` optional and never guessed.
-- Error envelope on every `/api/v1` failure: HTTP `ApiError::status()` + body `{"error": ApiError}`.
-- Only the coordinator edits `domain.rs`, `Cargo.toml`/`Cargo.lock`, `mod.rs`, `head.rs`, `config.rs`, `ui/app.css`, `ui/app.js`, nav markup shared by all pages. Need a change there? Put it in your report under "Integration notes" with exact code; do not edit.
-- Approved dependencies: everything already in Cargo.toml plus `rusqlite =0.32.1 (bundled)`. Nothing else. Build is `--offline`.
+Shared acceptance (lead, at integration): with CK_POWER_DRY=1, 20 virtual agents + 2 real-looking agents: `ck admin power eco 1 2` sleeps idle PCs after a minute (events power.sleep), a submitted job wakes them (power.wake, magic packet logged); kill -9 the primary with a standby: after the failover the new primary recruits a new standby within ~20 s (event ha.recruit, /api/v1/ha shows 1 standby again); the 1,000-agent ceiling explained and, if the patch is small, fixed and re-measured.
 
-## Build hygiene (8 agents share one crate)
+## File ownership map
+- lead: `proto.rs`, `jobs.rs`, `main.rs`, `repl.rs`, `sched.rs`, `select.rs`, `store.rs`, `sim.rs`, docs, `scripts/`, `schema.ts`, `app.css`
+- b1 `identity.rs`, `agent.rs`, `presence.rs` · b2 `head.rs` · b3 `api.rs`, `users.rs`, `jobcli.rs`, `dash.rs` · b4 rest of `console/` · b5 none
 
-- Use your own target dir to avoid lock contention: `CARGO_TARGET_DIR=rust/target-<letter>` (pre-cloned from `rust/target`).
-  Example: `CARGO_TARGET_DIR=rust/target-a cargo test --manifest-path rust/Cargo.toml --no-default-features --features watch --bin cw --offline storage::`
-- Keep the crate compiling after every edit. Your module stubs are already registered in `mod.rs` with `#[allow(dead_code)]`. Add submodules inside your own directory (`storage/sqlite.rs` declared from `storage/mod.rs`).
-- If the build breaks in a file you do not own, wait ~1 min and retry; never edit it.
-- Run tests filtered to your module while iterating; run the full suite before reporting.
-
-## Ownership and exported API (coordinator wires these into head.rs `/api/v1`)
-
-| Agent | Owns | Must export (exact names) |
-| --- | --- | --- |
-| A Storage | `storage/**`, `media_catalog.rs` | `storage::open(path: &Path) -> Result<Arc<dyn Store>, ApiError>` (SQLite WAL, migrations); `storage::memory() -> Arc<dyn Store>` (same semantics, for other agents' tests; may be SQLite `:memory:`); `storage::legacy::import(store: &dyn Store, data_dir: &Path) -> Result<ImportReport, ApiError>` (restartable, idempotent); `media_catalog::probe(source_id: &str, path: &Path) -> Result<MediaAsset, ApiError>` (ffprobe + fingerprint, `still` for images, `Missing` when absent); `media_catalog::media_id(source_id, fingerprint) -> String` |
-| B Ingest/cluster | `worker.rs`, `decode.rs`, `split.rs`, `net.rs`, `ingest/**`, `scheduler/**` | `ingest::manifest(source: &domain::Source) -> Result<Vec<PathBuf>, ApiError>` (deterministic, sorted, recursive opt-in); `ingest::batch_from_frame(...) -> IndexBatch` used by worker; `scheduler::Scheduler` (`new(lease_us)`, `register(WorkerCaps)`, `heartbeat(worker)`, `submit(IndexJob, tasks)`, `lease(worker) -> Option<TaskLease>`, `check(&LeaseRef) -> Result<(), ApiError>` stale generation = `stale_lease`, `complete(task_id, gen)`, `fail(task_id, gen, permanent: bool)`, `reap(now_us)`). Worker posts `IndexBatch` JSON to `POST /api/v1/index` and falls back to legacy `/api/index` on 404. |
-| C Models | `yolo.rs`, `track.rs`, `fight.rs`, `gate.rs`, `models/**`, `docs/MODELS.md`, `vision/eval/**` | `models::validate(module: &config::Module) -> Result<ModelVersion, ApiError>` (opens ONNX, checks output layout vs label count, hashes artifact, effective provider); `models::fuse(dets: Vec<Detection>, iou: f32) -> Vec<Detection>` (class-aware cross-module dedup, provenance `fused:<ids>`); `models::relate(obs_id, dets: &[Detection], installed: &[ModelVersion]) -> Vec<Relation>` (`near` only unless a holding module exists); `models::support(installed: &[ModelVersion], predicate) -> Support`; `models::summarize(obs: &FrameObservation, dets, rels, analyzed_classes: &[String], min_conf) -> FrameSummary` (distinct counts; classes not analyzed are absent = Unknown) |
-| D Query/matches | `query.rs`, `query/**` (convert to `query/mod.rs` if needed), `matches.rs` | `query::v1::run(store: &dyn Store, req: &query::v1::Request) -> Result<(QueryRun, Vec<ReviewMatch>), ApiError>`; `query::v1::timeline(store, run_id, start_us, end_us, resolution_us) -> Result<serde_json::Value, ApiError>`; `matches::windows(rows: &[(FrameObservation, Detection)], media: &HashMap<String, MediaAsset>, opts: &matches::Opts, query_run_id) -> Vec<ReviewMatch>` |
-| E Rules/alerts | `rules.rs`, `alerts/**` | `alerts::Engine::new(rules: Vec<alerts::RuleSpec>)`, `engine.observe(&FrameSummary) -> Vec<Alert>` (state transitions only), `alerts::RuleSpec::from_legacy(&config::Rule)`, `alerts::backtest(store: &dyn Store, spec, scope: &QueryScope) -> Result<Vec<Alert>, ApiError>` |
-| F Review UI | `ui/review.html`, `ui/review.js`, `ui/review.css`, `ui/timeline.js`, `ui/timeline.css`, `docs/REVIEW_UI.md` | Page served at `/review?run=<query_run_id>`; fixture mode `?fixture=1` reads `ui/fixtures/review.json` (owned by F, clearly labelled TEST DATA). |
-| G Product UI | `ui/sources.*`, `ui/find.*`, `ui/setup.*`, `ui/logs.*`, `ui/wall.*`, `ui/product.css` | Search sends `POST /api/v1/queries` and navigates to `/review?run=<id>`. |
-| H Security/acceptance | `auth/**`, `scripts/watch_acceptance.sh`, `docs/WATCH_OPERATIONS.md`, `docs/RELEASE_CHECKLIST.md` | `auth::Auth::load(root: &Path) -> Auth`; `auth.check(method: &str, path: &str, headers: &[(String, String)]) -> Result<auth::Principal, ApiError>`; `auth::Role`; login/logout/bootstrap handlers as pure fns returning `(status, headers, body)`; `auth::redact(url: &str) -> String`; `auth::allowed_media(root: &Path, path: &Path) -> bool` |
-
-## Target `/api/v1` routes the coordinator will wire (UI agents build against these)
-
-- `POST /api/v1/index` body `IndexBatch` -> `BatchOutcome`
-- `GET /api/v1/sources`, `POST /api/v1/sources` (Source + import -> IndexJob), `GET /api/v1/jobs`, `GET /api/v1/jobs/{id}`
-- `GET /api/v1/models` -> `[ModelVersion]` with `support` map; `GET /api/v1/capabilities`
-- `POST /api/v1/queries` body `{"sql"?: str, "class"?: str, "min_confidence"?: f32, "scope": QueryScope, "gap_us"?: i64, "pre_us"?: i64, "post_us"?: i64}` -> `{"run": QueryRun, "matches": [ReviewMatch] (first page), "next": cursor|null}`
-- `GET /api/v1/queries/{id}`, `GET /api/v1/queries/{id}/matches?cursor=&limit=`
-- `GET /api/v1/queries/{id}/timeline?start_us=&end_us=&resolution_us=` -> `{"lanes":[{"source_id","media_id","clock","label","duration_us","capture_start_utc_us","availability","matches":[ReviewMatch]}],"gaps":[...]}`
-- `GET /api/v1/media/{id}` -> MediaAsset; `/stream` (Range); `/frame?t_us=` (JPEG, exact seek); `/thumbnails?start_us=&end_us=&step_us=` -> `{"sprite": url, "tile_w", "tile_h", "cols", "samples":[{"t_us","x","y"}]}`; `/observations?start_us=&end_us=` -> `[{"observation", "detections", "relations"}]`
-- `POST /api/v1/reviews`, `GET /api/v1/reviews`, `GET/PATCH /api/v1/reviews/{id}` (PATCH needs `version`), `POST /api/v1/reviews/{id}/manifest` -> evidence manifest JSON
-- `POST /api/v1/exports`, `GET /api/v1/exports/{id}`, `POST /api/v1/exports/{id}/cancel`
-- `GET /api/v1/alerts?cursor=`, `POST /api/v1/alerts/{id}/decision`, `POST /api/v1/rules/backtest`
-- `GET /api/v1/audit?q=&cursor=`
-- `GET /api/v1/events` SSE (`id:` cursor; `job`, `alert`, `index` events)
-- `GET /api/v1/auth/me`, `POST /api/v1/auth/login`, `POST /api/v1/auth/logout`, `POST /api/v1/auth/bootstrap`
-
-## Report format (final message, <= 60 lines)
-
-1. Files created/changed.
-2. Exact test commands + pass counts (paste the `test result:` line).
-3. Real-media / real-browser evidence (paths to screenshots/logs under `docs/evidence/<letter>/`).
-4. Integration notes: exact code the coordinator must put in head.rs/mod.rs/Cargo/app.js.
-5. Remaining limitations, stated plainly.
+## Integration steps (lead)
+1. Reports. 2. cargo test (release, GPU), console check/test/build, chaos.sh 5/5. 3. Shared acceptance above. 4. Docs (OPERATIONS.md power + standbys), STATE.md, requirements NET-06 / HA-10.

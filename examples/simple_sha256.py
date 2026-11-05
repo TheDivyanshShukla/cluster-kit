@@ -36,7 +36,10 @@ def hash_range(start: int, end: int) -> int:
 
 
 def run_dask(pieces: list[tuple[int, int]]) -> tuple[list[int], str]:
-    from distributed import Client
+    try:
+        from distributed import Client
+    except ImportError:
+        sys.exit("Dask engine needs the cluster's Python. Run:  ./kit py run examples/simple_sha256.py --cluster")
     client = Client(f"tcp://127.0.0.1:{SCHED_PORT}", timeout=10)
     parts = client.gather(client.map(hash_range, *zip(*pieces)))
     return parts, f"cluster, Dask engine ({len(client.scheduler_info()['workers'])} workers)"

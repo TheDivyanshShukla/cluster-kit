@@ -1,0 +1,15 @@
+{
+  "nodes": [
+    {"count": 2000, "rate": 1e6, "jitter": 0.2, "mtbf_s": 86400, "down_s": 120, "lab": "A"},
+    {"count": 2000, "rate": 1e6, "jitter": 0.2, "mtbf_s": 86400, "down_s": 120, "lab": "B"},
+    {"count": 2000, "rate": 1e6, "jitter": 0.2, "mtbf_s": 86400, "down_s": 120, "lab": "C"},
+    {"count": 2000, "rate": 1e6, "jitter": 0.2, "mtbf_s": 86400, "down_s": 120, "lab": "D"},
+    {"count": 2000, "rate": 1e6, "jitter": 0.2, "mtbf_s": 86400, "down_s": 120, "lab": "E"}
+  ],
+  "job": {"n": 6e12, "policy": "adaptive"},
+  "architecture": "relays+standby",
+  "relays": {"per_lab": true, "batch": 20, "extra_latency_ms": 0.3},
+  "head_failure": {"at_s": 300, "recovery_s": 6},
+  "seed": 1,
+  "sample_s": 5
+}

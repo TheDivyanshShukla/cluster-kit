@@ -12,3 +12,13 @@ vision/models/*
 vision/data/
 vision/watch.json
 .claude/worktrees/
+
+# local clutter: old reports, screenshots, backups
+local/
+
+# head database when CK_DATA is not set
+ck-data/
+rust/ck-data/
+
+# macOS
+.DS_Store

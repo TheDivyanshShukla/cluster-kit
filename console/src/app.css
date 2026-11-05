@@ -1,0 +1,108 @@
+/* Design tokens: the ONLY place colours, radii and fonts are defined. Components use semantic classes. */
+@import 'tailwindcss';
+@import '@fontsource-variable/inter';
+
+:root {
+	color-scheme: light dark;
+	--hue: 195; /* teal accent tints the neutrals */
+	--primary-l: oklch(0.5 0.1 195);
+	--primary-d: oklch(0.74 0.09 195);
+
+	/* dark elevation from lightness: background .16 -> surface .20 -> raised .24 */
+	--background: light-dark(oklch(0.985 0.003 var(--hue)), oklch(0.16 0.008 var(--hue)));
+	--surface: light-dark(oklch(1 0 0), oklch(0.2 0.009 var(--hue)));
+	--raised: light-dark(oklch(0.965 0.004 var(--hue)), oklch(0.24 0.01 var(--hue)));
+	--line: light-dark(oklch(0.9 0.005 var(--hue)), oklch(0.3 0.01 var(--hue)));
+	--foreground: light-dark(oklch(0.21 0.01 var(--hue)), oklch(0.93 0.005 var(--hue)));
+	--muted-foreground: light-dark(oklch(0.5 0.01 var(--hue)), oklch(0.7 0.01 var(--hue)));
+	--primary: light-dark(var(--primary-l), var(--primary-d));
+	--primary-foreground: light-dark(oklch(0.99 0 0), oklch(0.16 0.01 var(--hue)));
+
+	/* node / job states: always paired with a shape or label, never colour alone (UI-14) */
+	--ok: light-dark(oklch(0.52 0.12 155), oklch(0.75 0.12 155));
+	--warn: light-dark(oklch(0.58 0.13 75), oklch(0.8 0.13 80));
+	--bad: light-dark(oklch(0.52 0.18 27), oklch(0.7 0.15 25));
+	--idle: light-dark(oklch(0.62 0.01 var(--hue)), oklch(0.6 0.01 var(--hue)));
+	--busy: var(--primary);
+
+	--ring: color-mix(in oklab, var(--primary) 50%, transparent);
+	--radius: 0.5rem;
+}
+@supports not (color: light-dark(white, black)) {
+	:root {
+		--background: oklch(0.985 0.003 195);
+		--surface: oklch(1 0 0);
+		--raised: oklch(0.965 0.004 195);
+		--line: oklch(0.9 0.005 195);
+		--foreground: oklch(0.21 0.01 195);
+		--muted-foreground: oklch(0.5 0.01 195);
+		--primary: oklch(0.5 0.1 195);
+		--primary-foreground: oklch(0.99 0 0);
+		--ok: oklch(0.52 0.12 155);
+		--warn: oklch(0.58 0.13 75);
+		--bad: oklch(0.52 0.18 27);
+		--idle: oklch(0.62 0.01 195);
+		--busy: oklch(0.5 0.1 195);
+	}
+}
+:root[data-theme='light'] {
+	color-scheme: light;
+}
+:root[data-theme='dark'] {
+	color-scheme: dark;
+}
+
+@theme inline {
+	--font-sans: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+	--font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+	--color-background: var(--background);
+	--color-surface: var(--surface);
+	--color-raised: var(--raised);
+	--color-line: var(--line);
+	--color-foreground: var(--foreground);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-ok: var(--ok);
+	--color-warn: var(--warn);
+	--color-bad: var(--bad);
+	--color-idle: var(--idle);
+	--color-busy: var(--busy);
+	--color-ring: var(--ring);
+	--radius-lg: var(--radius);
+}
+
+html {
+	background: var(--background);
+	color: var(--foreground);
+	font-size: 14px;
+}
+@media (min-width: 1800px) {
+	html {
+		font-size: 15px;
+	}
+}
+body {
+	font-family: var(--font-sans);
+	-webkit-font-smoothing: antialiased;
+}
+.num {
+	font-variant-numeric: tabular-nums;
+}
+:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
+}
+@media print {
+	:root {
+		color-scheme: light;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		transition-duration: 0.01ms !important;
+	}
+}

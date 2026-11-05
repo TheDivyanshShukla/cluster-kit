@@ -1,0 +1,26 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: clippy (allowed to fail for now)
+        if: matrix.os == 'ubuntu-latest'
+        continue-on-error: true
+        run: cargo clippy --no-default-features -- -D warnings
+      - run: cargo test --no-default-features
+      - name: chaos
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: .
+        run: bash scripts/chaos.sh

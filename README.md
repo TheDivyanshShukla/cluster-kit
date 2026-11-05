@@ -6,7 +6,6 @@ Turns ordinary Windows and Ubuntu PCs on one LAN into a compute cluster. It has 
 |---|---|---|---|
 | `py` | [python/](python/) | Dask (Python). Run any Python function across the cluster, with a 1 → N PC scaling benchmark. | `http://HEAD_IP:8787` |
 | `rs` | [rust/](rust/) | `ck`, a Rust binary that uses raw TCP and a binary protocol. Built-in SHA-256 search, or runs a program in any language per chunk. | `http://HEAD_IP:7702` |
-| `rs watch` | [rust/src/watch/](rust/src/watch/) | `cw`, campus cameras. Every frame is gated. Blur and blank frames skip the detector. Rules are short lines. | `http://HEAD_IP:7710` |
 
 Both engines have:
 - **Auto-discovery:** workers find the head by UDP broadcast, so you never type an IP.
@@ -21,6 +20,7 @@ python/                 Dask engine: cluster.py (head/worker/bench/firewall)
 rust/                   Rust engine: src/main.rs, src/gpu.rs + sha.wgsl (GPU), src/dash.html,
                         bench/mpi_pingpong.c + bench/mpi_sha.c (MPI baselines)
 examples/               example jobs: simple_sha256.py (start here, see docs/SIMPLE.md), dask_sha256.py (Dask), primes.c / primes.js / primes.py (any-language --cmd)
+docs/                   SIMPLE.md, BENCHMARK.md, UBUNTU.md, and the roadmap: CONSOLE_REQUIREMENTS.md
 ```
 
 To add an engine later, create a folder and add one `case` branch to `kit` (and `kit.ps1`). To get firewall handling for free, start it through `python/cluster.py fwrun`.
@@ -37,6 +37,7 @@ Copy or clone this folder to every PC, then:
 - **Rust engine:** installs Rust and builds `ck`. Use `kit setup py` to skip Rust.
 - **Sleep:** setup also offers to disable sleep on that PC.
 - **Windows and Rust:** building needs the MSVC build tools. If the build fails, setup prints the `winget` command that installs them.
+- **Ubuntu PCs:** what to copy, packages, offline builds and ports are in [docs/UBUNTU.md](docs/UBUNTU.md).
 
 ## Run
 
@@ -49,31 +50,6 @@ Copy or clone this folder to every PC, then:
 | Benchmark | `kit py bench` | `kit rs ping --head HEAD_IP`, `kit py run examples/sha_bench.py` (see [docs/BENCHMARK.md](docs/BENCHMARK.md)) |
 
 On Linux and macOS, write `./kit` instead of `kit`. Stop anything with Ctrl+C or by closing the window, and the ports close automatically.
-
-### Cameras
-
-One i5-10400F cannot watch a wall of cameras and still keep up. `cw` is the demonstration: the same footage, one PC against every PC that joined.
-
-```
-kit rs watch fetch     once per PC: sample clips and the object model
-kit rs watch head      this PC opens the panel and works too
-kit rs watch worker    every other PC
-```
-
-Full instructions (build, models, sources, joining PCs, tests, environment variables, troubleshooting): [docs/RUNNING.md](docs/RUNNING.md). Demo walkthroughs: [docs/DEMO.md](docs/DEMO.md), [docs/CLUSTER_DEMO.md](docs/CLUSTER_DEMO.md). Adding an Ubuntu PC: [docs/UBUNTU.md](docs/UBUNTU.md).
-
-ffmpeg must be on PATH (`winget install Gyan.FFmpeg`, or `brew install ffmpeg`). Open `http://HEAD_IP:7710`. One PC assigns every camera to the head. All PCs spreads them by core count. Any number of PCs on the network can join. Processing is set on the panel: Speed, Balanced, or Accuracy, and each filter on its own (blur, blank, an unchanged picture, how often a sharp frame is looked at, and the picture size).
-
-A rule is one line, saved from Setup:
-
-```
-seen("fight")
-seen("pistol") or seen("knife")
-count("cell phone") > 40
-count("cell phone") < 5
-```
-
-A count below a number freezes while the frame is blurry, blank, or was never detected, so a bad picture is not "zero phones". The warning stays a check until a person confirms it. A weapon model is not downloaded. Put the ONNX path on every PC, then turn that model on. The operation figure uses the size you type for the model. It is not counted inside the network. On an Intel CPU, OpenVINO is often faster than the runtime shipped here. Swapping that runtime later does not change a rule. There is no login. Use it on a trusted LAN, same as `ck`.
 
 On Windows, `head` and `worker` ask for Administrator rights, which firewall rules need. On Ubuntu with ufw active, they ask for your sudo password once.
 
@@ -116,11 +92,10 @@ tune       on | off       low-latency network settings (Linux, Windows); reverts
 |---|---|---|
 | py | TCP 8786–8787, TCP 9000–9200 | TCP 9000–9200, UDP 8785 |
 | rs | TCP 7700 (workers, clients), TCP 7702 (dashboard) | UDP 7701 (discovery) |
-| rs watch | TCP 7710 (panel) | UDP 7711 (discovery) |
 
 Rules are tagged `daskcluster-head`, `daskcluster-worker`, `daskcluster-ck-head` and `daskcluster-ck-worker`. Nothing else in your firewall is touched.
 
-**Security:** these programs have no authentication. Anyone on the LAN can run code on every PC: through Dask, or through `ck run --cmd`. The camera panel is open to the same LAN. Use them on trusted networks only.
+**Security:** these programs have no authentication. Anyone on the LAN can run code on every PC: through Dask, or through `ck run --cmd`. Use them on trusted networks only. Fixing this comes before any campus-wide use (see docs/CONSOLE_REQUIREMENTS.md, section SEC).
 
 ## Benchmarks
 

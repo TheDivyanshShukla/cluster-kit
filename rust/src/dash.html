@@ -74,7 +74,7 @@ const fmt = n => n >= 1e9 ? (n / 1e9).toFixed(2) + 'G' : n >= 1e6 ? (n / 1e6).to
 const gb = b => (b / 2 ** 30).toFixed(1);
 const $ = id => document.getElementById(id);
 let dupes = new Set(); // addresses with more than one worker get a #id suffix
-const name = w => (w.addr === '127.0.0.1' ? 'head (local)' : w.addr) + (dupes.has(w.addr) ? ' #' + w.id : '');
+const name = w => (w.addr === '127.0.0.1' && !w.virtual ? 'head (local)' : (w.host || w.addr)) + (dupes.has(w.addr) ? ' #' + w.id : '');
 const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
 
 const toggle = $('detail');
