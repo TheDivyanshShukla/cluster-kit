@@ -12,6 +12,7 @@ if (MODE === 'required') {
 	users.set('admin', { password: 'adminadminadmin', role: 'admin', created_ms: Date.now() - 864e5 });
 	users.set('vic', { password: 'viewerpass1234', role: 'viewer', created_ms: Date.now() - 3e8 });
 	users.set('ana', { password: 'researcherpass1', role: 'researcher', created_ms: Date.now() - 4e8 });
+	for (const [i, n] of ['ben', 'chitra', 'dev', 'esha', 'farid', 'gita', 'hari', 'indu', 'jai'].entries()) users.set(n, { password: 'researcherpass1', role: i % 4 === 0 ? 'operator' : i % 4 === 1 ? 'viewer' : 'researcher', created_ms: Date.now() - (5 + i) * 3e7 });
 }
 const sessions = new Map<string, string>(); // cookie -> user name
 
@@ -34,7 +35,7 @@ const mkJob = (o: Partial<Job> & Pick<Job, 'kind' | 'total'>): Job => {
 	jobs.push(j);
 	return j;
 };
-const ago = (ms: number) => now() - ms;
+const ago = (ms: number) => Math.round(now() - ms);
 mkJob({ name: 'SHA sweep 0-50M', kind: 'sha', total: 50_000_000, done: 50_000_000, state: 'done', created_ms: ago(9e6), started_ms: ago(9e6), finished_ms: ago(8.9e6) });
 mkJob({ name: 'Flaky command', kind: 'cmd', total: 8_000_000, done: 3_000_000, state: 'failed', error: 'worker 10.0.0.7 exited with status 2', submitter: 'ana', created_ms: ago(7e6), started_ms: ago(7e6), finished_ms: ago(6.9e6) });
 mkJob({ name: 'Old synth', kind: 'synth', total: 1_000_000_000, done: 400_000_000, state: 'cancelled', submitter: 'ana', created_ms: ago(5e6), started_ms: ago(5e6), finished_ms: ago(4.9e6) });
@@ -42,6 +43,21 @@ mkJob({ name: 'Synth 500G numbers', kind: 'synth', total: 500_000_000_000, done:
 mkJob({ name: 'Exam grading (urgent)', kind: 'sha', total: 80_000_000_000, done: 8_000_000_000, state: 'running', created_ms: ago(30_000), started_ms: ago(30_000), selector: 'pool=night', priority: 0, submitter: 'ana' });
 mkJob({ name: 'Hash the word list', kind: 'list', total: 6, done: 6, state: 'done', reducer: 'sort', policy: 'guided', submitter: 'ana', created_ms: ago(3e6), started_ms: ago(3e6), finished_ms: ago(2.9e6), items: ['pear', 'apple', 'fig', 'plum', 'kiwi', 'lime'] });
 mkJob({ name: 'Nightly SHA batch', kind: 'sha', total: 200_000_000, submitter: 'ana' });
+// ~45 more jobs: a realistic history (mostly done, some failed or cancelled) and a few queued
+{
+	const who = ['ana', 'ben', 'chitra', 'dev', 'esha', 'admin'], kinds2 = ['sha', 'synth', 'cmd', 'list'] as const;
+	const names = ['Hash sweep', 'Prime search', 'Grade batch', 'Render tiles', 'Word list', 'Monte Carlo', 'Checksum audit', 'Nightly SHA', 'Seed scan', 'Matrix probe'];
+	for (let i = 0; i < 45; i++) {
+		const queued = i >= 42, st = queued ? 'queued' : i % 9 === 4 ? 'failed' : i % 11 === 6 ? 'cancelled' : 'done';
+		const total = 1_000_000 * (1 + ((i * 37) % 900)), age = (i + 1) * 5.2e6 * (0.6 + (i % 5) * 0.2);
+		mkJob({
+			name: `${names[i % names.length]} ${i + 1}`, kind: kinds2[i % 4], total, done: st === 'done' ? total : st === 'queued' ? 0 : Math.floor(total * 0.4), state: st,
+			submitter: who[(i * 7) % who.length], priority: i % 13 === 0 ? 0 : i % 5 === 1 ? 1 : i % 7 === 3 ? 3 : i % 17 === 5 ? 4 : 2,
+			selector: i % 3 === 0 ? 'lab="Lab A"' : i % 8 === 2 ? 'pool=night' : '', error: st === 'failed' ? `worker 10.0.0.${10 + (i % 20)} exited with status ${1 + (i % 3)}` : null,
+			created_ms: ago(age), started_ms: queued ? null : ago(age - 2e4), finished_ms: st === 'done' || st === 'failed' || st === 'cancelled' ? ago(age - 4e5) : null
+		});
+	}
+}
 
 const workers = Array.from({ length: 30 }, (_, i) => {
 	const threads = i % 3 === 0 ? 16 : 8;
@@ -162,15 +178,60 @@ type Ev = { id: number; ts_ms: number; kind: string; actor: string; detail: stri
 const events: Ev[] = [];
 let evSeq = 0;
 const subs = new Set<(name: string, data: unknown) => void>();
+// ---- structured log lines (docs/LOGGING.md), JSON per line, newest last in memory
+type LogLine = Record<string, unknown> & { ts_ms: number; level: 'error' | 'warn' | 'info' | 'debug'; role: string; node: string; kind: string };
+const logLines: LogLine[] = [];
+const LV = { error: 0, warn: 1, info: 2, debug: 3 } as const;
+const pushLog = (l: LogLine) => { logLines.push(l); if (logLines.length > 40_000) logLines.splice(0, 5_000); };
+
+const EV_KINDS: [string, string, (n: number) => string][] = [
+	['node.join', '', (n) => `pc-${String(1 + (n % 30)).padStart(2, '0')} joined`],
+	['node.lost', '', (n) => `pc-${String(1 + ((n * 7) % 30)).padStart(2, '0')} lost`],
+	['job.submit', 'ana', (n) => `job ${1 + (n % 50)} submitted`],
+	['job.start', '', (n) => `job ${1 + (n % 50)} started`],
+	['job.done', '', (n) => `job ${1 + (n % 50)} finished`],
+	['job.cancel', 'admin', (n) => `job ${1 + (n % 50)} cancelled`],
+	['auth.login', 'admin', () => 'login from 127.0.0.1'],
+	['power.sleep', '', (n) => `${1 + (n % 6)} PCs went to sleep`],
+	['power.wake', '', (n) => `pc-${String(1 + (n % 30)).padStart(2, '0')} woke up`],
+	['tune.changed', 'admin', () => 'lost_after_ms 15000 -> 20000'],
+	['ha.recruit', '', (n) => `pc-${String(1 + (n % 30)).padStart(2, '0')} became a standby`],
+	['node.approve', 'admin', (n) => `pc-${String(1 + (n % 30)).padStart(2, '0')} -> active`],
+	['pool.change', 'ben', () => 'PUT night'],
+	['user.create', 'admin', () => 'created esha as researcher']
+];
+const ACTORS = ['ana', 'ben', 'chitra', 'dev', 'admin'];
 const logEvent = (kind: string, actor: string, detail: string, ts = now()) => {
 	const e = { id: ++evSeq, ts_ms: ts, kind, actor, detail };
 	events.push(e);
+	pushLog({ ts_ms: ts, level: kind.endsWith('lost') ? 'warn' : 'info', role: 'head', node: 'n001', kind, actor, msg: detail });
 	for (const s of subs) s('event', e);
 };
-for (let i = 0; i < 70; i++) {
-	const k = ['node.join', 'job.submit', 'auth.login', 'job.done', 'node.lost'][i % 5];
-	logEvent(k, k.startsWith('node') ? '' : i % 2 ? 'ana' : 'admin', `${k} ${['pc-03 joined', 'job 4 submitted', 'login from 127.0.0.1', 'job 1 finished', 'pc-12 lost'][i % 5]}`, ago((70 - i) * 120_000));
+// 2,000 events: dense in the last hour, thinning over ~2.5 days (oldest first so ids rise with time)
+for (let i = 1999; i >= 0; i--) {
+	const [k, a0, d] = EV_KINDS[(i * 7 + (i >> 3)) % EV_KINDS.length];
+	logEvent(k, a0 && i % 3 === 0 ? ACTORS[i % ACTORS.length] : a0, d(i), ago((i / 2000) ** 2.5 * 2.5 * 864e5 + i * 1500));
 }
+// ~12,000 log lines over the last 24 h: api requests, chunks, node and ha traffic
+{
+	const KL: [string, LogLine['level'], string, string][] = [
+		['api.request', 'debug', 'head', 'GET /api/v1/cluster'], ['api.request', 'info', 'head', 'POST /api/v1/jobs'], ['api.request', 'warn', 'head', 'GET /api/v1/jobs/999'],
+		['chunk.requeue', 'warn', 'head', 'chunk requeued after a slow PC'], ['chunk.dispatch', 'debug', 'head', 'chunk dispatched'], ['chunk.end', 'debug', 'agent', 'chunk finished'],
+		['node.connect', 'info', 'head', 'agent connected'], ['node.disconnect', 'warn', 'head', 'agent disconnected'], ['ha.lag', 'info', 'head', 'standby lag class changed'],
+		['standby.follow', 'info', 'standby', 'following the head'], ['power.eco', 'info', 'head', 'eco: 3 PCs to sleep'], ['agent.calibration', 'info', 'agent', 'calibrated 42.1 MH/s'],
+		['job.started', 'info', 'head', 'job started'], ['job.complete', 'info', 'head', 'job complete'], ['tune.sent', 'info', 'head', 'tunables sent to 28 PCs'], ['node.denied', 'error', 'head', 'join code expired']
+	];
+	for (let i = 0; i < 12_000; i++) {
+		const [kind, level, role, msg] = KL[(i * 5 + (i >> 4)) % KL.length];
+		const ts = ago((i / 12_000) ** 1.6 * 864e5 + i * 40);
+		const node = role === 'head' ? 'n001' : `n${String(1 + (i % 30)).padStart(3, '0')}`;
+		pushLog({ ts_ms: ts, level, role, node, kind, msg: `${msg} #${i}`, ...(kind === 'api.request' ? { method: msg.split(' ')[0], path: msg.split(' ')[1], status: level === 'warn' ? 404 : 200, ms: 1 + (i % 17), user: ACTORS[i % ACTORS.length] } : { job: 1 + (i % 50), a: i * 1000, b: i * 1000 + 999 }) });
+	}
+	logLines.sort((x, y) => x.ts_ms - y.ts_ms);
+}
+setInterval(() => {
+	for (let i = 0; i < 3; i++) pushLog({ ts_ms: now(), level: i === 2 && Math.random() < 0.2 ? 'warn' : i === 0 ? 'debug' : 'info', role: 'head', node: 'n001', kind: i === 0 ? 'api.request' : i === 1 ? 'chunk.end' : 'ha.lag', msg: i === 0 ? 'GET /api/v1/cluster' : i === 1 ? 'chunk finished' : 'standby lag class changed', ...(i === 0 ? { method: 'GET', path: '/api/v1/cluster', status: 200, ms: 2, user: 'admin' } : {}) });
+}, 1500);
 
 const runningAll = () => jobs.filter((j) => j.state === 'running');
 const running = () => runningAll()[0] ?? null;
@@ -303,14 +364,19 @@ function setFleet(n: number) {
 	labs.splice(0, labs.length, ...labs.filter((l) => l.id <= 100));
 	for (let i = 0; i < want; i++) {
 		const li = Math.floor(i / 100);
-		if (i % 100 === 0) labs.push({ id: 101 + li, name: `Sim ${li + 1}`, w: 10, h: 10, created_ms: ago(1e8) });
+		if (i % 100 === 0) labs.push({ id: 101 + li, name: want <= 400 ? `Lab ${'CDEFGH'[li] ?? `S${li + 1}`}` : `Sim ${li + 1}`, w: 10, h: 10, created_ms: ago(1e8) });
 		const id = `x${String(i + 1).padStart(4, '0')}`, threads = i % 3 === 0 ? 16 : 8;
 		const w = { ...workers[0], id: 1000 + i, addr: `10.1.${Math.floor(i / 250)}.${i % 250}:7701`, threads, chunks: 0, numbers: 0, busy: false, rate: 0, node_id: id, host: `sim-${String(i + 1).padStart(4, '0')}`, virtual: true, presence: 'idle' as const, blocked: false, cap: null };
 		workers.push(w);
-		nodes.set(id, { ...nodes.get('n001')!, node_id: id, host: w.host!, addr: w.addr, lab_id: 101 + li, x: (i % 100) % 10, y: Math.floor((i % 100) / 10), state: 'active', online: true, power: 'awake', presence: 'idle', labels: {}, pools: [] });
+		const inv = { ...(w.inv as any), cpu_model: ['AMD Ryzen 7 5700G', 'Intel Core i5-10400', 'Intel Core i7-12700'][i % 3], cores_logical: threads, ram_bytes: [8, 16, 32][i % 3] * 2 ** 30 };
+		w.inv = inv;
+		// a believable mix for the lists (only for the 200-PC default; the 1,000-PC probe stays all-active)
+		const mix = want <= 400 ? (i % 53 === 7 ? 'pending' : i % 41 === 3 ? 'maintenance' : i % 37 === 5 ? 'cordoned' : i % 61 === 9 ? 'retired' : 'active') : 'active';
+		const asleep = want <= 400 && i % 23 === 4, lost = want <= 400 && i % 43 === 11;
+		nodes.set(id, { ...nodes.get('n001')!, node_id: id, host: w.host!, addr: w.addr, inventory: inv, lab_id: 101 + li, x: (i % 100) % 10, y: Math.floor((i % 100) / 10), state: mix as NState, online: !asleep && !lost, power: asleep ? 'asleep' : 'awake', presence: 'idle', labels: want <= 400 && i % 6 === 0 ? { room: String(1 + (i % 4)), gpu: i % 12 === 0 ? 'yes' : 'no' } : {}, pools: [] });
 	}
 }
-if (process.env.MOCK_PCS) setFleet(Number(process.env.MOCK_PCS));
+setFleet(Number(process.env.MOCK_PCS ?? 170)); // 30 hand-made PCs + 170 = 200 (MOCK_PCS=0 for the original 30)
 setInterval(() => {
 	if (workers.length <= BASE) return;
 	const w = workers[BASE + Math.floor(Math.random() * (workers.length - BASE))];
@@ -495,6 +561,19 @@ async function handle(req: Request): Promise<Response> {
 			logEvent('tune.changed', me.name, ch.join(', ') || 'no change');
 		}
 		return json({ tunables: tunables() });
+	}
+	if (p === '/api/v1/logs') {
+		if ((d = need('operator'))) return d;
+		const since = Number(url.searchParams.get('since_ms') ?? 0), kind = url.searchParams.get('kind') ?? '', role = url.searchParams.get('role') ?? '';
+		const lv = url.searchParams.get('level');
+		if (lv && !(lv in LV)) return err(400, 'invalid_request', 'level is error|warn|info|debug');
+		const max = lv ? LV[lv as keyof typeof LV] : 3, limit = Math.max(1, Math.min(20_000, Number(url.searchParams.get('limit') ?? 200)));
+		const out: LogLine[] = [];
+		for (let i = logLines.length - 1; i >= 0 && out.length < limit; i--) {
+			const l = logLines[i];
+			if (l.ts_ms >= since && LV[l.level] <= max && (!kind || l.kind.startsWith(kind)) && (!role || l.role === role)) out.push(l);
+		}
+		return json({ logs: out });
 	}
 	if (p === '/api/v1/ha/candidates') return json({ candidates: candidates() });
 	if (p === '/api/v1/ha/switchover' && m === 'POST') {

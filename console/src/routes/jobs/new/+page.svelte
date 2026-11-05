@@ -12,6 +12,8 @@
 	import { debounce, PRIORITY_LABEL } from '#lib/org.ts';
 	import { estimateText, parseItems, PLACEMENTS, POLICIES, REDUCER_OPTIONS } from '#lib/sched.ts';
 	import { roleNow } from '#lib/session.svelte.ts';
+	import Page from '#lib/components/Page.svelte';
+	import Panel from '#lib/components/Panel.svelte';
 	import { btnGhost, btnPrimary, card, field } from '#lib/ui.ts';
 
 	const form = $state(emptyForm());
@@ -91,16 +93,13 @@
 	};
 </script>
 
-<svelte:head><title>New job · Cluster Kit</title></svelte:head>
-
-<a href="/jobs" class="text-muted-foreground hover:text-foreground inline-flex items-center gap-1.5 text-[13px]"><ArrowLeft class="size-4" aria-hidden="true" />All jobs</a>
-<h1 class="mt-3 text-xl font-semibold tracking-tight">New job</h1>
-<p class="text-muted-foreground mt-1">Cover a range of numbers across every connected PC.</p>
-
+<Page title="New job" subtitle="Cover a range of numbers across every connected PC.">
+	{#snippet actions()}<a href="/jobs" class={btnGhost}><ArrowLeft class="size-4" aria-hidden="true" />All jobs</a>{/snippet}
 {#if !atLeast(roleNow(), 'researcher')}
-	<div class="mt-6"><EmptyState icon={Lock} title="Your role cannot submit jobs" body="Ask an admin for the researcher role." /></div>
+	<Panel title="New job"><EmptyState icon={Lock} title="Your role cannot submit jobs" body="Ask an admin for the researcher role." /></Panel>
 {:else}
-	<form onsubmit={submit} novalidate class="{card} mt-5 max-w-2xl space-y-5 p-4 sm:p-5">
+	<Panel title="New job">
+	<form onsubmit={submit} novalidate class="max-w-2xl space-y-5">
 		<fieldset>
 			<legend class="mb-1.5 text-xs font-medium">Kind of work</legend>
 			<div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
@@ -231,4 +230,6 @@
 			<button type="submit" class={btnPrimary} disabled={busy}><Send class="size-4" aria-hidden="true" />{busy ? 'Submitting…' : 'Submit job'}</button>
 		</div>
 	</form>
+	</Panel>
 {/if}
+</Page>

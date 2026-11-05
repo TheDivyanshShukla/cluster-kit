@@ -1,6 +1,7 @@
 // Typed fetch wrapper for the ck head (docs/API.md). Throws readable errors; never returns unparsed JSON.
 // Cookies are same-origin: the session cookie rides along without any option.
 import { z } from 'zod';
+import { LogList } from './logs';
 import {
 	ApiErrorBody,
 	CapList,
@@ -188,6 +189,12 @@ export const api = {
 	cancelJob: (id: number) => call('POST', `/api/v1/jobs/${id}/cancel`, JobOne),
 	// events
 	events: (limit = 50, before?: number | null) => call('GET', `/api/v1/events${page(limit, before)}`, EventList),
+	/** operator role; newest lines of the head's log files, filtered by the head */
+	logs: (q: { since_ms?: number; kind?: string; level?: string; limit?: number }) => {
+		const p = new URLSearchParams();
+		for (const [k, v] of Object.entries(q)) if (v !== undefined && v !== '') p.set(k, String(v));
+		return call('GET', `/api/v1/logs?${p}`, LogList);
+	},
 	// legacy
 	stats: (detail = false) => call('GET', detail ? '/stats?detail=1' : '/stats', Stats)
 };

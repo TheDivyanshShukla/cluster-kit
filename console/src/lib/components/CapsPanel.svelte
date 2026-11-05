@@ -41,7 +41,7 @@
 </script>
 
 <section aria-label="Thread caps">
-	<h2 class="font-medium">Thread caps</h2>
+	<h2 class="sr-only">Thread caps</h2>
 	<p class="text-muted-foreground mt-0.5 text-[13px]">Limit how many threads matching PCs give to jobs, for example so a lab stays usable for the person sitting there.</p>
 	{#if error}<p class="text-bad mt-2 text-[13px]" role="alert">{error}</p>{/if}
 	<div class="{card} mt-3">

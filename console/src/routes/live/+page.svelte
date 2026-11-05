@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Activity, ArrowRightLeft, Crown, ListChecks, Moon, Plug, Sunrise, UserPlus, User as UserIcon, WifiOff, X, Wrench, ChevronUp } from '@lucide/svelte';
+	import { Activity, ArrowRightLeft, Crown, ListChecks, Moon, Plug, Sunrise, UserPlus, User as UserIcon, WifiOff, X, Wrench } from '@lucide/svelte';
 	import type { Component } from 'svelte';
 	import { api } from '#lib/api/client.ts';
 	import type { EventRow } from '#lib/api/schema.ts';
@@ -12,13 +12,14 @@
 	import { rate } from '#lib/format.ts';
 	import { mergeRows } from '#lib/jobs.ts';
 	import { live } from '#lib/live.svelte.ts';
-	import { card, field } from '#lib/ui.ts';
+	import Page from '#lib/components/Page.svelte';
+	import Panel from '#lib/components/Panel.svelte';
+	import { field } from '#lib/ui.ts';
 
 	let filter = $state('');
 	let replayAt = $state<number | null>(null);
 	let pinned = $state<string | null>(null);
 	let matched = $state<[number, number]>([0, 0]);
-	let sheet = $state(false);
 	let canvasRef = $state<LiveCanvas>();
 
 	// history for the rail and the replay: the last 30 minutes, newest first
@@ -47,59 +48,38 @@
 		const ids = idsIn(ev, hosts);
 		canvasRef?.flash(ids);
 		if (ids[0]) pinned = ids[0];
-		sheet = false;
 	}
 	const node = $derived(pinned ? live.nodes[pinned] : undefined);
 	const worker = $derived(live.cluster?.workers.find((w) => w.node_id === pinned));
 	const recent = $derived(pinned ? all.filter((e) => idsIn(e, hosts).includes(pinned!)).slice(0, 6) : []);
 </script>
 
-<svelte:head><title>Live · Cluster Kit</title></svelte:head>
+<Page
+	title="Live"
+	subtitle="Every PC, the head and the work moving between them."
+	tabs={[{ id: 'canvas', label: 'Canvas' }, { id: 'events', label: 'Events' }, { id: 'timeline', label: 'Timeline' }]}
+	class="sm:grid-cols-[minmax(0,1fr)_17rem] sm:grid-rows-[minmax(0,1fr)_auto] lg:grid-cols-[minmax(0,1fr)_20rem]"
+>
+	{#snippet actions()}
+		<label class="flex items-center gap-2">
+			<span class="text-muted-foreground text-xs max-sm:sr-only">Filter <span class="max-lg:hidden">(lab=A job=12 state=lost)</span></span>
+			<input class="{field} h-9 w-full font-mono sm:w-60" bind:value={filter} placeholder="lab=A state=lost" autocomplete="off" spellcheck="false" maxlength="200" aria-label="Filter PCs" />
+		</label>
+		{#if filter.trim()}<span class="text-muted-foreground num text-xs" role="status">{matched[0]} of {matched[1]} match</span>{/if}
+	{/snippet}
 
-<div class="flex flex-wrap items-end justify-between gap-3">
-	<div>
-		<h1 class="text-xl font-semibold tracking-tight">Live</h1>
-		<p class="text-muted-foreground mt-1">Every PC, the head and the work moving between them.</p>
-	</div>
-	<label class="w-full sm:w-72">
-		<span class="mb-1 block text-xs font-medium">Filter <span class="text-muted-foreground font-normal">(lab=A job=12 state=lost)</span></span>
-		<input class="{field} font-mono" bind:value={filter} placeholder="lab=A state=lost" autocomplete="off" spellcheck="false" maxlength="200" />
-	</label>
-</div>
-{#if filter.trim()}<p class="text-muted-foreground num mt-1 text-xs" role="status">{matched[0]} of {matched[1]} PCs match; the rest are dimmed.</p>{/if}
+	<Panel title="Canvas" tab="canvas" label="Live canvas" scroll={false} pad={false} class="sm:row-start-1">
+		<div class="min-h-0 flex-1 p-1"><LiveCanvas bind:this={canvasRef} {filter} {replayAt} replayEvents={all} onpick={(id) => (pinned = id)} onmatch={(a, b) => (matched = [a, b])} /></div>
+	</Panel>
 
-<div class="mt-4 grid min-w-0 gap-3 md:grid-cols-[minmax(0,1fr)_320px]">
-	<div class="flex min-w-0 flex-col gap-3">
-		<div class="{card} h-[min(62dvh,620px)] min-h-[320px] p-1">
-			<LiveCanvas bind:this={canvasRef} {filter} {replayAt} replayEvents={all} onpick={(id) => (pinned = id)} onmatch={(a, b) => (matched = [a, b])} />
-		</div>
+	<Panel title="Timeline" tab="timeline" scroll={false} class="sm:row-start-2">
 		<TimelineScrubber events={all} bind:at={replayAt} />
-		{#if node}
-			<section class="{card} p-3" aria-label="Selected PC">
-				<div class="flex flex-wrap items-center gap-x-3 gap-y-1">
-					<h2 class="font-semibold">{node.host}</h2>
-					<NodeStateChip state={node.state} online={node.online} power={node.power} id={node.node_id} />
-					<span class="text-muted-foreground text-xs">{live.labs.find((l) => l.id === node.lab_id)?.name ?? 'no lab'}{worker?.rate ? ` · ${rate(worker.rate)}` : ''}</span>
-					<button type="button" class="text-muted-foreground hover:text-foreground ml-auto inline-flex h-9 items-center gap-1 px-1 text-xs" onclick={() => (pinned = null)}><X class="size-4" aria-hidden="true" />Close</button>
-				</div>
-				{#if recent.length}
-					<ul class="text-muted-foreground mt-2 space-y-0.5 text-xs">{#each recent as e (e.id)}<li class="truncate"><span class="num">{stamp(e.ts_ms)}</span> {railText(e)}</li>{/each}</ul>
-				{:else}<p class="text-muted-foreground mt-2 text-xs">No recent events for this PC.</p>{/if}
-				{#if replayAt == null}<div class="mt-3"><NodeActions ids={[node.node_id]} ondone={() => (pinned = null)} /></div>{/if}
-			</section>
-		{/if}
-	</div>
+	</Panel>
 
-	<!-- event rail: a column on md+, a bottom sheet on phones -->
-	<aside class="max-md:fixed max-md:inset-x-0 max-md:bottom-0 max-md:z-30 md:h-[calc(min(62dvh,620px)+7.5rem)] md:min-h-[420px]" aria-label="Events">
-		<div class="{card} flex h-full min-h-0 flex-col max-md:rounded-b-none max-md:shadow-lg">
-			<button type="button" class="flex h-11 shrink-0 items-center gap-2 px-3 text-left text-[13px] font-medium md:cursor-default" aria-expanded={sheet} onclick={() => (sheet = !sheet)}>
-				Events
-				<span class="text-muted-foreground min-w-0 flex-1 truncate font-normal md:hidden">{all[0] ? railText(all[0]) : ''}</span>
-				<ChevronUp class="ml-auto size-4 transition-transform md:hidden {sheet ? 'rotate-180' : ''}" aria-hidden="true" />
-			</button>
-			<ul class="border-line min-h-0 flex-1 overflow-y-auto border-t {sheet ? 'max-md:max-h-[55dvh]' : 'max-md:hidden'}">
-				{#each all.slice(0, 100) as e (e.id)}
+	<div class="contents sm:row-span-2 sm:col-start-2 sm:row-start-1 sm:flex sm:min-h-0 sm:flex-col sm:gap-3">
+		<Panel title="Events" tab="events" label="Event rail" class="sm:min-h-0 sm:flex-1" pad={false} count={all.length}>
+			<ul class="divide-line divide-y">
+				{#each all.slice(0, 150) as e (e.id)}
 					{@const k = railKind(e.kind)}
 					{@const Icon = icons[k.key]}
 					<li>
@@ -113,7 +93,21 @@
 					<li class="text-muted-foreground px-3 py-4 text-[13px]">Nothing has happened yet. Joins, losses, sleep and head changes appear here.</li>
 				{/each}
 			</ul>
-		</div>
-	</aside>
-</div>
-<div class="h-12 md:hidden" aria-hidden="true"></div>
+		</Panel>
+		{#if node}
+			<Panel title={node.host} tab="canvas" label="Selected PC" scroll={false} class="sm:max-h-[55%] sm:shrink-0">
+				{#snippet actions()}
+					<NodeStateChip state={node.state} online={node.online} power={node.power} id={node.node_id} />
+					<button type="button" class="text-muted-foreground hover:text-foreground inline-flex size-8 items-center justify-center" aria-label="Close" onclick={() => (pinned = null)}><X class="size-4" aria-hidden="true" /></button>
+				{/snippet}
+				<div class="thin max-h-[40dvh] min-h-0 overflow-auto">
+					<p class="text-muted-foreground text-xs">{live.labs.find((l) => l.id === node.lab_id)?.name ?? 'no lab'}{worker?.rate ? ` · ${rate(worker.rate)}` : ''}</p>
+					{#if recent.length}
+						<ul class="text-muted-foreground mt-2 space-y-0.5 text-xs">{#each recent as e (e.id)}<li class="truncate"><span class="num">{stamp(e.ts_ms)}</span> {railText(e)}</li>{/each}</ul>
+					{:else}<p class="text-muted-foreground mt-2 text-xs">No recent events for this PC.</p>{/if}
+					{#if replayAt == null}<div class="mt-3"><NodeActions ids={[node.node_id]} ondone={() => (pinned = null)} /></div>{/if}
+				</div>
+			</Panel>
+		{/if}
+	</div>
+</Page>

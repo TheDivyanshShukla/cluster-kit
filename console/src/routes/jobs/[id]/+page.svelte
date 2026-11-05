@@ -2,6 +2,8 @@
 	import { page } from '$app/state';
 	import { ArrowLeft, CircleAlert, Clock, Download, FileQuestion, Square } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
+	import Page from '#lib/components/Page.svelte';
+	import Panel from '#lib/components/Panel.svelte';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 	import Listbox from '#lib/components/Listbox.svelte';
 	import EmptyState from '#lib/components/EmptyState.svelte';
@@ -125,91 +127,85 @@
 	);
 </script>
 
-<svelte:head><title>{job ? `Job ${job.id}` : 'Job'} · Cluster Kit</title></svelte:head>
-
-<a href="/jobs" class="text-muted-foreground hover:text-foreground inline-flex items-center gap-1.5 text-[13px]"><ArrowLeft class="size-4" aria-hidden="true" />All jobs</a>
-
-{#if !job && !fetched}
-	<div class="{card} mt-4 h-56 animate-pulse" aria-busy="true"></div>
-{:else if !job}
-	<div class="mt-4">
-		{#if error && error.status !== 404}
-			<EmptyState icon={CircleAlert} title="Could not load this job" body={error.message} />
-		{:else}
-			<EmptyState icon={FileQuestion} title="No such job" body="Job {page.params.id} does not exist. It may have been mistyped.">
-				{#snippet action()}<a href="/jobs" class={btnGhost}>See all jobs</a>{/snippet}
-			</EmptyState>
-		{/if}
-	</div>
-{:else}
-	<div class="mt-3 flex flex-wrap items-start justify-between gap-3">
-		<div class="min-w-0">
-			<h1 class="text-xl font-semibold tracking-tight break-words"><span class="num text-muted-foreground">#{job.id}</span> {job.name || 'Untitled job'}</h1>
-			<p class="mt-2 flex flex-wrap items-center gap-2"><StateChip state={job.state} /><PriorityChip priority={job.priority} /></p>
-		</div>
-		{#if canCancel(roleNow(), userNow(), job)}
+<Page
+	title={job ? `#${job.id} ${job.name || 'Untitled job'}` : 'Job'}
+	tabs={[{ id: 'job', label: 'Job' }, { id: 'result', label: 'Result' }]}
+	class="sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]"
+>
+	{#snippet actions()}
+		{#if job}<StateChip state={job.state} /><PriorityChip priority={job.priority} />{/if}
+		{#if job && canCancel(roleNow(), userNow(), job)}
 			<button type="button" class={btnDanger} onclick={() => (confirmOpen = true)}><Square class="size-4" aria-hidden="true" />Cancel job</button>
 		{/if}
-	</div>
+		<a href="/jobs" class={btnGhost}><ArrowLeft class="size-4" aria-hidden="true" />All jobs</a>
+	{/snippet}
 
-	{#if cancelError}<p class="text-bad mt-3 flex items-center gap-1.5 text-[13px]" role="alert"><CircleAlert class="size-4 shrink-0" aria-hidden="true" />{cancelError}</p>{/if}
-	{#if job.state === 'failed'}
-		<p class="border-bad text-bad mt-4 flex items-start gap-2 rounded-lg border px-3 py-2.5" role="alert">
-			<CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" /><span class="break-words">Failed: {job.error ?? 'no reason was recorded.'}</span>
-		</p>
-	{/if}
+	{#if !job && !fetched}
+		<Panel title="Job" tab="job" class="sm:col-span-2"><div class="bg-raised h-40 animate-pulse rounded-lg" aria-busy="true"></div></Panel>
+	{:else if !job}
+		<Panel title="Job" tab="job" class="sm:col-span-2">
+			{#if error && error.status !== 404}
+				<EmptyState icon={CircleAlert} title="Could not load this job" body={error.message} />
+			{:else}
+				<EmptyState icon={FileQuestion} title="No such job" body="Job {page.params.id} does not exist. It may have been mistyped.">
+					{#snippet action()}<a href="/jobs" class={btnGhost}>See all jobs</a>{/snippet}
+				</EmptyState>
+			{/if}
+		</Panel>
+	{:else}
+		<Panel title="Progress and facts" tab="job">
+			{#if cancelError}<p class="text-bad mb-3 flex items-center gap-1.5 text-[13px]" role="alert"><CircleAlert class="size-4 shrink-0" aria-hidden="true" />{cancelError}</p>{/if}
+			{#if job.state === 'failed'}
+				<p class="border-bad text-bad mb-3 flex items-start gap-2 rounded-lg border px-3 py-2.5" role="alert">
+					<CircleAlert class="mt-0.5 size-4 shrink-0" aria-hidden="true" /><span class="break-words">Failed: {job.error ?? 'no reason was recorded.'}</span>
+				</p>
+			{/if}
+			<ProgressBar value={progress(job)} label="Job progress" tone={job.state === 'failed' ? 'bg-bad' : job.state === 'done' ? 'bg-ok' : 'bg-primary'} />
+			<p class="num text-muted-foreground mt-2 text-xs" aria-live="polite">
+				{count(job.done)} of {count(job.total)} numbers · {Math.round(progress(job) * 100)}%{job.state === 'queued' ? ' · waiting for its turn' : ''}
+			</p>
+			{#if etaWords}<p class="mt-1 flex items-center gap-1.5 text-[13px] font-medium" aria-live="polite"><Clock class="text-muted-foreground size-4" aria-hidden="true" />{etaWords[0].toUpperCase() + etaWords.slice(1)}</p>{/if}
+			<dl class="border-line mt-4 grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-[var(--line)]">
+				{#each facts as [k, v] (k)}
+					<div class="bg-surface px-3 py-2">
+						<dt class="text-muted-foreground text-xs">{k}</dt>
+						<dd class="num mt-0.5 text-[13px] break-words">{v}</dd>
+					</div>
+				{/each}
+			</dl>
+		</Panel>
 
-	<section class="{card} mt-4 px-4 py-4" aria-label="Progress">
-		<ProgressBar value={progress(job)} label="Job progress" tone={job.state === 'failed' ? 'bg-bad' : job.state === 'done' ? 'bg-ok' : 'bg-primary'} />
-		<p class="num text-muted-foreground mt-2 text-xs" aria-live="polite">
-			{count(job.done)} of {count(job.total)} numbers · {Math.round(progress(job) * 100)}%{job.state === 'queued' ? ' · waiting for its turn' : ''}
-		</p>
-		{#if etaWords}<p class="mt-1 flex items-center gap-1.5 text-[13px] font-medium" aria-live="polite"><Clock class="text-muted-foreground size-4" aria-hidden="true" />{etaWords[0].toUpperCase() + etaWords.slice(1)}</p>{/if}
-	</section>
-
-	<dl class="{card} mt-4 grid grid-cols-2 gap-px overflow-hidden sm:grid-cols-3 lg:grid-cols-4">
-		{#each facts as [k, v] (k)}
-			<div class="bg-surface px-4 py-3">
-				<dt class="text-muted-foreground text-xs">{k}</dt>
-				<dd class="num mt-0.5 break-words">{v}</dd>
-			</div>
-		{/each}
-	</dl>
-
-	<section class="mt-6" aria-label="Result">
-		<div class="mb-2 flex flex-wrap items-center justify-between gap-2">
-			<h2 class="font-medium">Result</h2>
+		<Panel title="Result" tab="result">
+			{#snippet actions()}
+				{#if blobUrl}<a href={blobUrl} download="job-{job.id}-result.txt" class="{btnGhost} h-7 px-2 text-xs"><Download class="size-3.5" aria-hidden="true" />Download</a>{/if}
+			{/snippet}
 			{#if job.state === 'done'}
-				<div class="flex items-end gap-2">
+				<div class="mb-3 flex items-end gap-2">
 					<div class="w-52"><Listbox label="Show result as" id="view-reducer" options={REDUCER_OPTIONS} bind:value={redId} /></div>
 					{#if redId === 'top'}<label class="block w-20"><span class="mb-1 block text-xs font-medium">N</span><input class={field} type="number" min="1" step="1" inputmode="numeric" bind:value={redN} aria-invalid={!!reducer.error} /></label>{/if}
 				</div>
-			{/if}
-			{#if blobUrl}
-				<a href={blobUrl} download="job-{job.id}-result.txt" class={btnGhost}><Download class="size-4" aria-hidden="true" />Download</a>
-			{/if}
-		</div>
-		{#if job.state === 'done'}
-			{#if reducer.error}
-				<p class="text-bad text-[13px]" role="alert">{reducer.error}</p>
-			{:else if resultError}
-				<EmptyState icon={CircleAlert} title="Could not read the result" body={resultError} />
-			{:else if result === null}
-				<div class="{card} h-24 animate-pulse" aria-busy="true"></div>
-			{:else if result.trim() === ''}
-				<p class="text-muted-foreground {card} px-4 py-6 text-center">The job finished with an empty result: nothing matched.</p>
+				{#if reducer.error}
+					<p class="text-bad text-[13px]" role="alert">{reducer.error}</p>
+				{:else if resultError}
+					<EmptyState icon={CircleAlert} title="Could not read the result" body={resultError} />
+				{:else if result === null}
+					<div class="bg-raised h-24 animate-pulse rounded-lg" aria-busy="true"></div>
+				{:else if result.trim() === ''}
+					<p class="text-muted-foreground px-4 py-6 text-center">The job finished with an empty result: nothing matched.</p>
+				{:else}
+					<pre class="font-mono text-xs break-all whitespace-pre-wrap" aria-label="Job result">{result.slice(0, SHOW)}</pre>
+					{#if result.length > SHOW}<p class="text-muted-foreground mt-2 text-xs">Showing the first {count(SHOW)} characters. Download for all {count(result.length)}.</p>{/if}
+				{/if}
 			{:else}
-				<!-- svelte-ignore a11y_no_noninteractive_tabindex (a scrollable box must be focusable) -->
-				<pre class="{card} max-h-96 overflow-auto p-3 font-mono text-xs break-all whitespace-pre-wrap" tabindex="0" aria-label="Job result">{result.slice(0, SHOW)}</pre>
-				{#if result.length > SHOW}<p class="text-muted-foreground mt-2 text-xs">Showing the first {count(SHOW)} characters. Download for all {count(result.length)}.</p>{/if}
+				<p class="text-muted-foreground px-4 py-6 text-center">
+					{job.state === 'queued' || job.state === 'running' ? 'The result appears here when the job is done.' : `No result: the job was ${job.state}.`}
+				</p>
 			{/if}
-		{:else}
-			<p class="text-muted-foreground {card} border-dashed px-4 py-6 text-center">
-				{job.state === 'queued' || job.state === 'running' ? 'The result appears here when the job is done.' : `No result: the job was ${job.state}.`}
-			</p>
-		{/if}
-	</section>
+		</Panel>
+	{/if}
+</Page>
 
+{#if job}
 	<ConfirmDialog
 		bind:open={confirmOpen}
 		title="Cancel job {job.id}?"

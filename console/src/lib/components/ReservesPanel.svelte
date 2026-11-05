@@ -55,7 +55,7 @@
 </script>
 
 <section aria-label="Reserves">
-	<h2 class="font-medium">Reserves</h2>
+	<h2 class="sr-only">Reserves</h2>
 	<p class="text-muted-foreground mt-0.5 text-[13px]">Keep PCs free of jobs. Example: keep 10 PCs in Lab A free for students. The head picks which PCs to hold and keeps that choice stable.</p>
 	{#if error}<p class="text-bad mt-2 text-[13px]" role="alert">{error}</p>{/if}
 	<div class="{card} mt-3">

@@ -11,7 +11,7 @@
 
 	// Overview shows the numbers and the standby list; Settings (`full`) adds the standby settings and the failover notes.
 	// The Make head flow lives in HeadTopology, which sits above this card on Settings.
-	let { full = false }: { full?: boolean } = $props();
+	let { full = false, bare = false }: { full?: boolean; bare?: boolean } = $props();
 	const h = $derived(live.ha);
 	const meta = {
 		primary: { icon: Crown, cls: 'text-ok bg-ok/10' },
@@ -48,7 +48,7 @@
 	const hostOf = (id: string) => live.nodes[id]?.host ?? id;
 </script>
 
-<section class="{card} px-4 py-4" aria-label="High availability">
+<section class={bare ? '' : `${card} px-4 py-4`} aria-label="High availability">
 	<div class="flex flex-wrap items-center justify-between gap-2">
 		<h2 class="font-medium">Head and standby</h2>
 		{#if h}

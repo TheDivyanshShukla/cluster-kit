@@ -1,17 +1,22 @@
 <script lang="ts">
-	import { CircleAlert, Lock, RotateCcw, Search, SlidersHorizontal } from '@lucide/svelte';
+	import { CircleAlert, Lock, RotateCcw, SlidersHorizontal } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import type { Tunable } from '#lib/api/schema.ts';
 	import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
 	import EmptyState from '#lib/components/EmptyState.svelte';
+	import Hl from '#lib/components/Hl.svelte';
+	import ListToolbar from '#lib/components/ListToolbar.svelte';
+	import Panel from '#lib/components/Panel.svelte';
+	import { Listing } from '#lib/listing.svelte.ts';
+	import type { Spec } from '#lib/listing.ts';
 	import { atLeast } from '#lib/jobs.ts';
 	import { roleNow } from '#lib/session.svelte.ts';
-	import { groupTunables, invalidKeys, isChanged, patchOf, pending, problem, rangeHint, readOnly, riskyOf, fmtNum } from '#lib/tunables.ts';
-	import { btnGhost, btnPrimary, card, field } from '#lib/ui.ts';
+	import { invalidKeys, isChanged, patchOf, pending, problem, rangeHint, readOnly, riskyOf, fmtNum } from '#lib/tunables.ts';
+	import { btnGhost, btnPrimary, field } from '#lib/ui.ts';
 
 	let list = $state<Tunable[] | null>(null);
 	let failed = $state('');
-	let q = $state('');
+	let { tab = 'settings' }: { tab?: string } = $props();
 	let draft = $state<Record<string, string>>({});
 	let busy = $state(false);
 	let note = $state('');
@@ -23,7 +28,24 @@
 	}
 	$effect(load);
 
-	const groups = $derived(groupTunables(list ?? [], q));
+	const spec: Spec<Tunable> = {
+		facets: [
+			{ key: 'group', label: 'Group', get: (t) => t.group },
+			{ key: 'source', label: 'Source', get: (t) => t.source, order: ['default', 'db', 'env'], text: (v) => (v === 'db' ? 'changed here' : v === 'env' ? 'environment' : v) },
+			{ key: 'changed', label: 'Changed', get: (t) => (isChanged(t) ? 'yes' : 'no'), single: true, text: (v) => (v === 'yes' ? 'Changed only' : 'Default only') }
+		],
+		text: (t) => [t.key, t.key.replaceAll('_', ' '), t.help, t.group, t.unit],
+		sorters: { key: (t) => t.key, changed: (t) => (isChanged(t) ? 0 : 1), group: (t) => t.group },
+		base: () => 0 // the registry order groups related settings
+	};
+	const l = new Listing<Tunable>(spec, 't.');
+	const res = $derived(l.run(list ?? []));
+	// grouped in registry order unless a sort is chosen
+	const groups = $derived(
+		l.state.sort
+			? [{ group: '', items: res.rows }]
+			: res.rows.reduce<{ group: string; items: Tunable[] }[]>((a, t) => ((a.find((g) => g.group === t.group) ?? a[a.push({ group: t.group, items: [] }) - 1]!).items.push(t), a), [])
+	);
 	const todo = $derived(pending(list ?? [], draft));
 	const bad = $derived(invalidKeys(list ?? [], draft));
 	const risky = $derived(riskyOf(todo));
@@ -51,25 +73,22 @@
 	}
 </script>
 
-<section class="{card} px-4 py-4" aria-label="All settings">
-	<div class="flex flex-wrap items-center justify-between gap-2">
-		<h2 class="flex items-center gap-2 font-medium"><SlidersHorizontal class="text-muted-foreground size-4" aria-hidden="true" />All settings</h2>
-		<label class="relative block w-full sm:w-64">
-			<span class="sr-only">Search settings</span>
-			<Search class="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2" aria-hidden="true" />
-			<input type="search" bind:value={q} placeholder="Search, e.g. lost, standby, MB" class="{field} pl-9" />
-		</label>
-	</div>
-	<p class="text-muted-foreground mt-1 text-[13px]">Every number the head and the PCs use. {canEdit ? 'Change what you need and press Save; the rest keeps its default.' : 'Changing these needs the admin role.'}</p>
+<Panel title="All settings" {tab} count={list?.length} label="All settings">
+	{#snippet toolbar()}
+		<ListToolbar {l} rows={list ?? []} shown={res.rows.length} total={list?.length ?? 0} placeholder="Search, e.g. lost, standby, MB" sorts={[{ key: 'key', label: 'Name' }, { key: 'changed', label: 'Changed first' }]} />
+	{/snippet}
+	<p class="text-muted-foreground text-[13px]">Every number the head and the PCs use. {canEdit ? 'Change what you need and press Save; the rest keeps its default.' : 'Changing these needs the admin role.'}</p>
 	{#if list === null && !failed}
 		<div class="bg-raised mt-3 h-48 animate-pulse rounded-lg" aria-busy="true"></div>
 	{:else if failed && list === null}
-		<div class="mt-3"><EmptyState icon={CircleAlert} title="Could not load the settings" body="{failed} Power and standby settings above still work." /></div>
-	{:else if groups.length === 0}
-		<p class="text-muted-foreground mt-4 text-[13px]">No setting matches "{q}". Try a shorter word.</p>
+		<div class="mt-3"><EmptyState icon={CircleAlert} title="Could not load the settings" body="{failed} Power and standby settings still work." /></div>
+	{:else if res.rows.length === 0}
+		<div class="mt-3"><EmptyState icon={SlidersHorizontal} title="No setting matches these filters" body="Try a shorter word or clear the chips.">
+			{#snippet action()}<button type="button" class="text-primary text-[13px] font-medium hover:underline" onclick={() => l.clear()}>Clear filters</button>{/snippet}
+		</EmptyState></div>
 	{:else}
 		{#each groups as g (g.group)}
-			<h3 class="mt-5 text-[13px] font-semibold">{g.group}</h3>
+			{#if g.group}<h3 class="mt-5 text-[13px] font-semibold first:mt-3">{g.group}</h3>{/if}
 			<ul class="divide-line mt-1 divide-y">
 				{#each g.items as t (t.key)}
 					{@const ro = readOnly(t) || !canEdit}
@@ -77,7 +96,7 @@
 					<li class="grid gap-x-4 gap-y-1.5 py-3 md:grid-cols-[minmax(0,1fr)_16rem]">
 						<div class="min-w-0">
 							<p class="flex flex-wrap items-center gap-x-2 gap-y-1">
-								<code class="font-mono text-xs font-medium">{t.key}</code>
+								<code class="font-mono text-xs font-medium"><Hl text={t.key} q={l.state.q} /></code>
 								{#if isChanged(t)}<span class="bg-warn/10 text-warn rounded-full px-2 py-0.5 text-xs font-medium">Changed</span>{/if}
 								<span class="text-muted-foreground text-xs">{t.scope === 'head' ? 'head' : t.scope === 'agent' ? 'PCs' : 'head and PCs'}</span>
 							</p>
@@ -97,21 +116,22 @@
 			</ul>
 		{/each}
 	{/if}
-	{#if note}<p class="mt-3 text-[13px]" role="status">{note}</p>{/if}
-</section>
-
-{#if canEdit && (todo.length || bad.length)}
-	<div class="bg-surface border-line sticky bottom-3 z-10 mt-3 flex flex-wrap items-center justify-between gap-3 rounded-lg border px-4 py-3 shadow-lg" role="region" aria-label="Unsaved changes">
-		<p class="num text-[13px]">
-			{#if bad.length}<span class="text-bad">{bad.length} value{bad.length === 1 ? '' : 's'} out of range.</span>{/if}
-			{todo.length} change{todo.length === 1 ? '' : 's'} not saved{#if risky.length}<span class="text-warn"> · touches {risky.join(', ')}</span>{/if}
-		</p>
-		<span class="flex gap-2">
-			<button type="button" class={btnGhost} onclick={() => (draft = {})} disabled={busy}>Discard</button>
-			<button type="button" class={btnPrimary} onclick={save} disabled={busy || !todo.length || bad.length > 0}>{busy ? 'Saving…' : `Save ${todo.length} change${todo.length === 1 ? '' : 's'}`}</button>
-		</span>
-	</div>
-{/if}
+	{#snippet footer()}
+		{#if canEdit && (todo.length || bad.length)}
+			<div class="flex flex-wrap items-center justify-between gap-3" role="region" aria-label="Unsaved changes">
+				<p class="num text-[13px]">
+					{#if bad.length}<span class="text-bad">{bad.length} value{bad.length === 1 ? '' : 's'} out of range.</span>{/if}
+					{todo.length} change{todo.length === 1 ? '' : 's'} not saved{#if risky.length}<span class="text-warn"> · touches {risky.join(', ')}</span>{/if}
+				</p>
+				<span class="flex gap-2">
+					<button type="button" class={btnGhost} onclick={() => (draft = {})} disabled={busy}>Discard</button>
+					<button type="button" class={btnPrimary} onclick={save} disabled={busy || !todo.length || bad.length > 0}>{busy ? 'Saving…' : `Save ${todo.length} change${todo.length === 1 ? '' : 's'}`}</button>
+				</span>
+			</div>
+		{:else if note}<p class="text-[13px]" role="status">{note}</p>{/if}
+	{/snippet}
+	{#if note && (todo.length || bad.length)}<p class="mt-3 text-[13px]" role="status">{note}</p>{/if}
+</Panel>
 
 <ConfirmDialog
 	bind:open={ask}

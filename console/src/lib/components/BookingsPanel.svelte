@@ -49,7 +49,7 @@
 </script>
 
 <section aria-label="Bookings">
-	<h2 class="font-medium">Bookings</h2>
+	<h2 class="sr-only">Bookings</h2>
 	<p class="text-muted-foreground mt-0.5 text-[13px]">One-off times when matching PCs are kept free of jobs, such as an exam. Times are your local time.</p>
 	{#if error}<p class="text-bad mt-2 text-[13px]" role="alert">{error}</p>{/if}
 	<div class="{card} mt-3">

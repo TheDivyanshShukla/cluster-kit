@@ -2,6 +2,8 @@
 	import { LayoutGrid, Moon, Pencil, Sunrise, Wand2, MapPinOff, Settings2, Map as MapIcon } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import EmptyState from '#lib/components/EmptyState.svelte';
+	import Page from '#lib/components/Page.svelte';
+	import Panel from '#lib/components/Panel.svelte';
 	import FloorMap from '#lib/components/FloorMap.svelte';
 	import LabsEditor from '#lib/components/LabsEditor.svelte';
 	import NodeActions from '#lib/components/NodeActions.svelte';
@@ -149,12 +151,13 @@
 <svelte:head><title>Floor map · Cluster Kit</title></svelte:head>
 <svelte:window onpointermove={move} onpointerup={up} />
 
-<div class="flex flex-wrap items-end justify-between gap-3">
-	<div>
-		<h1 class="text-xl font-semibold tracking-tight">Floor map</h1>
-		<p class="text-muted-foreground mt-1">Each tile is a PC, drawn where it sits in the room.</p>
-	</div>
-	<div class="flex flex-wrap items-center gap-2">
+<Page
+	title="Floor map"
+	subtitle="Each tile is a PC, drawn where it sits in the room."
+	tabs={[{ id: 'map', label: 'Map' }, { id: 'unplaced', label: 'Unplaced', badge: unplaced.length }]}
+	class="sm:grid-cols-[minmax(0,1fr)_15rem] lg:grid-cols-[minmax(0,1fr)_16rem]"
+>
+	{#snippet actions()}
 		<Segmented legend="Colour tiles by" bind:value={overlay} options={[{ value: 'state', label: 'State' }, { value: 'cpu', label: 'CPU' }, { value: 'work', label: 'Working' }, { value: 'avail', label: 'Availability' }]} />
 		<Segmented legend="View" bind:value={view} options={[{ value: 'map', label: 'Map' }, { value: 'table', label: 'Table' }]} />
 		{#if canEdit}
@@ -162,10 +165,11 @@
 				<Pencil class="size-4" aria-hidden="true" />{edit ? 'Done editing' : 'Edit map'}
 			</button>
 		{/if}
-	</div>
-</div>
+	{/snippet}
 
-<p class="text-muted-foreground mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs" aria-label="Legend">
+	<Panel title="Map" tab="map" label="Floor map" count={live.labs.length ? `${live.labs.length} lab${live.labs.length === 1 ? '' : 's'}` : undefined}>
+		<div class="space-y-3">
+			<p class="text-muted-foreground flex flex-wrap gap-x-4 gap-y-1 text-xs" aria-label="Legend">
 	{#if overlay === 'state'}
 		{#each Object.entries(STATE_LOOK) as [s, v] (s)}<span><span class="text-foreground font-mono text-sm">{v.glyph}</span> {s}</span>{/each}
 	{:else if overlay === 'cpu'}
@@ -179,18 +183,13 @@
 	<span class="inline-flex items-center gap-1"><Moon class="text-foreground size-3.5" aria-hidden="true" />asleep (dashed, faint)</span>
 	<span class="inline-flex items-center gap-1"><Sunrise class="text-warn size-3.5" aria-hidden="true" />waking (warn outline)</span>
 </p>
-{#if Object.keys(live.nodes).length}<p class="num mt-2 text-[13px] font-medium" aria-label="PCs by power state">{fleetWords(counts)}</p>{/if}
-
-{#if selected.length}
-	<div class="mt-4"><NodeActions ids={selected} ondone={() => (selected = [])} /></div>
-{/if}
-{#if err}<p class="text-bad mt-3 text-[13px]" role="alert">{err}</p>{/if}
-
-<div class="mt-5">
-	{#if !live.cluster && !Object.keys(live.nodes).length}
-		<div class="bg-surface border-line h-64 animate-pulse rounded-lg border" aria-busy="true"></div>
-	{:else if view === 'table'}
-		<div class="bg-surface border-line relative overflow-x-auto rounded-lg border">
+			{#if Object.keys(live.nodes).length}<p class="num text-[13px] font-medium" aria-label="PCs by power state">{fleetWords(counts)}</p>{/if}
+			{#if selected.length}<NodeActions ids={selected} ondone={() => (selected = [])} />{/if}
+			{#if err}<p class="text-bad text-[13px]" role="alert">{err}</p>{/if}
+			{#if !live.cluster && !Object.keys(live.nodes).length}
+				<div class="bg-raised h-64 animate-pulse rounded-lg" aria-busy="true"></div>
+			{:else if view === 'table'}
+				<div class="border-line relative overflow-x-auto rounded-lg border">
 			<table class="w-full text-left text-[13px]">
 				<caption class="sr-only">Every PC with its lab seat, state, CPU and activity</caption>
 				<thead class="text-muted-foreground border-line border-b text-xs">
@@ -209,13 +208,12 @@
 				</tbody>
 			</table>
 		</div>
-	{:else if live.labs.length === 0}
-		<EmptyState icon={MapIcon} title="No lab yet" body={canEdit ? 'Create a lab with its width and height, then place your PCs on it.' : 'An operator creates labs and places PCs on them.'}>
-			{#snippet action()}{#if canEdit}<button type="button" class={btnPrimary} onclick={() => (edit = true)}>Create a lab</button>{/if}{/snippet}
-		</EmptyState>
-	{:else}
-		<div class="grid items-start gap-5 lg:grid-cols-[1fr_16rem]">
-			<div class="grid gap-5 xl:grid-cols-2">
+			{:else if live.labs.length === 0}
+				<EmptyState icon={MapIcon} title="No lab yet" body={canEdit ? 'Create a lab with its width and height, then place your PCs on it.' : 'An operator creates labs and places PCs on them.'}>
+					{#snippet action()}{#if canEdit}<button type="button" class={btnPrimary} onclick={() => (edit = true)}>Create a lab</button>{/if}{/snippet}
+				</EmptyState>
+			{:else}
+				<div class="grid gap-5 xl:grid-cols-2">
 				{#each live.labs as lab (lab.id)}
 					<section class="bg-surface border-line min-w-0 rounded-lg border p-3" aria-label={lab.name}>
 						<h2 class="mb-2 flex items-baseline justify-between text-[13px] font-semibold">
@@ -236,7 +234,21 @@
 					</section>
 				{/each}
 			</div>
-			<aside class="bg-surface border-line rounded-lg border p-3" data-unplace aria-label="Unplaced PCs">
+			{/if}
+			{#if editing}
+	<details class="bg-surface border-line mt-5 rounded-lg border p-3">
+		<summary class="flex cursor-pointer items-center gap-2 text-[13px] font-semibold"><Settings2 class="size-4" aria-hidden="true" />Labs</summary>
+		<div class="mt-3"><LabsEditor /></div>
+	</details>
+{/if}
+
+
+		</div>
+	</Panel>
+
+	<Panel title="Unplaced" tab="unplaced" count={unplaced.length} label="Unplaced PCs">
+		<div data-unplace>
+
 				<h2 class="text-[13px] font-semibold">Unplaced <span class="text-muted-foreground num font-normal">({unplaced.length})</span></h2>
 				{#if unplaced.length === 0}
 					<p class="text-muted-foreground mt-2 text-xs">Every PC has a seat.</p>
@@ -288,17 +300,10 @@
 						<button type="submit" class={btnGhost} disabled={!at.id}><LayoutGrid class="size-4" aria-hidden="true" />Place</button>
 					</form>
 				{/if}
-			</aside>
+			
 		</div>
-	{/if}
-</div>
-
-{#if editing}
-	<details class="bg-surface border-line mt-5 rounded-lg border p-3">
-		<summary class="flex cursor-pointer items-center gap-2 text-[13px] font-semibold"><Settings2 class="size-4" aria-hidden="true" />Labs</summary>
-		<div class="mt-3"><LabsEditor /></div>
-	</details>
-{/if}
+	</Panel>
+</Page>
 
 {#if drag}
 	<div class="bg-primary text-primary-foreground pointer-events-none fixed z-50 rounded-lg px-2.5 py-1 text-xs font-medium shadow-lg" style="left:{drag.x + 12}px;top:{drag.y + 12}px">

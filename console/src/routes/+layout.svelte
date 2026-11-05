@@ -62,20 +62,20 @@
 />
 
 {#if session.loading}
-	<div class="flex min-h-dvh items-center justify-center" aria-busy="true"><div class="bg-raised h-2 w-32 animate-pulse rounded-full"></div></div>
+	<div class="flex h-dvh items-center justify-center" aria-busy="true"><div class="bg-raised h-2 w-32 animate-pulse rounded-full"></div></div>
 {:else if session.error && !session.me}
-	<div class="mx-auto max-w-md px-4 py-16">
+	<div class="h-dvh overflow-auto"><div class="mx-auto max-w-md px-4 py-16">
 		<EmptyState icon={CircleAlert} title="The head is not answering" body={session.error}>
 			{#snippet action()}<button type="button" class={btnGhost} onclick={() => void loadMe()}>Try again</button>{/snippet}
 		</EmptyState>
-	</div>
+	</div></div>
 {:else if !authed()}
-	<AuthForm bootstrap={session.me?.needs_bootstrap ?? false} />
+	<div class="h-dvh overflow-auto"><AuthForm bootstrap={session.me?.needs_bootstrap ?? false} /></div>
 {:else if page.url.pathname === '/wall'}
 	{@render children()}
 {:else}
-	<div class="flex min-h-dvh flex-col md:flex-row">
-		<aside class="border-line bg-surface flex shrink-0 items-center gap-1 border-b px-3 py-2 md:sticky md:top-0 md:h-dvh md:w-52 md:flex-col md:items-stretch md:border-r md:border-b-0 md:px-3 md:py-4">
+	<div class="flex h-dvh flex-col overflow-hidden md:flex-row">
+		<aside class="border-line bg-surface flex shrink-0 items-center gap-1 border-b px-3 py-1.5 md:h-dvh md:w-52 md:flex-col md:items-stretch md:border-r md:border-b-0 md:px-3 md:py-4">
 			<a href="/" class="mr-2 flex items-center gap-2 px-2 font-semibold tracking-tight md:mr-0 md:mb-5" aria-label="Cluster Kit home">
 				<span class="bg-primary size-2.5 shrink-0 rounded-sm" aria-hidden="true"></span><span class="hidden md:inline">Cluster Kit</span>
 			</a>
@@ -131,10 +131,10 @@
 				</details>
 			</div>
 		</aside>
-		<main class="min-w-0 flex-1 px-4 py-5 md:px-8 md:py-7">
-			{#if isStandby()}<HaBanners />{/if}
+		<main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden p-3 md:p-4">
+			{#if isStandby()}<div class="mb-3 shrink-0"><HaBanners /></div>{/if}
 			{#if live.link === 'reconnecting' && !isStandby()}
-				<p class="bg-raised border-line text-warn mb-4 flex items-center gap-2 rounded-lg border px-3 py-2 text-[13px]" role="status">
+				<p class="bg-raised border-line text-warn mb-3 flex shrink-0 items-center gap-2 rounded-lg border px-3 py-2 text-[13px]" role="status">
 					<WifiOff class="size-4 shrink-0" aria-hidden="true" />Lost the live link to the head. Reconnecting; numbers may be a few seconds old.
 				</p>
 			{/if}
@@ -142,3 +142,25 @@
 		</main>
 	</div>
 {/if}
+
+<!-- the page never scrolls: panels do (docs/DESIGN.md section 8) -->
+<style>
+	:global(html),
+	:global(body) {
+		height: 100dvh;
+		overflow: hidden;
+		overscroll-behavior: none;
+	}
+	:global(.thin) {
+		scrollbar-width: thin;
+		scrollbar-color: var(--line) transparent;
+	}
+	:global(.thin::-webkit-scrollbar) {
+		width: 8px;
+		height: 8px;
+	}
+	:global(.thin::-webkit-scrollbar-thumb) {
+		background: var(--line);
+		border-radius: 8px;
+	}
+</style>

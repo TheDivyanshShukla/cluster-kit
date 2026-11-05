@@ -60,7 +60,7 @@
 </script>
 
 <section aria-label="Timetable">
-	<h2 class="font-medium">Timetable</h2>
+	<h2 class="sr-only">Timetable</h2>
 	<p class="text-muted-foreground mt-0.5 text-[13px]">Weekly windows when matching PCs take no jobs, or fewer threads. Times are the head's local time (India by default). A window that ends before it starts runs overnight.</p>
 	{#if error}<p class="text-bad mt-2 text-[13px]" role="alert">{error}</p>{/if}
 

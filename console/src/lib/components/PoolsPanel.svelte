@@ -60,7 +60,7 @@
 </script>
 
 <section aria-label="Pools">
-	<h2 class="font-medium">Pools</h2>
+	<h2 class="sr-only">Pools</h2>
 	<p class="text-muted-foreground mt-0.5 text-[13px]">A named group of PCs you pick by hand. Use it in selectors as <code class="font-mono text-xs">pool=night</code>.</p>
 	{#if error}<p class="text-bad mt-2 text-[13px]" role="alert">{error}</p>{/if}
 	<div class="mt-3 space-y-3">

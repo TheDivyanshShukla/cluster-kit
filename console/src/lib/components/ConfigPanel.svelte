@@ -54,7 +54,7 @@
 </script>
 
 <section aria-label="Setup export and import">
-	<h2 class="font-medium">Setup backup</h2>
+	<h2 class="sr-only">Setup backup</h2>
 	<p class="text-muted-foreground mt-0.5 text-[13px]">Export labs, seats, labels, pools, caps and reserves as one JSON file. Importing shows what would change before anything is applied.</p>
 	<div class="{card} mt-3 flex flex-wrap items-center gap-2 p-4">
 		<button type="button" class={btnGhost} onclick={() => void download()}><Download class="size-4" aria-hidden="true" />Download JSON</button>

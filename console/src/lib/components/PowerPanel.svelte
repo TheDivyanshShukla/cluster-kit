@@ -9,6 +9,7 @@
 	import { powerCounts } from '#lib/topology.ts';
 	import { btnPrimary, card, field } from '#lib/ui.ts';
 
+	let { bare = false }: { bare?: boolean } = $props();
 	let mode = $state<'off' | 'eco'>('off');
 	let idle = $state(15);
 	let keep = $state(4);
@@ -41,14 +42,14 @@
 	}
 </script>
 
-<section class="{card} px-4 py-4" aria-label="Power">
-	<div class="flex flex-wrap items-center justify-between gap-2">
+<section class={bare ? '' : `${card} px-4 py-4`} aria-label="Power">
+	{#if !bare}<div class="flex flex-wrap items-center justify-between gap-2">
 		<h2 class="flex items-center gap-2 font-medium"><Power class="text-muted-foreground size-4" aria-hidden="true" />Power</h2>
-	</div>
+	</div>{/if}
 	{#if !loaded}
-		<div class="bg-raised mt-3 h-40 animate-pulse rounded-lg" aria-busy="true"></div>
+		<div class="bg-raised h-40 animate-pulse rounded-lg" aria-busy="true"></div>
 	{:else}
-		<form class="mt-3 space-y-3" onsubmit={(e) => { e.preventDefault(); void save(); }}>
+		<form class="space-y-3" onsubmit={(e) => { e.preventDefault(); void save(); }}>
 			<fieldset disabled={!canEdit} class="m-0 space-y-3 border-0 p-0">
 				<Segmented legend="Power mode" bind:value={mode} options={[{ value: 'off', label: 'Off' }, { value: 'eco', label: 'Eco' }]} />
 				<p class="text-muted-foreground text-[13px]">{why[mode]}</p>

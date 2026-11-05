@@ -1,0 +1,1 @@
+import{at as e}from"./Ntd9Rets.js";var t=e({w:typeof innerWidth==`number`?innerWidth:1280});typeof window<`u`&&addEventListener(`resize`,()=>t.w=innerWidth,{passive:!0});var n=()=>t.w<640;export{t as n,n as t};

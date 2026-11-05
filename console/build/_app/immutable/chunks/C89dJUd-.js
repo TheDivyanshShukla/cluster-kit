@@ -1,1 +1,0 @@
-import{n as e,r as t}from"./Km1-svlq.js";import{H as n}from"./61eA0LCV.js";var r={name:`list-checks`,size:24,node:[[`path`,{d:`M13 5h8`}],[`path`,{d:`M13 12h8`}],[`path`,{d:`M13 19h8`}],[`path`,{d:`m3 17 2 2 4-4`}],[`path`,{d:`m3 7 2 2 4-4`}]]};r.node;var i=new Set([`$$slots`,`$$events`,`$$legacy`]);function a(a,o){let s=e(o,i);n(a,t(()=>s,{get icon(){return r}}))}export{a as t};

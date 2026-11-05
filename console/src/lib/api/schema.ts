@@ -280,3 +280,46 @@ export const JobHints = z.object({
 	placement: z.union([Placement, z.literal('')]).catch(''),
 	mem_mb: z.number().int().default(0)
 });
+
+/** Wave 12 research features (docs/API.md "Research features") */
+export const Breakdown = z.object({
+	job: z.number().int(),
+	wall_s: z.number(),
+	pc_seconds: z.object({ compute: z.number(), dispatch_wait: z.number(), tail_idle: z.number(), recompute: z.number(), failover_pause: z.number(), other: z.number() }),
+	per_pc: z.array(z.object({ node_id: z.string(), host: z.string().default(''), chunks: z.number(), numbers: z.number(), rate: z.number(), busy_s: z.number() })),
+	chunk_s: z.object({ p50: z.number(), p90: z.number(), max: z.number() }),
+	stragglers: z.array(z.string()).default([]),
+	efficiency: z.number()
+});
+export const BreakdownReply = z.object({ breakdown: Breakdown });
+export const Alert = z.object({
+	id: z.number().int(),
+	kind: z.enum(['slow_pc', 'flaky_pc', 'head_hot', 'standby_behind', 'reserve_at_risk', 'no_standby']).catch('slow_pc'),
+	severity: z.enum(['info', 'warn', 'bad']).catch('warn'),
+	node_id: z.string().nullable().default(null),
+	detail: z.string(),
+	since_ms: z.number(),
+	last_ms: z.number(),
+	active: z.boolean(),
+	acked_by: z.string().nullable().default(null)
+});
+export const AlertList = z.object({ alerts: z.array(Alert) });
+export const ExperimentRow = z.object({
+	id: z.number().int(), name: z.string(), submitter: z.string(), created_ms: z.number(), configs: z.number().int(),
+	repeats: z.number().int(), virtual: z.boolean(), commit: z.string().default(''), pcs_max: z.number().int()
+});
+export const ExperimentList = z.object({ experiments: z.array(ExperimentRow) });
+export const ExperimentOne = z.object({ experiment: ExperimentRow, raw_csv: z.string(), runs_jsonl: z.string(), sim: z.unknown().nullable().default(null) });
+export const DayReport = z.object({
+	day: z.string(), throughput_peak: z.number(), throughput_mean: z.number(),
+	work_done: z.object({ numbers: z.number(), items: z.number(), jobs_done: z.number(), jobs_failed: z.number() }),
+	pcs: z.object({ seen: z.number(), max_online: z.number(), mean_online: z.number() }),
+	failures: z.object({ pcs_lost: z.number(), recovered_chunks: z.number(), head_failovers: z.number() }),
+	energy_kwh: z.number().nullable().default(null), busy_share: z.number(),
+	top_jobs: z.array(z.object({ id: z.number(), name: z.string(), pc_hours: z.number() })), alerts: z.number()
+});
+export const DayReportReply = z.object({ report: DayReport });
+export type Breakdown = z.infer<typeof Breakdown>;
+export type Alert = z.infer<typeof Alert>;
+export type ExperimentRow = z.infer<typeof ExperimentRow>;
+export type DayReport = z.infer<typeof DayReport>;
