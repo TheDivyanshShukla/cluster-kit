@@ -8,7 +8,10 @@ Markdown report: throughput, utilisation, PCs, failures per hour, failovers.
 
 Energy: CPU package joules from Linux RAPL when the agents can read it (OBS-03); add wall-meter readings by hand.
 """
+from __future__ import annotations
+
 import argparse, csv, json, os, statistics, sys, time, urllib.request
+from typing import Any
 from datetime import datetime
 
 p = argparse.ArgumentParser()
@@ -23,7 +26,7 @@ heads = [h.strip().rstrip("/") for h in a.head.split(",") if h.strip()]
 token = os.environ.get("CK_TOKEN")
 
 
-def call(method, path, body=None):
+def call(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
     """Try each head; a standby answers 503, a dead head refuses: move on. Returns the JSON reply."""
     last = None
     for h in list(heads):

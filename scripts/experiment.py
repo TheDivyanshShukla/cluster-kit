@@ -14,7 +14,10 @@ runs.jsonl (provenance per run: git commit, head, the exact PCs and their classe
 PCs are chosen in a fixed order (node id), so "8 PCs" is the same 8 every repeat. EXP-05: virtual and real PCs are
 never mixed; a run on virtual nodes says so in every row and in the file name.
 """
+from __future__ import annotations
+
 import argparse, csv, json, os, statistics, subprocess, sys, time, urllib.parse, urllib.request
+from typing import Any
 
 p = argparse.ArgumentParser()
 p.add_argument("--head", required=True)
@@ -37,7 +40,7 @@ if not (a.n or a.n_per_pc):
 head, token = a.head.rstrip("/"), os.environ.get("CK_TOKEN")
 
 
-def call(method, path, body=None):
+def call(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
     req = urllib.request.Request(head + path, method=method, data=None if body is None else json.dumps(body).encode())
     req.add_header("Content-Type", "application/json")
     if token:
@@ -69,7 +72,7 @@ except OSError:
 print(f"{len(configs)} configs x {a.repeats} repeats (+{a.warmup} warm-up) on {len(pool)} {'VIRTUAL ' if virtual else ''}PCs -> {out}/")
 
 
-def run(cfg):
+def run(cfg: tuple[int, str, int]) -> tuple[dict[str, Any], list[str], int, float, int]:
     k, pol, ch = cfg
     ids = pool[:k]
     n = int(a.n or a.n_per_pc * k)

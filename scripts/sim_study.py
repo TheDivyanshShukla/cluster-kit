@@ -8,9 +8,16 @@ Writes CSVs, PNG + PDF figures, VALIDATION.md and results.json into docs/sim/. I
 Every number that is an assumption (power, wake latency, MTBF, timetable, speed spread) is a parameter below and is
 labelled in docs/sim/REPORT.md. Only stdlib + matplotlib.
 """
+from __future__ import annotations
+
 import argparse, csv, json, math, os, statistics as st, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, Callable, Iterable, TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+Scn = dict[str, Any]  # a ck sim scenario (see rust/src/sim.rs header)
 
 R = Path(__file__).resolve().parents[1]
 OUT = R / "docs" / "sim"
@@ -37,7 +44,7 @@ EFF = 0.97                                           # job-level efficiency (chu
 SEEDS = 3 if A.quick else 7
 
 
-def run(scn, name="x"):
+def run(scn: Scn, name: str = "x") -> tuple[dict[str, Any], Path]:
     """Run `ck sim` on a scenario dict, return (summary dict, timeline path)."""
     d = Path(TMP) / name
     d.mkdir(parents=True, exist_ok=True)
@@ -49,11 +56,11 @@ def run(scn, name="x"):
     return json.loads((d / "summary.json").read_text()), d / "timeline.csv"
 
 
-def pmap(fn, items):
+def pmap(fn: Callable[[T], U], items: Iterable[T]) -> list[U]:
     return list(POOL.map(fn, items))
 
 
-def lab_nodes(p, speed_cv=LAB_SPEED_CV, **kw):
+def lab_nodes(p: int, speed_cv: float = LAB_SPEED_CV, **kw: Any) -> list[dict[str, Any]]:
     """p PCs: the head PC (slower, it also runs the head) + p-1 workers."""
     g = [{"count": 1, "rate": HEAD_RATE, "run_cv": HEAD_RUN_CV, "lab": "L0"}]
     if p > 1:
@@ -61,11 +68,11 @@ def lab_nodes(p, speed_cv=LAB_SPEED_CV, **kw):
     return g
 
 
-def nominal_rate(p):
+def nominal_rate(p: int) -> float:
     return HEAD_RATE + (p - 1) * WORKER_RATE
 
 
-def csv_write(name, rows, header):
+def csv_write(name: str, rows: Iterable[Iterable[Any]], header: list[str]) -> None:
     with open(OUT / name, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(header)
@@ -73,11 +80,11 @@ def csv_write(name, rows, header):
             w.writerow([f"{x:.6g}" if isinstance(x, float) else x for x in r])
 
 
-def mean(x):
+def mean(x: list[float]) -> float:
     return sum(x) / len(x)
 
 
-def cvp(x):
+def cvp(x: list[float]) -> float:
     return 100 * st.stdev(x) / mean(x) if len(x) > 1 and mean(x) else 0.0
 
 
@@ -90,26 +97,26 @@ plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.rig
                      "figure.dpi": 110, "savefig.bbox": "tight", "axes.prop_cycle": matplotlib.cycler(color=C)})
 
 
-def save(fig, name):
+def save(fig: Any, name: str) -> None:
     fig.savefig(OUT / f"{name}.png", dpi=130)
     fig.savefig(OUT / f"{name}.pdf")
     plt.close(fig)
 
 
 # ---------------------------------------------------------------- SIM-04 validation
-def read_paper():
+def read_paper() -> dict[str, list[tuple[float, float]]]:
     raw = {}
     for r in csv.DictReader(open(PAPER / "raw.csv")):
         raw.setdefault(r["config"], []).append((float(r["hashes_per_s"]), float(r["n"])))
     return raw
 
 
-def validate():
+def validate() -> bool:
     raw = read_paper()
     single = {k: mean([x[0] for x in v]) for k, v in raw.items() if k in ("head", "192.168.10.200", "192.168.10.3", "192.168.10.5")}
     rows, ok = [], True
 
-    def add(what, measured, simulated, unit, tol=10.0, kind="err"):
+    def add(what: str, measured: float, simulated: float, unit: str, tol: float = 10.0, kind: str = "err") -> None:
         nonlocal ok
         err = 100 * (simulated - measured) / measured
         good = abs(err) <= tol
@@ -122,7 +129,7 @@ def validate():
         meas = [x[0] for x in raw[f"{p} PCs"]]
         nominal = single["head"] + (p - 1) * mean([single[k] for k in ("192.168.10.200", "192.168.10.3", "192.168.10.5")])
         nodes = [{"count": 1, "rate": single["head"], "run_cv": HEAD_RUN_CV}, {"count": p - 1, "rate": WORKER_RATE, "speed_cv": 0.001, "run_cv": WORKER_RUN_CV}]
-        def one(seed):
+        def one(seed: int) -> Any:
             s, _ = run({"nodes": nodes, "job": {"n": n, "policy": "fixed"}, "seed": seed}, f"val{p}_{seed}")
             return s["throughput_per_s"]
         sim = pmap(one, range(1, 61))
@@ -167,12 +174,12 @@ def validate():
 
 
 # ---------------------------------------------------------------- E1 throughput and efficiency 1..200 PCs
-def e1():
+def e1() -> None:
     ps = [1, 2, 3, 4, 8, 16, 32, 64, 100, 150, 200] if not A.quick else [1, 4, 16, 64, 200]
     variants = [("fixed", 70e6, "fixed, ~3 s per PC (the paper)"), ("adaptive", 70e6, "adaptive, ~3 s per PC"), ("fixed", 700e6, "fixed, ~30 s per PC")]
     jobs = [(v, p, r) for v in variants for p in ps for r in range(1, SEEDS + 1)]
 
-    def one(a):
+    def one(a: Any) -> Any:
         (pol, npc, _), p, r = a
         s, _t = run({"nodes": lab_nodes(p), "job": {"n": npc * p, "policy": pol}, "head": {"service_us": SVC_US, "service_us_per_agent": SVC_AGENT_US}, "seed": 100 * p + r}, f"e1_{pol}_{int(npc)}_{p}_{r}")
         return (pol, int(npc), p, r, s["throughput_per_s"], 100 * s["throughput_per_s"] / nominal_rate(p), s["makespan_s"], s["tasks_per_s"], s["head_utilisation_pct"])
@@ -197,7 +204,7 @@ def e1():
 
 
 # ---------------------------------------------------------------- E3 cost of losing k of N PCs mid-job
-def e3():
+def e3() -> None:
     out = {}
     fig, ax = plt.subplots(1, 2, figsize=(10, 3.8))
     for ci, N in enumerate([20, 200]):
@@ -205,7 +212,7 @@ def e3():
         n = N * WORKER_RATE * 600
         jobs = [(k, perm, r) for k in ks for perm in (True, False) for r in range(1, SEEDS + 1)]
 
-        def one(a):
+        def one(a: Any) -> Any:
             k, perm, r = a
             g = lab_nodes(N - k)
             if k:
@@ -234,13 +241,13 @@ def e3():
 
 
 # ---------------------------------------------------------------- E4 head crash
-def e4():
+def e4() -> None:
     cases = [("standby, crash", "standby", {"recovery_s": 5.7}), ("planned switchover", "standby", {"recovery_s": 3.7}),
              ("no standby, manual restart 5 min", "single", {"manual_restart_s": 300.0}), ("no standby, manual restart 30 min", "single", {"manual_restart_s": 1800.0}),
              ("no standby, never restarted", "single", {})]
     Ns = [20, 200, 1000]
     jobs = [(N, c, r) for N in Ns for c in cases for r in range(1, SEEDS + 1)]
-    def one(a):
+    def one(a: Any) -> Any:
         N, (name, arch, hf), r = a
         n = N * WORKER_RATE * 600
         scn = {"nodes": lab_nodes(N), "job": {"n": n, "policy": "adaptive"}, "architecture": arch, "seed": 7 * N + r, "head": {"service_us": SVC_US, "service_us_per_agent": SVC_AGENT_US}, "max_s": 1e5}
@@ -265,7 +272,7 @@ def e4():
     summ["never_restarted_done_pct"] = never
     # sensitivity to the promotion time
     recs = [2, 5.7, 10, 20, 30, 60]
-    def sens(rec):
+    def sens(rec: Any) -> Any:
         N = 200
         scn = {"nodes": lab_nodes(N), "job": {"n": N * WORKER_RATE * 600}, "architecture": "standby", "seed": 5}
         s0, _t = run(scn, f"e4s0_{rec}")
@@ -281,11 +288,11 @@ def e4():
 
 
 # ---------------------------------------------------------------- E5 architectures
-def e5():
+def e5() -> None:
     archs = ["single", "standby", "relays", "relays+standby"]
     Ns = [200, 1000, 10000] if not A.quick else [200, 1000]
     jobs = [(N, a, r) for N in Ns for a in archs for r in range(1, (3 if N < 10000 else 2) + 1)]
-    def one(x):
+    def one(x: Any) -> Any:
         N, a, r = x
         lab = 50
         g = [{"count": min(lab, N - i * lab), "rate": WORKER_RATE, "speed_cv": LAB_SPEED_CV, "run_cv": WORKER_RUN_CV, "lab": f"L{i}"} for i in range((N + lab - 1) // lab)]
@@ -326,7 +333,9 @@ USER_JOBS = [  # ASSUMED user jobs: (name, arrive_h, work in "10-minute whole-la
     ("u1", 11.0, 1.0), ("u2", 13.5, 0.5), ("u3", 15.0, 2.0), ("u4", 19.5, 0.2), ("u5", 2.0, 0.4)]
 
 
-def day_scn(placement="spread", max_pcs=0, pow_job=False, eco=True, power=None, ecocfg=None, seed=1, mtbf=0.0, head_mtbf=0.0, classes=True, user=True, hours=24, wake_s=None, tick=10):
+def day_scn(placement: str = "spread", max_pcs: int = 0, pow_job: bool = False, eco: bool = True, power: dict[str, float] | None = None,
+            ecocfg: dict[str, Any] | None = None, seed: int = 1, mtbf: float = 0.0, head_mtbf: float = 0.0, classes: bool = True,
+            user: bool = True, hours: float = 24, wake_s: float | None = None, tick: float = 10) -> Scn:
     pcs = [{"count": 50, "rate": LAB_RATES[i], "speed_cv": LAB_SPEED_CV, "run_cv": WORKER_RUN_CV, "mtbf_s": mtbf, "down_s": 180.0, "threads": 12} for i in range(4)]
     pw = dict(POWER, **(power or {}))
     if wake_s:
@@ -339,17 +348,17 @@ def day_scn(placement="spread", max_pcs=0, pow_job=False, eco=True, power=None, 
             "eco": dict(ECO, **(ecocfg or {}), enabled=eco), "reservations": res, "jobs": jobs, "head": {"mtbf_s": head_mtbf, "standby": True, "recovery_s": 5.7}}
 
 
-def user_stats(s):
+def user_stats(s: dict[str, Any]) -> tuple[float, float, float, int]:  # mean makespan, max, mean wait, unfinished
     us = [j for j in s["jobs"] if j["name"].startswith("u")]
     mk = [j["makespan_s"] for j in us if j["makespan_s"] is not None]
     return (mean(mk) if mk else float("nan"), max(mk) if mk else float("nan"), mean([j["wait_s"] for j in us if j["wait_s"] is not None] or [float("nan")]), sum(1 for j in us if j["makespan_s"] is None))
 
 
-def place():
+def place() -> None:
     modes = ["spread", "pack", "fastest", "efficient"]
     caps = [0, 100, 50, 20]
     jobs = [(m, c, pw, r) for m in modes for c in caps for pw in (False, True) for r in range(1, SEEDS + 1 if not A.quick else 2)]
-    def one(a):
+    def one(a: Any) -> Any:
         m, c, pw, r = a
         s, _t = run(day_scn(placement=m, max_pcs=c, pow_job=pw, eco=not pw, seed=r), f"pl_{m}_{c}_{pw}_{r}")
         mk, mx, wait, unf = user_stats(s)
@@ -357,7 +366,7 @@ def place():
         return (m, c, int(pw), r, mk, mx, wait, unf, s["kwh"], powdone / 1e12, s["wakes"], s["class_delay_pc_s"])
     rows = pmap(one, jobs)
     csv_write("placement_modes.csv", rows, ["placement", "max_pcs", "with_pow_background", "repeat", "user_mean_makespan_s", "user_max_makespan_s", "user_mean_wait_s", "unfinished", "kwh_day", "pow_Thash", "wakes", "class_delay_pc_s"])
-    def cell(m, c, pw, i):
+    def cell(m: Any, c: Any, pw: Any, i: Any) -> Any:
         return mean([r[i] for r in rows if r[0] == m and r[1] == c and r[2] == pw])
     fig, ax = plt.subplots(1, 3, figsize=(14, 4), constrained_layout=True)
     for k, (i, ttl, fmt) in enumerate([(4, "user job mean makespan (s)\nno background job, eco on", "{:.0f}"), (8, "energy of the day (kWh)\nno background job, eco on", "{:.1f}")]):
@@ -378,7 +387,7 @@ def place():
     RESULTS["place"] = {f"{m}_{c}_{'pow' if pw else 'nopow'}": {"user_mean_makespan_s": cell(m, c, pw, 4), "user_max_makespan_s": cell(m, c, pw, 5), "kwh": cell(m, c, pw, 8), "pow_Thash": cell(m, c, pw, 9), "wakes": cell(m, c, pw, 10)} for m in modes for c in caps for pw in (0, 1)}
 
 
-def eco():
+def eco() -> None:
     cfgs = [("always on", dict(eco=False)), ("eco (idle 10 min, prewake 2 min)", dict(eco=True))]
     rows, tls = [], {}
     for name, kw in cfgs:
@@ -393,7 +402,7 @@ def eco():
     # sensitivity: wake latency x idle timeout
     wakes, idles = [30, 60, 120], [300, 600, 1800, 3600]
     jobs = [(w, i) for w in wakes for i in idles]
-    def sens(a):
+    def sens(a: Any) -> Any:
         w, i = a
         s, _t = run(day_scn(seed=1, ecocfg={"idle_sleep_s": i}, wake_s=w), f"ecos_{w}_{i}")
         return 100 * (1 - s["kwh"] / on), mean([x["makespan_s"] for x in s["jobs"] if x["makespan_s"] is not None])
@@ -434,11 +443,11 @@ def eco():
 
 
 # ---------------------------------------------------------------- E7 24 h soak projection
-def e7():
+def e7() -> None:
     mtbfs = [("6 h", 6 * 3600.0), ("1 day", 86400.0), ("3 days", 3 * 86400.0), ("7 days", 7 * 86400.0), ("30 days", 30 * 86400.0)]
     reps = 10 if not A.quick else 3
     jobs = [(nm, m, r) for nm, m in mtbfs for r in range(1, reps + 1)]
-    def one(a):
+    def one(a: Any) -> Any:
         nm, m, r = a
         s, tl = run(day_scn(seed=r, mtbf=m, head_mtbf=7 * 86400.0, pow_job=True, eco=False, classes=False, user=False), f"e7_{nm}_{r}")
         rows = list(csv.DictReader(open(tl)))
