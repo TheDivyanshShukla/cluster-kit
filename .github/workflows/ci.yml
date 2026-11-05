@@ -38,6 +38,6 @@ jobs:
       - run: python -m unittest discover -s python/tests
       - uses: astral-sh/setup-uv@v6
         if: matrix.python == '3.12'
-      - name: ruff (latest): full type hints
+      - name: "ruff (latest): full type hints"
         if: matrix.python == '3.12'
         run: uvx ruff@latest check .
