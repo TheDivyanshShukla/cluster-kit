@@ -270,7 +270,7 @@ Operator guide: [HIERARCHY.md](HIERARCHY.md). CLI: `ck admin hier`.
 
 Tree: `{"mode", "active" (leases are being granted), "paused" (reason or null), "settings", "root": {"node_id", "role", "epoch", "addr", "pcs_direct"}, "standbys": [node ids], "labs": [Lab], "orphans": [{"node_id", "lab", "leases", "silent_s", "expires_in_s"}], "unleasable_jobs": [job ids]}`. Lab = `{"lab", "pinned", "drain", "state": "active"|"partitioned"|"released"|"absent"|"none", "pcs_at_root", "pcs": [{"id", "host", "threads", "busy"}] (under the lab head), "silent_s", "orphaned_leases", "head": null | {"node_id", "host", "addr", "port", "api", "connected_s", "pcs", "threads", "leases" (as the lab head sees them: job, a, b, got, finished, age_s), "root_inflight" (as the root sees them), "granted_in_flight", "lab_granted", "lab_done", "leases_done", "lag_s" (age of its last status), "unacked", "partitioned", "released", "rate", "chunks_inflight"}}`.
 
-SSE `event` carries `labhead.join`, `labhead.leave`, `labhead.partition`, `labhead.heal`, `labhead.lease` (live, not stored), `hier.*`. New tunables (group Hierarchy): `hier_mode`, `lease_s`, `lab_head_min_pcs`, `lab_silence_s`, `lab_head_standby`, `lab_head_port`, `lab_part_s`.
+SSE `event` carries `labhead.join`, `labhead.leave`, `labhead.partition`, `labhead.heal`, `labhead.lease` (live, not stored), `hier.*`. New tunables (group Hierarchy): `hier_mode`, `lease_s`, `lab_head_min_pcs`, `lab_silence_s`, `lab_head_standby`, `lab_head_port`, `lab_part_s` (group Network: `stage_timeout_s`). `PUT /hierarchy/settings` takes only the first five (as `mode` for `hier_mode`); the other two go through `PUT /tunables`.
 
 Wire (agents and heads only): `HELLO_W`'s Hello gains `lab_head {lab, port, api, pcs}`; frame `PARTIAL` (31) = a RESULT-shaped finished piece of a lease; CTRL keys `move_to`, `start_lab_head`, `hier_job`, `lab_keys`, `lab_release`, `lab_adopt`, `lab_exit`, `lab_drain` (root to agent/lab head) and `lab_status`, `leases`, `lease_done` (lab head to root). Old agents ignore every new key and frame.
 
@@ -290,4 +290,16 @@ Suggestions next to the alerts; rules, options and the catalogue are in [ADVISOR
 
 Suggestion = `{"id", "kind", "severity": "info"|"tip"|"warn", "title", "why", "options": [Option], "effect", "action" (the recommended option's), "since_ms", "policy", "accuracy"}`. Option = `{"id", "title", "action": {"type": "tune"|"node_state"|"ha_target"|"power"|"doc", ...} or null, "steps": [text], "expected_effect", "metric", "metric_from", "metric_to", "cost", "risk": "low"|"med"|"high", "reversible", "auto_safe", "time_to_effect", "confidence", "success_check", "recommended", "score"}`. Applied = `{"id", "kind", "option", "action", "by", "auto", "ts_ms", "metric", "before", "predicted", "follow_s", "undone", "outcome": {"observed", "predicted_gain", "observed_gain", "hit"} or null}`. SSE event `advice` sends `{"suggestions": [...]}` whenever the list changes. Events: `advice.applied`, `advice.auto`, `advice.undone`, `advice.dismissed`, `advice.settings`, `advice.outcome`.
 
-Needs wiring outside the advisor's files: `users::min_role` currently gives every `/api/v1/advice*` route viewer (the handlers enforce operator/admin themselves), and `users::ROUTES` / `jobcli::CLI_MAP` have no entry for these routes.
+Roles are enforced twice: `users::min_role` gives `PUT /advice/settings`, `POST /advice/{id}/apply` and `/undo` the admin role and the other `POST /advice/*` routes operator, and the handlers check again. Dismiss defaults to a 24 h snooze (`snooze_h` is clamped to 0 to 720); undo snoozes the suggestion for 1 h; apply snoozes it for the 10 min follow-up window and answers 409 when asked again inside it.
+
+## Logs
+
+`GET /api/v1/logs?since_ms=&kind=&level=&role=&limit=` (operator): `{"logs": [line]}`, newest matching JSON lines from this head's log files. `level` is `error|warn|info|debug` (default `debug`, i.e. everything), `limit` defaults to 200 (1 to 5000), `kind` is a prefix such as `node.` . CLI: `ck logs`. Details: [LOGGING.md](LOGGING.md).
+
+## Limits on a chunk (memory, output, staging)
+
+Agent-side tunables in group Agent limits, and one head-side tunable in group Network (full table in [OPERATIONS.md](OPERATIONS.md) section 8):
+- `job_mem_pct` (default 80): a `cmd` program, with all its processes, is stopped when its group uses more than this share of the PC's RAM; the chunk fails with "memory over the N MB limit (job_mem_pct), program stopped". 0 turns the check off. The check runs about every 300 ms.
+- `out_max_mb` (64): stdout kept per chunk; the program is stopped when it prints more ("output over the N MiB limit"). Put big results in `$CK_OUT` files instead.
+- `out_files_mb` (256): total size of `$CK_OUT` files per chunk, checked while the program runs.
+- `stage_timeout_s` (120): a chunk (or lab-head lease) reserved for a PC while its blobs download is re-staged from the head after this long plus 1 s per 2 MB of missing blobs, then given to another PC after the same time again (the slow PC is skipped for that job). If the blob is no longer on the head the job fails with a message naming it.

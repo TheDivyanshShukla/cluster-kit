@@ -381,7 +381,7 @@ pub fn advise(o: &AdvObs, now: i64) -> Vec<Suggestion> {
             opts.push(Opt::new("lab_heads_auto", &format!("Lab heads, automatic: hier_mode 0 -> 2 ({} lab(s) of {} PCs or more)", big.len(), o.t("lab_head_min_pcs")))
                 .act(Action::Tune { key: "hier_mode".into(), from: 0.0, to: 2.0 })
                 .eff(format!("root busy ~{} -> ~{} of one core, each lab head ~{}; the head stops being the limit", pc(b1), pc(b2), pc(bl)))
-                .metric("dispatch_share", ds, ds * 0.3).cost("PCs reconnect once (about 2 s); a lab head loss costs ~2 s and a lease of recomputed work; jobs with a selector, blobs or a command/list kind pause the hierarchy")
+                .metric("dispatch_share", ds, ds * 0.3).cost("PCs reconnect once (about 2 s); a lab head loss costs ~2 s and a lease of recomputed work; only `--only` jobs pause the hierarchy")
                 .risk("med", true).tte("about 10 s").conf(format!("model: sim.rs cost model, {pcs} PCs, chunks {cur} s, lease {} s (docs/sim/HIERARCHY.md); measured on 1 machine in docs/HIERARCHY.md", o.t("lease_s")))
                 .check("dispatch_share falls and head_hot clears within 10 min").score(ds * 90.0 + if head_hot { 40.0 } else { 0.0 }));
             opts.push(Opt::new("lab_heads_manual", "Lab heads, by hand: hier_mode 0 -> 1, then pin the PC you want per lab")

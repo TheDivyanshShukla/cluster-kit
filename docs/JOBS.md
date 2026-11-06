@@ -144,3 +144,11 @@ A `cmd` or `list` program may write result files. The agent sets env `CK_OUT` to
 List them with `ck job files ID`, fetch them with `ck job files ID --get DIR`, or use `GET /api/v1/jobs/ID/files` and `GET /api/v1/blobs/SHA`.
 
 A template stores a job body under a name: `ck job template save NAME job.json`, then `ck job submit --template NAME` (API: `POST /api/v1/jobs {"template": "NAME", "n": 5000}`; keys in the body replace the stored ones).
+
+## Limits per chunk, lab heads, and file staging
+
+- **Memory.** A `cmd` program and all its processes are stopped when together they use more than `job_mem_pct` (default 80) percent of the PC's RAM; the chunk fails with "memory over the N MB limit (job_mem_pct), program stopped". Not a retry: only exit 75 asks for a retry.
+- **Output.** stdout beyond `out_max_mb` (64 MB) stops the program ("output over the N MiB limit"); `$CK_OUT` files beyond `out_files_mb` (256 MB) stop it too. Write large results to `$CK_OUT`, not stdout.
+- **Files (blobs).** A chunk whose files have not arrived `stage_timeout_s` (120 s, plus 1 s per 2 MB) after it was reserved is re-staged from the head, then moved to another PC. If a file is gone from the head the job fails and names it.
+- **Lab heads.** With lab heads on, every kind on this page runs the same way, including `$CK_OUT` files and `max_pcs`; only `--only` jobs make the root pause lab heads ([HIERARCHY.md](HIERARCHY.md)). `CK_START` and `CK_END` stay the numbers of the whole job.
+- **Real examples.** `examples/real/` has five complete jobs written with the SDK (see [SDK.md](SDK.md)); `examples/real/cv.py` leaves PNG files in `$CK_OUT` as described above.

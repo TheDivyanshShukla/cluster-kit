@@ -64,6 +64,13 @@ if __name__ == "__main__":
 
 It runs locally when the cluster would not be faster. More: `examples/sdk/` (`sweep.py`, `model_avg.py`, `ml_torch.py`) and [docs/SDK.md](docs/SDK.md).
 
+## Beyond one head (Rust engine)
+
+- **Lab heads** ([docs/HIERARCHY.md](docs/HIERARCHY.md)): for hundreds of PCs, one head per lab serves its PCs and talks to the root in big leases, so the root's CPU stops being the limit. Off by default; `ck admin hier settings mode=auto` turns it on in a running fleet, and `mode=off` turns it off again in the middle of a job. Every job kind runs through lab heads except `--only`.
+- **Advisor** ([docs/ADVISOR.md](docs/ADVISOR.md)): the console's Advisor page and `ck admin advice` list measured suggestions with options, cost and risk; you apply, undo or dismiss them, and the head checks each applied one against its prediction after 10 minutes.
+- **Limits per program**: a command program is stopped when it uses more than `job_mem_pct` (80 %) of the PC's RAM, prints more than `out_max_mb` (64 MB) to stdout, or leaves more than `out_files_mb` (256 MB) in `$CK_OUT`. A chunk waiting for its files is re-staged after `stage_timeout_s` (120 s). All tunables: [docs/OPERATIONS.md](docs/OPERATIONS.md) section 8.
+- **Real workloads** (`examples/real/`): CNN training, an SVM sweep, a 5-million-row ETL, an image pipeline and a 1 GB text job, each `python3 examples/real/NAME.py local|cluster`, with the same exact digest either way. `scripts/stress/workloads.py` runs them against a fleet, with faults. Results: [docs/audit/ROUND4.md](docs/audit/ROUND4.md).
+
 ## Layout
 
 ```
@@ -72,7 +79,9 @@ python/                 Dask engine: cluster.py (head/worker/bench/firewall)
 rust/                   Rust engine: src/main.rs, src/gpu.rs + sha.wgsl (GPU), src/dash.html,
                         bench/mpi_pingpong.c + bench/mpi_sha.c (MPI baselines)
 examples/               example jobs: simple_sha256.py (start here, see docs/SIMPLE.md), dask_sha256.py (Dask), primes.c / primes.js / primes.py (any-language --cmd)
-docs/                   ARCHITECTURE.md (start here), OPERATIONS.md, API.md, SDK.md, SIMPLE.md, BENCHMARK.md, UBUNTU.md, roadmap: CONSOLE_REQUIREMENTS.md
+docs/                   ARCHITECTURE.md (start here), OPERATIONS.md, API.md, SDK.md, JOBS.md, BULK.md, HIERARCHY.md (lab heads), ADVISOR.md,
+                        SIMPLE.md, BENCHMARK.md, UBUNTU.md, LOGGING.md, audit/ (bad-case and real-workload rounds), roadmap: CONSOLE_REQUIREMENTS.md
+examples/real/          five real Python workloads (train, sweep, etl, cv, text)
 ```
 
 To add an engine later, create a folder and add one `case` branch to `kit` (and `kit.ps1`). To get firewall handling for free, start it through `python/cluster.py fwrun`.

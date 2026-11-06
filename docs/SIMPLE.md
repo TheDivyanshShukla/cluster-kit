@@ -58,3 +58,7 @@ python examples/simple_sha256.py --n 5e7 --cores
 ```
 
 (`examples/simple_time.py` is the same idea with prime counting.)
+
+## Next: real jobs
+
+`examples/real/` has five heavier, realistic jobs (training, a sweep, ETL, an image pipeline, text) that run `local` or `cluster` and print the same digest either way; see [SDK.md](SDK.md). On a big fleet, lab heads ([HIERARCHY.md](HIERARCHY.md)) keep the head from being the limit, and the advisor ([ADVISOR.md](ADVISOR.md)) suggests settings. A small job like the one above finishes before the network pays off; on one Mac, cluster mode of the real examples is slower than local for the short ones ([audit/ROUND4.md](audit/ROUND4.md)).

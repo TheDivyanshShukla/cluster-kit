@@ -214,3 +214,17 @@ The first task of a job on a PC leaves a per-user warm Python worker that has al
 ## Blobs per chunk (lab heads and shards)
 
 Items that hold `ck.shard` / `ck.put` handles inside a tuple, a dict or a batch are sent as `@refs:<sha>,..|<line>`: the head reads the shas to send each shard only to the PCs whose chunk uses it (before, only items that were a bare handle were placed per chunk; any other item made every PC fetch every shard). The runner drops the prefix. `ck.plan` therefore counts a blob used by one item as data for one PC (`blob_per_chunk`, now true by default; set `ck.config(blob_per_chunk=False)` against a head from before this change). Jobs through lab heads: see HIERARCHY.md section 7.
+
+## Real-workload examples and what they found
+
+`examples/real/` holds five jobs that people actually run, each with `local` and `cluster` modes and one JSON line `{"digest", "secs"}` that must be identical in both:
+
+| File | Uses | What it does |
+|---|---|---|
+| `train.py` | `ck.train` | small CNN on 28x28 digits, models averaged each round (torch) |
+| `sweep.py` | `ck.sweep` | 240 SVM configurations, 5-fold cross-validated (scikit-learn) |
+| `etl.py` | `ck.shard`, `ck.map` | 5-million-row CSV cut into 24 blobs, filtered and grouped on the PCs, merged here (pandas) |
+| `cv.py` | `ck.map`, `$CK_OUT` | 5,000 generated images resized, blurred, edge-mapped; PNGs saved as job files (OpenCV, Pillow) |
+| `text.py` | `ck.shard`, `ck.map` | word counts and exact duplicate-line removal over 1 GB of text (numpy) |
+
+Put the imports a function needs at the top of the file: a lazy import inside the function defeats the warm runner and inflates the profile of item 0. Numbers and faults: [audit/ROUND4.md](audit/ROUND4.md). Fixed while building them: a crash on results over 64 KB (the SDK's `sum(map(len, ...))` called its own `map`), no retry of GET calls when the head fails over mid-job (`_http` now retries while a job is in flight), blobs not uploaded again after a reconnect, and a profile window that counted import time (item 0 looked 10x too slow). With lab heads on, `/api/v1/cluster` lists each lab head's PCs as `lab_pcs` and the planner counts them; before that fix it saw a lab head as one PC and planned for one.

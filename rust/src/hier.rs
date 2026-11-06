@@ -361,10 +361,10 @@ fn tick(ctx: &Arc<Ctx>) {
         return;
     }
     let mode = mode();
-    // pause while a job runs that lab heads cannot serve (selector, blobs, command/list kinds): its PCs must reach it directly
+    // pause while a job runs that lab heads cannot serve (--only jobs name exact PCs): its PCs must reach it directly
     let blocked: Option<String> = {
         let st = ctx.sh.0.lock().unwrap();
-        st.jobs.values().find(|j| j.has_work() && !j.lease_ok).map(|j| format!("job {} cannot use lab heads (selector, blobs or a command/list job)", j.id))
+        st.jobs.values().find(|j| j.has_work() && !j.lease_ok).map(|j| format!("job {} cannot use lab heads (--only names exact PCs)", j.id))
     };
     let (labs, direct): (Vec<LabHead>, Vec<(String, String, Option<Arc<Mutex<Out>>>, bool)>) = {
         let st = ctx.sh.0.lock().unwrap();
