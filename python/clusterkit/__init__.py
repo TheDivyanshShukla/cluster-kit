@@ -98,6 +98,8 @@ def _opts(kw: dict[str, Any]) -> Opts:
 
 
 # ---------------------------------------------------------------- HTTP
+_in_job = [0]  # cluster runs in flight: while > 0, GET/HEAD retry through a head failover
+_reconnected = [False]  # set when such a retry got through: the head may be a new one that lacks the blobs this run uploaded
 def _http(method: str, path: str, body: Any = None, text: bool = False, timeout: float = 60, raw: bool = False, length: int | None = None) -> Any:
     """JSON in/out. A bytes (or file-like, with length=) body is sent as is (blob upload); raw=True returns bytes; HEAD returns {}."""
     blob = isinstance(body, (bytes, bytearray)) or hasattr(body, "read")
@@ -108,13 +110,23 @@ def _http(method: str, path: str, body: Any = None, text: bool = False, timeout:
             req.add_header("Content-Length", str(length))
     if _cfg["token"]:
         req.add_header("Authorization", "Bearer " + _cfg["token"])
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = r.read()
-    except urllib.error.HTTPError as e:
-        raise ClusterError(f"{method} {path}: HTTP {e.code} {e.read()[:300].decode(errors='replace')}") from None
-    except OSError as e:
-        raise ClusterError(f"cannot reach the head at {_cfg['head']} ({e}); call ck.connect(url) or set CK_HEAD") from None
+    # while a job runs, reads wait for a failover: the standby takes over the same address within seconds and keeps the job (CK_FAILOVER_SECS, default 60)
+    deadline = time.monotonic() + (float(os.environ.get("CK_FAILOVER_SECS") or 60) if _in_job[0] and method in ("GET", "HEAD") else 0.0)
+    tries = 0
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = r.read()
+            if tries:
+                _reconnected[0] = True
+            break
+        except urllib.error.HTTPError as e:
+            raise ClusterError(f"{method} {path}: HTTP {e.code} {e.read()[:300].decode(errors='replace')}") from None
+        except OSError as e:
+            if time.monotonic() >= deadline:
+                raise ClusterError(f"cannot reach the head at {_cfg['head']} ({e}); call ck.connect(url) or set CK_HEAD") from None
+            tries += 1
+            time.sleep(0.5)
     if raw:
         return data
     return {} if method == "HEAD" else data.decode() if text else json.loads(data)
@@ -402,15 +414,15 @@ def _profile(fn: Callable[..., Any], mode: str, items: list[Any], limit: float =
             for x in items[1:k]:
                 _runner.apply(mode, fn, x)
                 rest["done"] += 1
-                if time.perf_counter() - t0 > 2.0 - first:
+                if time.perf_counter() - t0 > max(2.0 - first, 0.0):
                     break
         except BaseException as e:  # noqa: BLE001 - re-raised in the caller
             rest["err"] = e
 
-    if first <= 2.0 and n > 1:
+    if first <= 10.0 and n > 1:  # item 0 ran under tracemalloc and paid one-time costs (imports): even a slow one gets one clean timing from item 1
         th = threading.Thread(target=more_items, daemon=True)
         th.start()
-        th.join(min(limit, 2.0 - first + 1.0))
+        th.join(min(limit, max(2.0 - first, 0.0) + first + 1.0))
         if th.is_alive():  # an item far slower than item 0: plan with what it has taken so far
             log.warning("a sample item is still running locally after %.1f s; planning the items as slow", time.perf_counter() - t0)
             return max(first, time.perf_counter() - t0), max(peak, rss) / 1048576
@@ -676,6 +688,11 @@ def _await(jid: int, timeout_s: float | None, check: Callable[[dict[str, Any], f
             row, via = _stream.rows.get(jid), "push"
         else:
             row, polled, via = _http("GET", f"/api/v1/jobs/{jid}")["job"], now, "poll"
+            if _reconnected[0] and st and st.get("blobs"):  # the head changed under us: put back what the standby had not copied yet
+                _reconnected[0] = False
+                for h in st["blobs"]:
+                    h.on = None
+                _bulk.upload(st["blobs"], _self)
         state = row and row.get("state")
         if state == "done":
             if st is not None:
@@ -737,6 +754,7 @@ def _submit(fn: Callable[..., Any], mode: str, items: list[Any], pl: Plan, o: Op
     hs = {h.sha: h for x in items for h in _bulk.find(x)}
     hs.update({h.sha: h for h in code_hs})
     st["up_bytes"], st["up_s"] = _bulk.upload(list(hs.values()), _self) if hs else (0, 0.0)
+    st["blobs"] = list(hs.values())
     body = {"kind": "list", "cmd": cmd, "items": lines, "name": o["name"] or f"sdk:{fn.__name__}",
             "priority": o["priority"], "max_pcs": pl.pcs, "placement": pl.placement, "mem_mb": pl.mem_mb}
     if hs:
@@ -825,7 +843,7 @@ def _cluster_run(fn: Callable[..., Any], mode: str, items: list[Any], pl: Plan, 
             v = _runner.dec(got[sha].decode())
             for i in idx:
                 out[i] = v
-        st["down_bytes"], st["down_s"] = sum(map(len, got.values())), time.perf_counter() - t1
+        st["down_bytes"], st["down_s"] = sum(len(v) for v in got.values()), time.perf_counter() - t1
     st["decode_s"] = time.perf_counter() - t0
     if len(out) != len(items):
         raise ClusterError(f"job {jid} returned {len(out)} results for {len(items)} items")
@@ -886,12 +904,15 @@ def _run(fn: Callable[..., Any], mode: str, items: list[Any], o: Opts, pl: Plan 
         if learn:
             _learn(st, pl, len(items), time.perf_counter() - t0, "local", o, fn)
         return out
+    _in_job[0] += 1
     try:
         out = _cluster_run(fn, mode, items, pl, o, st)
     except _Replan as r:
         log.warning("%s", r)
         _learn(st, pl, len(items), time.perf_counter() - t0, "replanned", o, fn)
         return _local(fn, mode, items, pl.local_procs)
+    finally:
+        _in_job[0] -= 1
     _last["wall"] = time.perf_counter() - t0
     if learn:
         _learn(st, pl, len(items), _last["wall"], "cluster", o, fn)
