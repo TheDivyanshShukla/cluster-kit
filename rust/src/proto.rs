@@ -79,6 +79,9 @@ pub const SNAPSHOT_BEGIN: u8 = 29;
 pub const SNAPSHOT_MORE: u8 = 30;
 pub const SNAP_ONE: u64 = 64 << 20;
 pub const SNAP_PIECE: usize = 32 << 20;
+/// Lab head -> root (docs/HIERARCHY.md): a finished piece of a leased range. Same payload as RESULT (56-byte header, then the
+/// merged body of the piece). The root stores it like a result, shrinks the lease, and ACKs it; it is not a request for more work.
+pub const PARTIAL: u8 = 31;
 pub const CANCEL_RANGE: u8 = 28; // head -> worker: job, start, end: stop or skip this one chunk (the other copy won)
 
 pub const KIND_SHA: u8 = 0; // arg = prefix as nibbles; body = (n u64, sha256 [u8; 32])*
@@ -118,6 +121,12 @@ pub struct Inventory {
 //   {"wol": ["aa:bb:..", ..]}       send Wake-on-LAN magic packets on this PC's subnet (a lab-local helper)
 //   {"standby_of": "ip:port"}       start `ck head --standby` on this PC for that head (once; HA-10)
 // agent -> head: {"standby_started": true} | {"standby_failed": "why"}
+//   Hierarchy (docs/HIERARCHY.md):
+//     root -> agent: {"move_to": "ip:port" | null}  connect to this head first (a lab head); null = back to the normal way
+//                    {"start_lab_head": {"lab","parent","port","join_code"}}  start `ck head --parent` beside this agent
+//     root -> lab head: {"hier_job": {...}} job facts for a lease, {"lab_keys": [...]} node keys of its PCs (secured fleets),
+//                    {"lab_release": "ip:port"} send your PCs back to the root, {"lab_exit": true}, {"lab_drain": bool}
+//     lab head -> root: {"lab_status": {...}} every second, {"leases": [[job,a,b]..]} on (re)connect, {"lease_done": {...}}
 //   {"job": {"id": J, "mem_mb": M}}  wave 10b, head -> agent before the first TASK of job J on that agent: cap copies
 //                                    of J's chunks at floor(free RAM x 0.8 / M) (M = 0: no cap)
 
@@ -137,6 +146,19 @@ pub struct Hello {
     /// A head with a lower epoch that verifies it fences itself (no UDP beacons needed). Old heads ignore the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seen_proof: Option<String>,
+    /// Set by a lab head (`ck head --parent`): it joins as one big worker and takes leases (docs/HIERARCHY.md). Old heads ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lab_head: Option<LabHello>,
+}
+
+/// What a lab head says about itself: its lab, the TCP/API ports its PCs and the root reach it on, and how many PCs it serves.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LabHello {
+    pub lab: String,
+    pub port: u16,
+    pub api: u16,
+    #[serde(default)]
+    pub pcs: u32,
 }
 
 pub fn hello_payload(threads: u32, h: &Hello) -> Vec<u8> {
@@ -288,7 +310,7 @@ mod tests {
 
     #[test]
     fn hello_round_trip_and_v1() {
-        let h = Hello { node_id: "abc/v3".into(), host: "lab-a-07".into(), virtual_node: true, inv: Inventory { cores_logical: 12, ..Default::default() }, join_code: None, seen_proof: None };
+        let h = Hello { node_id: "abc/v3".into(), host: "lab-a-07".into(), virtual_node: true, inv: Inventory { cores_logical: 12, ..Default::default() }, join_code: None, seen_proof: None, lab_head: None };
         assert_eq!(parse_hello(&hello_payload(12, &h)), (12, PROTO_VERSION, Some(h)));
         assert_eq!(parse_hello(&8u32.to_le_bytes()), (8, 1, None), "v1 worker");
         let mut buf = vec![];

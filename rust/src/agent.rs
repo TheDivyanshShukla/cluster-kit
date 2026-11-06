@@ -171,7 +171,7 @@ fn reconnect_delay(fails: u32) -> Duration {
     Duration::from_millis((250u64 << (fails - 1).min(4)) * (750 + (n % 500) as u64) / 1000)
 }
 
-fn connect(addr: &str) -> io::Result<TcpStream> {
+pub(crate) fn connect(addr: &str) -> io::Result<TcpStream> {
     let a = addr.to_socket_addrs()?.next().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address"))?;
     TcpStream::connect_timeout(&a, Duration::from_secs(3))
 }
@@ -327,6 +327,70 @@ fn start_standby(head: &str, w: &Mutex<Out>) {
     let _ = w.lock().unwrap().put(CTRL, body.as_bytes());
 }
 
+/// Where to connect first: a lab head the root told us to use (CTRL move_to), with the time until which it counts as dead.
+/// After a session on it ends, the agent uses its normal way (beacon, --head, CK_HEADS: the root) for 30 s; the root sends
+/// move_to again once the lab head is back. Virtual agents of one process share it.
+static PREFER: Mutex<Option<(String, Option<Instant>)>> = Mutex::new(None);
+
+/// CTRL {"move_to": "ip:port" | null} and {"start_lab_head": {...}} (docs/HIERARCHY.md). `cur` is the address of this session.
+fn hier_ctrl(p: &[u8], cur: &str, on_prefer: bool, sock: &TcpStream, w: &Mutex<Out>) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(p) else { return };
+    if let Some(m) = v.get("move_to") {
+        match m.as_str() {
+            Some(addr) => {
+                let addr = hostport(addr);
+                *PREFER.lock().unwrap() = Some((addr.clone(), None));
+                if addr != cur {
+                    crate::say!("agent.move", "moving to lab head {addr}");
+                    let _ = sock.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            None => {
+                *PREFER.lock().unwrap() = None;
+                if on_prefer {
+                    crate::say!("agent.move", "back to the normal head");
+                    let _ = sock.shutdown(std::net::Shutdown::Both);
+                }
+            }
+        }
+    }
+    if let Some(l) = v.get("start_lab_head") {
+        start_lab_head(l, w);
+    }
+}
+
+/// `ck head --parent ROOT --lab LAB` beside this agent (once per lab; a pid file in its data dir guards a restarted agent).
+fn start_lab_head(l: &serde_json::Value, w: &Mutex<Out>) {
+    let (Some(lab), Some(parent), Some(port)) = (l["lab"].as_str(), l["parent"].as_str(), l["port"].as_u64()) else { return };
+    let safe: String = lab.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    let data = std::path::Path::new(&std::env::var("CK_DATA").unwrap_or_else(|_| "ck-data".into())).join(format!("labhead-{safe}"));
+    let pidf = data.join("labhead.pid");
+    if cfg!(unix) && std::fs::read_to_string(&pidf).ok().is_some_and(|p| std::process::Command::new("kill").args(["-0", p.trim()]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())) {
+        return;
+    }
+    let r = std::env::current_exe().and_then(|exe| {
+        std::fs::create_dir_all(&data)?;
+        let mut c = std::process::Command::new(exe);
+        c.args(["head", "--parent", parent, "--lab", lab, "--no-local-worker"]).env("CK_DATA", &data).env("CK_PORT", port.to_string()).stdin(std::process::Stdio::null());
+        if let Some(code) = l["join_code"].as_str() {
+            c.env("CK_JOIN_CODE", code);
+        }
+        c.spawn()
+    });
+    let body = match r {
+        Ok(c) => {
+            crate::say!("agent.lab_head_start", "lab head for '{lab}': started pid {} on port {port}", c.id());
+            let _ = std::fs::write(&pidf, c.id().to_string());
+            serde_json::json!({"lab_head_started": lab}).to_string()
+        }
+        Err(e) => {
+            crate::warnl!("agent.lab_head_start", "lab head for '{lab}': failed to start: {e}");
+            serde_json::json!({"lab_head_failed": e.to_string()}).to_string()
+        }
+    };
+    let _ = w.lock().unwrap().put(CTRL, body.as_bytes());
+}
+
 /// CTRL keys wave 7: power / wol / standby_of (head -> agent).
 fn power_ctrl(p: &[u8], w: &Mutex<Out>) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(p) else { return };
@@ -404,7 +468,8 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
         // after a restart try the head we knew before waiting for a beacon
         let remembered = if first { std::fs::read_to_string(last_head_path()).ok().and_then(|t| parse_last_head(&t)) } else { None };
         first = false;
-        let cur = if heads.is_empty() { head.clone() } else { Some(heads[hi % heads.len()].clone()) };
+        let prefer = PREFER.lock().unwrap().clone().filter(|p| p.1.is_none_or(|t| Instant::now() >= t)).map(|p| p.0);
+        let cur = if prefer.is_some() { prefer.clone() } else if heads.is_empty() { head.clone() } else { Some(heads[hi % heads.len()].clone()) };
         let (ip, epoch) = match (&cur, remembered) {
             (Some(h), _) => (h.clone(), 0),
             (None, Some(r)) => r,
@@ -415,15 +480,15 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
                 crate::say!("agent.connect", "connected to head {ip} ({threads} threads)");
                 // the epoch to beat: what the beacon of this address says now, else what we knew
                 let epoch = SEEN.lock().unwrap().iter().filter(|e| e.0 == name && e.1 == hostport(&ip) && e.2.elapsed() < Duration::from_secs(5)).map(|e| e.3).max().unwrap_or(epoch);
-                if head.is_none() {
+                if head.is_none() && prefer.is_none() {
                     let p = last_head_path();
                     if let Some(d) = p.parent() {
                         let _ = std::fs::create_dir_all(d);
                     }
                     let _ = std::fs::write(p, format!("{} e={epoch}", hostport(&ip)));
                 }
-                let follow = head.is_none().then(|| (name.to_string(), hostport(&ip), epoch));
-                if let Err(e) = work(s, threads as u32, virt, unacked.clone(), follow) {
+                let follow = (head.is_none() && prefer.is_none()).then(|| (name.to_string(), hostport(&ip), epoch));
+                if let Err(e) = work(s, threads as u32, virt, unacked.clone(), follow, hostport(&ip), prefer.is_some()) {
                     crate::warnl!("agent.head_lost", "lost head {ip}: {e}");
                     if e.kind() == io::ErrorKind::PermissionDenied {
                         thread::sleep(Duration::from_secs(28)); // refused: do not hammer the head, an operator has to act
@@ -432,6 +497,16 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
             }
             Err(e) => crate::warnl!("agent.unreachable", "cannot reach head {ip}: {e}"),
         }
+        if let Some(p) = &prefer {
+            // the lab head is gone (or refused): use the normal way for 30 s, and reconnect at once
+            let mut g = PREFER.lock().unwrap();
+            if g.as_ref().is_some_and(|g| &g.0 == p) {
+                *g = Some((p.clone(), Some(Instant::now() + Duration::from_secs(30))));
+            }
+            fails = 0;
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
         hi += 1; // next head in CK_HEADS (a good session ends only when the head is gone or fenced)
         fails = if began.elapsed() > Duration::from_secs(20) { 0 } else { (fails + 1).min(5) };
         thread::sleep(reconnect_delay(fails));
@@ -439,7 +514,7 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
 }
 
 /// Secured fleet, agent side: answer CHALLENGE with the saved key, or take the KEY a join code earns and save it.
-fn admit(s: &mut TcpStream, node_id: &str, kp: &std::path::Path) -> io::Result<(FrameMac, FrameMac)> {
+pub(crate) fn admit(s: &mut TcpStream, node_id: &str, kp: &std::path::Path) -> io::Result<(FrameMac, FrameMac)> {
     let bad = |k, m: String| io::Error::new(k, m);
     match recv(s)? {
         (CHALLENGE, n) => {
@@ -596,7 +671,7 @@ fn note_proof(v: &serde_json::Value) {
     }
 }
 
-fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<Unacked>>, follow: Option<(String, String, u64)>) -> io::Result<()> {
+fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<Unacked>>, follow: Option<(String, String, u64)>, cur_addr: String, on_prefer: bool) -> io::Result<()> {
     // HA-01: a head silent for LOST_AFTER (frozen, cable pulled) errors the reader out.
     // ponytail: with --spin the socket is non-blocking and there is no timeout.
     if !SPIN.load(Relaxed) {
@@ -614,7 +689,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     let secure = !fleet_open();
     let kp = crate::identity::key_path(&node_id);
     let join_code = if secure && !kp.exists() { join_code() } else { None };
-    let hello = Hello { node_id: node_id.clone(), host: crate::identity::host(), virtual_node: virt.is_some(), inv: crate::identity::inventory(), join_code, seen_proof: seen_proof() };
+    let hello = Hello { node_id: node_id.clone(), host: crate::identity::host(), virtual_node: virt.is_some(), inv: crate::identity::inventory(), join_code, seen_proof: seen_proof(), lab_head: None };
     send(&mut s, HELLO_W, &hello_payload(threads, &hello))?;
     let (mac_w, mut mac_r) = if secure { let (w, r) = admit(&mut s, &node_id, &kp)?; (Some(w), Some(r)) } else { (None, None) };
     let sock = s.try_clone()?;
@@ -707,6 +782,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                     crate::tune::apply_remote(&t);
                 }
                 power_ctrl(&p, &w_r);
+                hier_ctrl(&p, &cur_addr, on_prefer, &sock_r, &w_r);
                 crate::kernels::note_job_ctrl(&p);
                 if let Some(secs) = serde_json::from_slice::<serde_json::Value>(&p).ok().and_then(|v| v.get("identify").and_then(|x| x.as_u64())) {
                     identify(secs);

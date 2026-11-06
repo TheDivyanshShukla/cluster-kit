@@ -1,6 +1,6 @@
 //! ck: a general-purpose cluster over raw TCP with a binary protocol. Roadmap: docs/CONSOLE_REQUIREMENTS.md.
 //!
-//!   ck head    [--name lab] [--threads N] [--no-local-worker] [--spin] [--gpu] [--standby --head PRIMARY]
+//!   ck head    [--name lab] [--threads N] [--no-local-worker] [--spin] [--gpu] [--standby --head PRIMARY] [--parent ROOT[:port][,STANDBY..] [--lab NAME]]
 //!   ck agent   [--name lab] [--threads N] [--head IP] [--spin] [--gpu] [--virtual N] [--code JOIN-CODE] [--relay]   (alias: ck worker)
 //!   ck run     [--head IP] --n 1e9 [--from 1] [--chunk 1e7] [--only IP,IP] (--sha PREFIX | --cmd "prog" | --push FILE [--with "interpreter"] | --synth NS_PER_NUMBER) [--selector SEL] [--priority P] [--policy adaptive|guided|fixed] [--reducer R] [--list FILE]
 //!   ck ping    [--head IP] [--count 10000] [--size 8] [--spin]   (round-trip latency / throughput)
@@ -30,11 +30,13 @@ mod dash;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod head;
+mod hier;
 mod identity;
 mod install;
 mod jobcli;
 mod jobs;
 mod kernels;
+mod lab;
 mod log;
 mod presence;
 mod proto;
@@ -109,6 +111,10 @@ pub struct Opts {
     pub priority: Option<String>,
     /// `head --standby --head PRIMARY`: keep a replica and take over when the primary fails (HA-03, repl.rs).
     pub standby: bool,
+    /// `head --parent ROOT[,STANDBY..]`: run as a lab head under that root (docs/HIERARCHY.md).
+    pub parent: Option<String>,
+    /// `head --lab NAME`: the lab this lab head serves (default: --name).
+    pub lab: Option<String>,
     /// `agent --relay`: re-broadcast the head's beacon on this PC's subnet (FLT-05).
     pub relay: bool,
     /// Bare arguments after the command (`ck job show 12` -> ["show", "12"]).
@@ -155,6 +161,8 @@ fn main() {
         priority: None,
         relay: false,
         standby: false,
+        parent: None,
+        lab: None,
         rest: vec![],
         count: 10_000,
         size: 8,
@@ -186,6 +194,8 @@ fn main() {
             "--relay" => o.relay = true,
             "--out" => std::env::set_var("CK_SIM_OUT", args.next().unwrap_or_else(|| die("--out needs a directory"))),
             "--standby" => o.standby = true,
+            "--parent" => o.parent = Some(args.next().unwrap_or_else(|| die("--parent needs ROOT[:port]"))),
+            "--lab" => o.lab = Some(args.next().unwrap_or_else(|| die("--lab needs a name"))),
             // `ck logs` filters, read by log::cli
             "--role" => std::env::set_var("CK_LOGS_ROLE", args.next().unwrap_or_else(|| die("--role needs head|agent|standby|client"))),
             "--since" => std::env::set_var("CK_LOGS_SINCE", args.next().unwrap_or_else(|| die("--since needs e.g. 10m"))),

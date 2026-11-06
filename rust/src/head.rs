@@ -42,10 +42,13 @@ pub struct Job {
     pub shared: Vec<String>, // job-wide blobs (code): every PC that takes a chunk needs them
     pub shards: Vec<String>, // blobs named by @blob: items; item_sha[i] = 0 or 1 + index into shards
     pub item_sha: Vec<u32>,
+    /// May a lab head take leases of it (docs/HIERARCHY.md): any PC may run it, no blobs, built-in kernel.
+    pub lease_ok: bool,
+    pub chunk_set: u64, // the chunk length the submitter asked for (0 = automatic); lab heads cut leases the same way
 }
 
 impl Job {
-    fn has_work(&self) -> bool {
+    pub(crate) fn has_work(&self) -> bool {
         !self.requeue.is_empty() || self.next < self.end
     }
 }
@@ -107,6 +110,21 @@ pub struct Worker {
     pub probe_burst: bool, // this probe only teaches the head its uplink: all PCs at once share it, so the per-PC speed is not stored
     pub blob_rep: bool,                        // the agent has reported its cache at least once
     pub staged: Option<(u64, u64, u64)>,       // a chunk reserved for this PC until its blobs have arrived (also in inflight)
+    // lab heads (src/lab.rs, src/hier.rs)
+    pub lab_pcs: Vec<String>,        // node ids of the PCs under this lab head (counted as connected for quorum)
+    pub lab_stat: serde_json::Value, // its last lab_status
+    pub told_h: BTreeSet<u64>,       // jobs whose CTRL {hier_job} this lab head already got
+    pub drain: bool,                 // no new leases for this lab head
+    pub leases_done: u64,
+    pub joined: Option<Instant>,
+}
+
+/// Leases of a lab head that lost its link but may still be computing them (docs/HIERARCHY.md, partition tolerance).
+pub struct Orphan {
+    pub since: Instant,
+    pub lab: String,
+    pub addr: String,
+    pub leases: Vec<(u64, u64, u64)>,
 }
 
 #[derive(Default)]
@@ -132,6 +150,7 @@ pub struct State {
     pub paused_s: f64,                     // seconds this head did not dispatch (no quorum / halted), finished stretches
     pub pause_since: Option<Instant>,      // start of the current no-dispatch stretch
     pub quotas: HashMap<String, (u32, u32)>, // user -> (max_pcs, max_running); absent or 0 = no limit (SCH-04, meta "quotas")
+    pub orphans: HashMap<String, Orphan>,    // lab head node id -> its leases while it is silent (hier.rs expires them)
 }
 
 fn who_of(w: &Worker) -> (String, String) {
@@ -186,9 +205,9 @@ fn dispatch_ok(role: &str, quorum: bool, standbys: usize, noq_for: Duration) -> 
 }
 
 /// Frames to write once the State lock is released.
-type Sends = Vec<(Arc<Mutex<Out>>, u8, Vec<u8>)>;
+pub(crate) type Sends = Vec<(Arc<Mutex<Out>>, u8, Vec<u8>)>;
 
-fn flush(sends: Sends) {
+pub(crate) fn flush(sends: Sends) {
     for (o, k, p) in sends {
         if k == ACK {
             ACKS.fetch_add(1, Relaxed);
@@ -260,17 +279,37 @@ pub fn recv_any(r: &mut impl Read, mac: &mut Option<FrameMac>) -> io::Result<(u8
 
 
 /// EWMA with alpha 0.3; the first sample is taken as is.
-fn ewma(old: f64, x: f64) -> f64 {
+pub(crate) fn ewma(old: f64, x: f64) -> f64 {
     if old > 0.0 { 0.3 * x + 0.7 * old } else { x }
 }
 
-fn nkey(w: &Worker) -> String {
+pub(crate) fn nkey(w: &Worker) -> String {
     w.hello.as_ref().map_or_else(|| w.addr.clone(), |h| h.node_id.clone())
 }
 
 /// A node may be given new chunks: state allows it, no time rule blocks it, nobody is using it.
 pub(crate) fn can_work(w: &Worker) -> bool {
     takes_tasks(&w.state) && !w.blocked && w.presence != "busy"
+}
+
+/// The lab head behind a worker connection, if it is one.
+pub(crate) fn lab_of(w: &Worker) -> Option<&LabHello> {
+    w.hello.as_ref().and_then(|h| h.lab_head.as_ref())
+}
+
+/// May this worker take a chunk of this job? A PC always may; a lab head only gets leases of leasable jobs while the hierarchy is on.
+pub(crate) fn lab_ok(w: &Worker, j: &Job) -> bool {
+    lab_of(w).is_none() || (j.lease_ok && !w.drain && crate::hier::on())
+}
+
+/// Range handed to a lab head: `lease_s` seconds of its measured speed, at most half of what each live lab could still take.
+pub(crate) fn lease_len(st: &State, w: &Worker, kind: u8, remaining: u64, dflt: u64) -> u64 {
+    let labs = st.workers.values().filter(|o| lab_of(o).is_some() && can_work(o)).count().max(1) as u64;
+    let rate = node_rate(st, w, kind);
+    // guided: at most half of what is left per live lab, but never a sliver (a tail of ever-smaller leases costs a round trip each)
+    let floor = (rate as u64).max(dflt).max(1).min(remaining);
+    let cap = (remaining / (2 * labs)).max(floor);
+    if rate > 0.0 { ((rate * crate::tune::get("lease_s")) as u64).clamp(floor, cap) } else { (dflt * w.threads.max(1) as u64 * 4).min(cap).max(1) } // speed unknown: a few chunks per thread
 }
 
 /// Is a blob missing on this node for chunk [a, b) of the job (job-wide blobs plus the shards its items name)?
@@ -341,7 +380,7 @@ pub fn fleet_rate_for(ctx: &Ctx, selector: &Selector) -> (usize, f64) {
 }
 
 /// Is a chunk still in flight on some connected node (a speculative copy or the original)?
-fn held(st: &State, k: (u64, u64, u64)) -> bool {
+pub(crate) fn held(st: &State, k: (u64, u64, u64)) -> bool {
     st.workers.values().any(|w| w.inflight.contains(&k))
 }
 
@@ -414,7 +453,7 @@ fn next_chunk(requeue: &mut Vec<(u64, u64)>, next: &mut u64, end: u64, chunk: u6
 }
 
 /// Ranges of [from,end) not covered by `done` (sorted, merged), ascending.
-fn gaps(from: u64, end: u64, done: &[(u64, u64)]) -> Vec<(u64, u64)> {
+pub(crate) fn gaps(from: u64, end: u64, done: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let (mut out, mut at) = (vec![], from);
     for &(a, b) in done {
         let (a, b) = (a.max(from), b.min(end));
@@ -595,14 +634,14 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         // fast path, same answer as sched::pick_job with one job and no reserves (which is O(workers) with attrs cloned
         // per node, ~1 ms at 1,000 nodes, under the State lock, once per result)
         let (w, j) = (&st.workers[&wid], st.jobs.values().next()?);
-        (can_work(w) && j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) && j.selector.matches(&w.attrs)).then_some(j.id)?
+        (can_work(w) && j.has_work() && lab_ok(w, j) && (j.only.is_empty() || j.only.contains(&addr)) && j.selector.matches(&w.attrs)).then_some(j.id)?
     } else if st.policy.reserves.is_empty() {
         // same answer as the branch below (sched::pick_job), without a NodeView (two Strings + attrs clone) per node:
         // one pass tallies how many other nodes work for each job, sched::pick_core decides from the tallies
         let jv: Vec<JobView> = st
             .jobs
             .values()
-            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: j.selector.clone(), has_work: j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) && quota_ok(st, j, wid) })
+            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: j.selector.clone(), has_work: j.has_work() && st.workers.get(&wid).is_some_and(|w| lab_ok(w, j)) && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) && quota_ok(st, j, wid) })
             .collect();
         let w = st.workers.get(&wid)?;
         if !can_work(w) {
@@ -625,7 +664,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         let jv: Vec<JobView> = st
             .jobs
             .values()
-            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: j.selector.clone(), has_work: j.has_work() && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) && quota_ok(st, j, wid) })
+            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: j.selector.clone(), has_work: j.has_work() && st.workers.get(&wid).is_some_and(|w| lab_ok(w, j)) && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) && quota_ok(st, j, wid) })
             .collect();
         sched::pick_job(wid, &views, &jv, &st.policy.reserves)?
     };
@@ -643,13 +682,17 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
             }
         }
     };
+    let nodes = nodes + st.workers.values().map(|w| w.lab_pcs.len().saturating_sub(1)).sum::<usize>(); // PCs behind lab heads count: chunks for a PC at the root are sized for the whole fleet
     let j = st.jobs.get(&id)?;
     let node_rate = node_rate(st, &st.workers[&wid], j.kind);
     // A PC runs one chunk at a time and splits a list chunk over its threads (kernels::run_list_par), so a chunk smaller
     // than the PC's thread count leaves threads idle (16 x 0.5 s items on 8 threads took 8 s as 16 chunks of 1). Floor it at
     // the thread count, but never above this PC's share of what is left, so several PCs still split a small job.
     let min = if j.kind == KIND_LIST { (st.workers[&wid].threads as u64).min(remaining.div_ceil(nodes.max(1) as u64)).max(1) } else { 1_000 };
-    let len = sched::chunk_len(j.policy, j.chunk, j.total, remaining, node_rate, fleet_rate, nodes, min, crate::tune::n("max_chunk")).max(1);
+    let mut len = sched::chunk_len(j.policy, j.chunk, j.total, remaining, node_rate, fleet_rate, nodes, min, crate::tune::n("max_chunk")).max(1);
+    if lab_of(&st.workers[&wid]).is_some() {
+        len = lease_len(st, &st.workers[&wid], j.kind, remaining, len);
+    }
     let j = st.jobs.get_mut(&id)?;
     let (mut a, mut b) = next_chunk(&mut j.requeue, &mut j.next, j.end, len)?;
     if !j.blobs.is_empty() && chunk_missing(&st.workers[&wid], j, a, b) {
@@ -685,7 +728,7 @@ fn speculate_take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8
         return None;
     }
     let w = st.workers.get(&wid)?;
-    if !can_work(w) || !w.inflight.is_empty() {
+    if !can_work(w) || !w.inflight.is_empty() || lab_of(w).is_some() {
         return None;
     }
     if !st.policy.reserves.is_empty() && sched::reserved(&node_views(st), &st.policy.reserves).contains(&nkey(w)) {
@@ -693,7 +736,7 @@ fn speculate_take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8
     }
     for j in st.jobs.values().filter(|j| !j.has_work() && j.selector.matches(&w.attrs) && (j.max_pcs == 0 || (st.workers.values().filter(|o| o.inflight.iter().any(|t| t.0 == j.id)).count() as u32) < j.max_pcs) && (j.only.is_empty() || j.only.contains(&w.addr)) && quota_ok(st, j, wid)) {
         let mut infl: Vec<sched::Inflight> = vec![];
-        for (_, h) in st.workers.iter().filter(|(i, _)| **i != wid) {
+        for (_, h) in st.workers.iter().filter(|(i, h)| **i != wid && lab_of(h).is_none()) {
             for k in h.inflight.iter().filter(|k| k.0 == j.id) {
                 let r = node_rate(st, h, j.kind);
                 infl.push(sched::Inflight {
@@ -802,8 +845,7 @@ fn failed(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<()> {
     let mut st = ctx.sh.0.lock().unwrap();
     if let Some(w) = st.workers.get_mut(&wid) {
         w.back += 1;
-        w.inflight.retain(|&t| t != (job, a, b));
-        w.sent.remove(&(job, a, b));
+        drop_within(w, job, a, b);
     }
     settle_drain(ctx, &mut st, wid);
     ctx.sh.1.notify_all(); // a node with nothing in flight may switch job
@@ -836,7 +878,9 @@ fn watchdog(ctx: Arc<Ctx>) {
         let mut late = vec![];
         for (wid, w) in st.workers.iter_mut() {
             w.sent.retain(|k, _| w.inflight.contains(k));
-            late.extend(w.sent.iter().filter(|(k, t)| now.duration_since(**t) > task_limit(w.rate, k.2 - k.1)).map(|(k, _)| (*wid, *k)));
+            if lab_of(w).is_none() {
+                late.extend(w.sent.iter().filter(|(k, t)| now.duration_since(**t) > task_limit(w.rate, k.2 - k.1)).map(|(k, _)| (*wid, *k)));
+            }
         }
         let mut outs = vec![];
         let mut timeout_sends: Sends = vec![];
@@ -889,7 +933,7 @@ fn start_job(ctx: &Ctx, st: &mut State, id: u64) {
     let total = spec.end.saturating_sub(spec.from);
     let todo = gaps(spec.from, spec.end, &ctx.store.done_ranges(id));
     let left: u64 = todo.iter().map(|g| g.1 - g.0).sum();
-    let pcs = st.workers.values().filter(|w| takes_tasks(&w.state) && (spec.only.is_empty() || spec.only.contains(&w.addr)) && selector.matches(&w.attrs)).count();
+    let pcs: usize = st.workers.values().filter(|w| takes_tasks(&w.state) && (spec.only.is_empty() || spec.only.contains(&w.addr)) && selector.matches(&w.attrs)).count() + st.workers.values().map(|w| w.lab_pcs.len()).sum::<usize>();
     // ~16 chunks per PC for load balancing, capped so cancel / the next job waits under a second.
     // ponytail: after a restart no worker has reconnected yet, so assume 4 PCs.
     let lo = if spec.kind == KIND_LIST { 1 } else { 10_000 }; // list items are few and slow: no 10,000 floor
@@ -921,9 +965,11 @@ fn start_job(ctx: &Ctx, st: &mut State, id: u64) {
         }
         shared.retain(|b| !idx.contains_key(b));
     }
+    let lease_ok = spec.selector.trim().is_empty() && spec.only.is_empty() && spec.blobs.is_empty() && spec.max_pcs == 0 && matches!(spec.placement.as_str(), "" | "spread") && matches!(spec.kind, KIND_SHA | KIND_SYNTH);
     st.jobs.insert(id, Job {
         id, kind: spec.kind, arg: spec.arg, next: spec.end, end: spec.end, chunk, total, left, todo: left,
         requeue: todo.into_iter().rev().collect(), only: spec.only, started: Instant::now(), selector, priority: spec.priority, user: spec.submitter.clone(), policy,
+        lease_ok, chunk_set: spec.chunk,
         max_pcs: spec.max_pcs, placement: spec.placement, mem_mb: spec.mem_mb, blobs: spec.blobs, blob_mode: spec.blob_mode, shared, shards, item_sha,
     });
     let p = paused_now(st);
@@ -1434,7 +1480,7 @@ fn covered(a: u64, b: u64, done: &[(u64, u64)]) -> u64 {
 }
 
 /// `r` without `cut`: zero, one or two ranges. Pure.
-fn subtract(r: (u64, u64), cut: (u64, u64)) -> Vec<(u64, u64)> {
+pub(crate) fn subtract(r: (u64, u64), cut: (u64, u64)) -> Vec<(u64, u64)> {
     let ((a, b), (c, d)) = (r, cut);
     if d <= a || c >= b {
         return vec![r];
@@ -1450,7 +1496,7 @@ fn subtract(r: (u64, u64), cut: (u64, u64)) -> Vec<(u64, u64)> {
 }
 
 /// Put `pieces` (ascending) back in the job's queue, minus what is queued or in flight already.
-fn requeue_missing(st: &mut State, job: u64, mut pieces: Vec<(u64, u64)>) {
+pub(crate) fn requeue_missing(st: &mut State, job: u64, mut pieces: Vec<(u64, u64)>) {
     let Some(j) = st.jobs.get(&job) else { return };
     let cuts: Vec<(u64, u64)> = st.workers.values().flat_map(|w| w.inflight.iter().filter(|t| t.0 == job).map(|t| (t.1, t.2))).chain(j.requeue.iter().copied()).collect();
     for c in cuts {
@@ -1461,8 +1507,38 @@ fn requeue_missing(st: &mut State, job: u64, mut pieces: Vec<(u64, u64)>) {
     q.sort_by(|x, y| y.cmp(x));
 }
 
-/// Handle a RESULT; returns the ACK / CANCEL_RANGE frames to send after the lock is released.
+/// Remove from a worker's in-flight list everything inside [a, b) of the job (a lease or chunk, whole or in fragments).
+pub(crate) fn drop_within(w: &mut Worker, job: u64, a: u64, b: u64) {
+    w.inflight.retain(|t| !(t.0 == job && a <= t.1 && t.2 <= b));
+    w.sent.retain(|t, _| !(t.0 == job && a <= t.1 && t.2 <= b));
+}
+
+/// A lab head finished [a, b) of a lease: that piece is no longer in flight on it; what is left of the lease stays.
+fn shrink_lease(w: &mut Worker, job: u64, a: u64, b: u64) {
+    let Some(t) = w.inflight.iter().copied().find(|t| t.0 == job && t.1 <= a && b <= t.2) else { return };
+    let sent = w.sent.remove(&t);
+    w.inflight.retain(|x| *x != t);
+    for (x, y) in subtract((t.1, t.2), (a, b)) {
+        w.inflight.push((job, x, y));
+        if let Some(s) = sent {
+            w.sent.insert((job, x, y), s);
+        }
+    }
+}
+
 fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
+    finish_part(ctx, wid, p, false)
+}
+
+/// PARTIAL from a lab head: a finished piece of a lease, stored like a result, no request for more work.
+fn partial_in(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<()> {
+    let (sends, _) = finish_part(ctx, wid, p, true)?;
+    flush(sends);
+    Ok(())
+}
+
+/// Handle a RESULT (or, with `partial`, a lab head's PARTIAL); returns the ACK / CANCEL_RANGE frames to send after the lock is released.
+pub(crate) fn finish_part(ctx: &Ctx, wid: u64, p: &[u8], partial: bool) -> io::Result<(Sends, bool)> {
     let sh = &ctx.sh;
     let (job, a, b) = (u64_at(p, 0)?, u64_at(p, 8)?, u64_at(p, 16)?);
     let (cpu, mem_used, mem_total) = (u64_at(p, 24)?, u64_at(p, 32)?, u64_at(p, 40)?);
@@ -1475,7 +1551,11 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     let kind = st.jobs.get(&job).map(|j| j.kind);
     let mut upd = None;
     let mut credit = true;
-    if let Some(w) = st.workers.get_mut(&wid) {
+    if let (true, Some(w)) = (partial, st.workers.get_mut(&wid)) {
+        credit = false;
+        w.numbers += b - a;
+        shrink_lease(w, job, a, b);
+    } else if let Some(w) = st.workers.get_mut(&wid) {
         // A RESULT while nothing was fed on this connection is one the agent resent after a failover (it sends them before its
         // first REQ): no credit, and not counted in `back`. Counting them left `back` R ahead of `fed`, so an agent with
         // 2 or more resent results never got another credit and idled for good (r2: 200 agents, 388 resends each).
@@ -1501,10 +1581,12 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
     if st.workers.get(&wid).is_some_and(|w| w.inflight.is_empty()) {
         sh.1.notify_all(); // idle node: may switch job
     }
-    while st.events.len() >= crate::tune::n("max_events") as usize {
-        st.events.pop_front();
+    if !partial {
+        while st.events.len() >= crate::tune::n("max_events") as usize {
+            st.events.pop_front();
+        }
+        st.events.push_back((wid, t0, t1));
     }
-    st.events.push_back((wid, t0, t1));
     let ack_now = |st: &State| -> Sends { st.workers.get(&wid).and_then(|w| w.out.clone()).map(|o| (o, ACK, pack(&[job, a, b]))).into_iter().collect() };
     if !st.jobs.contains_key(&job) {
         return Ok((ack_now(&st), credit)); // stale (cancelled or finished job): the agent may drop its copy
@@ -1543,6 +1625,7 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
         return Ok((ack_now(&st), credit)); // already stored (re-run, speculative copy, or an agent resending after a failover, HA-04): ACK at once
     }
     acct_kept(&mut st, job, wid, b - a, secs);
+    crate::lab::on_part(job, a, b, &p[RESULT_HDR..]); // a lab head: queue it for the next batch upward
     if let Some(f) = &files {
         ctx.store.put_job_files(job, a, b, f);
     }
@@ -1635,7 +1718,7 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
             Err(why) => return deny(&mut s, &ctx, h, &addr, &why),
         }
     }
-    if let Some(p) = hello.as_ref().and_then(|h| h.seen_proof.as_deref()) {
+    if let Some(p) = hello.as_ref().and_then(|h| h.seen_proof.as_deref()).filter(|_| !crate::lab::active()) {
         fence_by_proof(&ctx, p);
     }
     let node = hello.as_ref().map(|h| (h.node_id.clone(), h.host.clone()));
@@ -1650,9 +1733,12 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     let detail = |n: &(String, String)| format!("{} at {addr} (node {})", n.1, n.0); // read by people in the Events page
     if let Some(n) = &node {
         event(&ctx, "node.joined", "head", &detail(n));
+        if let Some(l) = hello.as_ref().and_then(|h| h.lab_head.as_ref()) {
+            event(&ctx, "labhead.join", "head", &format!("lab head {} serves lab {} ({} PCs) at {addr}:{}", n.1, l.lab, l.pcs, l.port));
+        }
     }
     let mut in_mac = key.as_ref().map(|k| FrameMac::new(k));
-    sh.0.lock().unwrap().workers.insert(wid, Worker { addr: addr.clone(), threads, version, hello, state, presence: "idle".into(), ..Default::default() });
+    sh.0.lock().unwrap().workers.insert(wid, Worker { addr: addr.clone(), threads, version, hello, state, presence: "idle".into(), joined: Some(Instant::now()), ..Default::default() });
     if let Some(n) = &node {
         publish_node(&ctx, &sh.0.lock().unwrap(), &n.0);
     }
@@ -1678,7 +1764,18 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
 
     let mut st = sh.0.lock().unwrap();
     let gw = st.workers.remove(&wid);
-    let gone = gw.as_ref().map(|w| w.inflight.clone()).unwrap_or_default();
+    let mut gone = gw.as_ref().map(|w| w.inflight.clone()).unwrap_or_default();
+    // A lab head that went silent (timeout) may still be computing its leases: keep them for lab_silence_s. One that closed the
+    // connection is gone: its leases go back at once.
+    let silent = err.as_ref().is_some_and(|e| matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock));
+    if let (Some(w), Some(n)) = (gw.as_ref().filter(|w| lab_of(w).is_some()), &node) {
+        if silent && !gone.is_empty() && crate::hier::on() {
+            st.orphans.insert(n.0.clone(), Orphan { since: Instant::now(), lab: lab_of(w).map(|l| l.lab.clone()).unwrap_or_default(), addr: addr.clone(), leases: std::mem::take(&mut gone) });
+            event(&ctx, "labhead.partition", "head", &format!("lab head {} of lab {} is silent: its leases are kept for {} s", n.1, lab_of(w).map_or("", |l| l.lab.as_str()), crate::tune::get("lab_silence_s")));
+        } else {
+            event(&ctx, "labhead.leave", "head", &format!("lab head {} of lab {} is gone ({} leases back in the queue)", n.1, lab_of(w).map_or("", |l| l.lab.as_str()), gone.len()));
+        }
+    }
     let mut recovered = 0;
     for t in &gone {
         if held(&st, *t) {
@@ -1732,6 +1829,10 @@ fn read_results(r: &mut impl Read, mac: &mut Option<FrameMac>, ctx: &Ctx, wid: u
                 if !finish_credit(ctx, wid, &p)? {
                     continue; // resent after a failover: no TASK was spent on it
                 }
+            }
+            PARTIAL => {
+                partial_in(ctx, wid, &p)?;
+                continue;
             }
             FAILED => failed(ctx, wid, &p)?,
             CTRL => ctrl_in(ctx, wid, &p),
@@ -1800,6 +1901,7 @@ fn ctrl_in(ctx: &Ctx, wid: u64, p: &[u8]) {
         note_files(f);
         return;
     }
+    crate::hier::lab_ctrl(ctx, wid, &v);
     let mut st = ctx.sh.0.lock().unwrap();
     let blob = crate::blobs::is_ctrl(&v);
     if blob {
@@ -1847,7 +1949,7 @@ fn ctrl_in(ctx: &Ctx, wid: u64, p: &[u8]) {
 fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>) {
     let sh = &ctx.sh;
     while credits.recv().is_ok() {
-        let (job, a, b, kind, arg, mem, jb) = {
+        let (job, a, b, kind, arg, mem, jb, hj) = {
             let mut st = sh.0.lock().unwrap();
             loop {
                 if !st.workers.contains_key(&wid) {
@@ -1856,15 +1958,17 @@ fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>
                 if let Some(t) = take(&mut st, wid).or_else(|| speculate_take(&mut st, wid)) {
                     let mem = st.jobs.get(&t.0).map_or(0, |j| j.mem_mb);
                     let blobs = st.jobs.get(&t.0).map(|j| j.blobs.clone()).unwrap_or_default();
+                    let facts = st.jobs.get(&t.0).map_or((2u8, 0u64, 0u64), |j| (j.priority, j.mem_mb, j.chunk_set));
                     let wk = st.workers.get_mut(&wid).unwrap();
                     let mem = if mem > 0 && wk.told.insert(t.0) { mem } else { 0 };
                     // cmd and list jobs always get this CTRL once: it carries the job-scoped blob upload token too
                     let jb = ((!blobs.is_empty() || matches!(t.3, KIND_CMD | KIND_LIST)) && wk.told_b.insert(t.0)).then_some(blobs);
+                    let hj = (lab_of(wk).is_some() && wk.told_h.insert(t.0)).then_some(facts);
                     wk.inflight.push((t.0, t.1, t.2));
                     wk.fed += 1;
                     wk.sent.insert((t.0, t.1, t.2), Instant::now());
                     crate::lgc!("chunk.dispatch", {"job": t.0, "a": t.1, "b": t.2, "wid": wid});
-                    break (t.0, t.1, t.2, t.3, t.4, mem, jb);
+                    break (t.0, t.1, t.2, t.3, t.4, mem, jb, hj);
                 }
                 // 2 s timeout: an idle node re-checks for an overdue chunk to copy (watchdog also wakes it every 5 s)
                 st = sh.1.wait_timeout(st, Duration::from_secs(2)).unwrap().0;
@@ -1872,6 +1976,9 @@ fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>
         };
         if mem > 0 {
             ctrl_to(&w, serde_json::json!({"job": {"id": job, "mem_mb": mem}}));
+        }
+        if let Some((priority, mem_mb, chunk)) = hj {
+            ctrl_to(&w, serde_json::json!({"hier_job": {"id": job, "priority": priority, "mem_mb": mem_mb, "chunk": chunk}}));
         }
         if let Some(jb) = jb {
             ctrl_to(&w, serde_json::json!({"job_blobs": {"id": job, "blobs": jb, "put": {"port": dash_port(), "token": crate::blobs::put_token(job)}}}));
@@ -2133,7 +2240,9 @@ pub fn run(o: &Opts) {
     load_quotas(&ctx, &mut ctx.sh.0.lock().unwrap());
     init_ha(&ctx);
     resume(&ctx);
-    if !o.no_local && !fleet_open() {
+    let lab_mode = o.parent.is_some();
+    let no_local = o.no_local || lab_mode;
+    if !no_local && !fleet_open() {
         // the head's own worker joins like any PC, with a one-use code made here
         let id = crate::identity::node_id();
         if !crate::identity::key_path(&id).exists() {
@@ -2145,7 +2254,9 @@ pub fn run(o: &Opts) {
     let wd = ctx.clone();
     thread::spawn(move || watchdog(wd));
     let pc = ctx.clone();
-    thread::spawn(move || power_loop(pc));
+    if !lab_mode {
+        thread::spawn(move || power_loop(pc)); // a lab head neither sleeps PCs nor recruits standbys: the root does
+    }
     let rc = ctx.clone();
     thread::spawn(move || research_loop(rc));
     let bc = ctx.clone();
@@ -2164,8 +2275,10 @@ pub fn run(o: &Opts) {
     let name = o.name.clone();
     let _ = CLUSTER.set(name.clone());
     let (cb, cw, n2) = (ctx.clone(), ctx.clone(), o.name.clone());
-    thread::spawn(move || beacon(&cb, &name));
-    thread::spawn(move || watch_epoch(cw, n2));
+    if !lab_mode {
+        thread::spawn(move || beacon(&cb, &name)); // a lab head is found through the root (CTRL move_to), not by beacon
+        thread::spawn(move || watch_epoch(cw, n2)); // and obeys the root's epoch instead of fencing itself
+    }
     let cg = ctx.clone();
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(1));
@@ -2175,7 +2288,12 @@ pub fn run(o: &Opts) {
     thread::spawn(move || crate::api::serve(ctx2));
     let shb = ctx.sh.clone();
     thread::spawn(move || heartbeat_all(shb));
-    if !o.no_local {
+    if lab_mode {
+        crate::lab::start(ctx.clone(), o);
+    } else {
+        crate::hier::start(ctx.clone());
+    }
+    if !no_local {
         let (name, threads) = (o.name.clone(), o.threads);
         let use_gpu = o.gpu;
         thread::spawn(move || crate::agent::worker(Some("127.0.0.1".into()), &name, threads, use_gpu));
@@ -2356,13 +2474,21 @@ fn snap(ctx: &Ctx) -> (Vec<Peer>, Vec<(Selector, u64, u32)>) {
     (peers.collect(), jobs.collect())
 }
 
-fn primary(ctx: &Ctx) -> bool {
+pub(crate) fn primary(ctx: &Ctx) -> bool {
     let st = ctx.sh.0.lock().unwrap();
     !st.halted && !st.gated && crate::repl::status(ctx).role == "primary"
 }
 
-fn ctrl_to(o: &Arc<Mutex<Out>>, v: serde_json::Value) {
+pub(crate) fn ctrl_to(o: &Arc<Mutex<Out>>, v: serde_json::Value) {
     let _ = o.lock().unwrap().put(CTRL, v.to_string().as_bytes());
+}
+
+/// CTRL {"move_to": addr} (null = back to the normal way) to every connected PC of this head.
+pub(crate) fn move_all(ctx: &Ctx, addr: Option<&str>) {
+    let outs: Vec<_> = ctx.sh.0.lock().unwrap().workers.values().filter(|w| lab_of(w).is_none()).filter_map(|w| w.out.clone()).collect();
+    for o in outs {
+        ctrl_to(&o, serde_json::json!({ "move_to": addr }));
+    }
 }
 
 /// Put PCs to sleep: CTRL {"power":"sleep"} to each, remembered as asleep (meta "asleep"). Err if one is not connected.
@@ -2584,14 +2710,14 @@ pub fn tune_changed(ctx: &Ctx) {
 }
 
 /// One PC as a head candidate (HA-10). `lab` is "" without a seat; `why` is "" when it can be a standby.
-struct Cand {
-    id: String,
-    host: String,
-    lab: String,
-    score: f64,
-    parts: [f64; 4],
-    role: &'static str,
-    why: String,
+pub(crate) struct Cand {
+    pub id: String,
+    pub host: String,
+    pub lab: String,
+    pub score: f64,
+    pub parts: [f64; 4],
+    pub role: &'static str,
+    pub why: String,
 }
 
 /// `node.lost` events of the last 24 h per node id. The event detail ends with "(node <id>)".
@@ -2619,7 +2745,7 @@ fn weights() -> sched::HeadWeights {
 }
 
 /// Every known PC scored as a head. `sel` is the standby selector from the HA settings.
-fn cand_list(ctx: &Ctx, sel: &Selector) -> Vec<Cand> {
+pub(crate) fn cand_list(ctx: &Ctx, sel: &Selector) -> Vec<Cand> {
     let rows = ctx.store.nodes();
     let labs: HashMap<u64, String> = ctx.store.labs().into_iter().map(|l| (l.id, l.name)).collect();
     let (peers, _) = snap(ctx);

@@ -368,6 +368,18 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
         ("GET", ["logs"]) => get_logs(r),
         ("GET", ["tunables"]) => json_out(200, json!({"tunables": crate::tune::listing()})),
         ("PUT", ["tunables"]) => put_tunables(ctx, r, me),
+        ("GET", ["hierarchy"]) => json_out(200, crate::hier::json(ctx)),
+        ("PUT", ["hierarchy", "settings"]) => put_hier_settings(ctx, r, me),
+        ("POST", ["hierarchy", "labs", lab, "head"]) => {
+            let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
+            let Some(node) = v["node"].as_str() else { return bad("give {\"node\": NODE_ID}") };
+            match crate::hier::pin(ctx, lab, node, me) { Ok(v) => json_out(200, v), Err(e) => bad(&e) }
+        }
+        ("DELETE", ["hierarchy", "labs", lab, "head"]) => match crate::hier::unpin(ctx, lab, me) { Ok(v) => json_out(200, v), Err(e) => fail(404, "not_found", &e) },
+        ("POST", ["hierarchy", "labs", lab, "drain"]) => {
+            let v = parse_body(r).unwrap_or_else(|_| json!({}));
+            match crate::hier::drain(ctx, lab, v["on"].as_bool().unwrap_or(true), me) { Ok(v) => json_out(200, v), Err(e) => bad(&e) }
+        }
         ("GET", ["ha", "candidates"]) => json_out(200, json!({"candidates": crate::head::candidates(ctx)})),
         ("GET", ["ha", "settings"]) => json_out(200, json!({"settings": ha_settings(ctx)})),
         ("PUT", ["ha", "settings"]) => put_ha_settings(ctx, r, me),
@@ -616,7 +628,7 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
 // ---- fleet (API.md "Fleet")
 
 fn online_ids(ctx: &Ctx) -> std::collections::HashSet<String> {
-    ctx.sh.0.lock().unwrap().workers.values().filter_map(|w| w.hello.as_ref().map(|h| h.node_id.clone())).collect()
+    ctx.sh.0.lock().unwrap().workers.values().flat_map(|w| w.hello.as_ref().map(|h| h.node_id.clone()).into_iter().chain(w.lab_pcs.iter().cloned())).collect() // PCs under a lab head are online too
 }
 
 /// Labels, pools and lab names of every node, loaded once per request (ORG-02..04).
@@ -669,6 +681,8 @@ fn node_json(ctx: &Ctx, n: &NodeRow, online: bool, org: &Org) -> Value {
     let mut v = serde_json::to_value(n).unwrap_or_default();
     v["inventory"] = serde_json::from_str(&n.inventory).unwrap_or(json!({}));
     v["online"] = json!(online);
+    // the lab head this PC works under, if any (it never connected to this head directly)
+    v["via_lab"] = json!(ctx.sh.0.lock().unwrap().workers.values().find(|w| w.lab_pcs.contains(&n.node_id)).and_then(|w| crate::head::lab_of(w).map(|l| l.lab.clone())));
     v["presence"] = json!(org.presence.get(&n.node_id).map_or("idle", String::as_str));
     v["labels"] = json!(org.labels.get(&n.node_id).map(|l| l.iter().cloned().collect::<std::collections::BTreeMap<_, _>>()).unwrap_or_default());
     v["pools"] = json!(org.pools.get(&n.node_id).cloned().unwrap_or_default());
@@ -828,6 +842,30 @@ fn put_tunables(ctx: &Ctx, r: &Req, actor: &str) -> Out {
     audit(ctx, "tune.changed", actor, &diff.join(", "));
     crate::head::tune_changed(ctx);
     json_out(200, json!({"tunables": crate::tune::listing()}))
+}
+
+/// PUT /api/v1/hierarchy/settings {"mode": "off"|"manual"|"auto", "lease_s", "lab_head_min_pcs", "lab_silence_s", "lab_head_standby"}: the same tunables as `ck admin tune`.
+fn put_hier_settings(ctx: &Ctx, r: &Req, actor: &str) -> Out {
+    let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
+    let mut changes: Vec<(String, Option<f64>)> = vec![];
+    for (k, x) in v.as_object().into_iter().flatten() {
+        let n = match (k.as_str(), x) {
+            ("mode", Value::String(m)) => match m.as_str() { "off" => 0.0, "manual" => 1.0, "auto" => 2.0, _ => return bad("mode must be off, manual or auto") },
+            ("lab_head_standby", Value::Bool(b)) => *b as u8 as f64,
+            ("lease_s" | "lab_head_min_pcs" | "lab_silence_s", x) => match x.as_f64() { Some(n) => n, None => return bad(&format!("{k} must be a number")) },
+            _ => return bad("settings: mode (off|manual|auto), lease_s, lab_head_min_pcs, lab_silence_s, lab_head_standby (true|false)"),
+        };
+        changes.push((if k == "mode" { "hier_mode".into() } else { k.clone() }, Some(n)));
+    }
+    let before: Vec<f64> = changes.iter().map(|(k, _)| crate::tune::get(k)).collect();
+    let json = match crate::tune::set(&changes) { Ok(j) => j, Err(e) => return bad(&e) };
+    if let Err(e) = ctx.store.set_meta("tune", &json) {
+        return fail(503, "unavailable", &e);
+    }
+    let diff: Vec<String> = changes.iter().zip(before).map(|((k, _), old)| format!("{k} {old} -> {}", crate::tune::get(k))).collect();
+    audit(ctx, "hier.settings", actor, &diff.join(", "));
+    crate::head::tune_changed(ctx);
+    json_out(200, crate::hier::json(ctx))
 }
 
 fn put_ha_settings(ctx: &Ctx, r: &Req, actor: &str) -> Out {
@@ -2113,7 +2151,7 @@ fn adv_gather(ctx: &Ctx) -> adv::AdvObs {
                         *losses.entry(id.to_string()).or_default() += 1;
                     }
                 }
-                "node.denied" | "task.timeout" if e.ts_ms >= now - 3_600_000 => *o.events.entry(e.kind.clone()).or_default() += 1,
+                "node.denied" | "task.timeout" | "labhead.leave" | "labhead.partition" if e.ts_ms >= now - 3_600_000 => *o.events.entry(e.kind.clone()).or_default() += 1,
                 _ => {}
             }
         }
@@ -2152,6 +2190,16 @@ fn adv_gather(ctx: &Ctx) -> adv::AdvObs {
     o.target_standbys = ctx.store.meta("ha_settings").and_then(|s| serde_json::from_str::<crate::jobs::HaSettings>(&s).ok()).map_or(crate::tune::n("target_standbys") as usize, |h| h.target_standbys as usize);
     o.best_head = head::candidates(ctx).into_iter().find(|c| c["role"] == "candidate" && c["eligible"] == true).and_then(|c| Some((c["node_id"].as_str()?.to_string(), c["host"].as_str()?.to_string(), c["score"].as_f64()?)));
     o.disk = adv_disk();
+    {
+        let (labs, heads, bad) = crate::hier::advice_facts(ctx);
+        let v = crate::hier::json(ctx);
+        o.hier = adv::HierObs {
+            mode: crate::hier::mode(), labs, heads,
+            bad: v["labs"].as_array().into_iter().flatten().filter(|l| l["pinned"].is_string() && matches!(l["state"].as_str(), Some("partitioned" | "released" | "absent"))).map(|l| (l["lab"].as_str().unwrap_or("").to_string(), l["state"].as_str().unwrap_or("").to_string())).collect(),
+            leaves_1h: o.events.get("labhead.leave").copied().unwrap_or(0), partitions_1h: o.events.get("labhead.partition").copied().unwrap_or(0),
+        };
+        let _ = bad;
+    }
     let pw = power_settings(ctx);
     (o.power_mode, o.keep_awake) = (pw.mode, pw.keep_awake);
     o.blob_sent_gb = crate::blobs::SERVED.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;

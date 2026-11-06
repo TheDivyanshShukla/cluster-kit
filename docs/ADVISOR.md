@@ -23,7 +23,10 @@ Kinds are the policy keys. Auto-safe: yes means policy `auto` may do it.
 
 | Situation | How detected | Suggested solution (options) | Action | Auto-safe |
 |---|---|---|---|---|
-| head_hot alert, or PCs wait for the head (dispatch_wait > 15 % of PC time) | alert `head_hot`; breakdown `dispatch_wait` over running/recent jobs | longer chunks (`target_chunk_s` x2); deeper queue (`pipeline` +1); (lab heads: not available yet) | tunable | yes |
+| head_hot alert, or PCs wait for the head (dispatch_wait > 15 % of PC time) | alert `head_hot`; breakdown `dispatch_wait` over running/recent jobs | longer chunks (`target_chunk_s` x2); deeper queue (`pipeline` +1); lab heads (`hier_mode` 2 automatic, or 1 and pin by hand; expected root load from the sim cost model) when a lab has `lab_head_min_pcs` or more PCs | tunable | yes |
+| Pinned lab head partitioned, released or absent | hierarchy tree | move the lab head to the best PC; unpin | steps | no |
+| Lab head lost in the last hour and `lease_s` over 60 s | events `labhead.leave` | halve `lease_s` | tunable | yes |
+| Lab head went silent in the last hour and `lease_s` under 60 s | events `labhead.partition` | double `lease_s` | tunable | yes |
 | flaky_pc alert / node.lost > `alert_flaky_losses` in 24 h | events `node.lost` | drain; cordon; `lost_after_s` x2 (3 or more flaky PCs); look at the PC | node state, tunable, steps | drain yes |
 | slow_pc alert | alert, breakdown tail share | cordon; find the cause | node state, steps | yes |
 | no_standby alert, or no standby configured with 3+ PCs | alert; HA settings | add one standby (`target_standbys` 0 -> 1); make a PC eligible (best PC named from head ranking); lower the target | HA target, steps | no |

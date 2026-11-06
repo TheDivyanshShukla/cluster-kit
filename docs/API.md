@@ -256,6 +256,24 @@ Result upload capability (for bulk results, never the user token): for every cmd
 - `POST /api/v1/sim` is in the role table (researcher) and the CLI map (`ck sim` runs the same scenario locally).
 - New tunables: `out_files_mb`, `blob_partial_ms` (500), `blob_stall_s` (20), `blob_offer_s` (5), `log_batch` (200), `cand_recheck_s` (5); they replace the wave 14 constants.
 
+## Lab heads: the two-level hierarchy
+
+Operator guide: [HIERARCHY.md](HIERARCHY.md). CLI: `ck admin hier`.
+
+| Method and path | Role | Body | Reply |
+|---|---|---|---|
+| GET `/api/v1/hierarchy` | viewer | | the tree (below) |
+| PUT `/api/v1/hierarchy/settings` | admin | `{"mode"?: "off"\|"manual"\|"auto", "lease_s"?, "lab_head_min_pcs"?, "lab_silence_s"?, "lab_head_standby"?: bool}` | the tree. Writes the tunables `hier_mode`, `lease_s`, ... (same store as `PUT /tunables`); audit event `hier.settings` |
+| POST `/api/v1/hierarchy/labs/{lab}/head` | operator | `{"node": NODE_ID}` | `{"lab", "pinned"}`. Pin (promote, or move) the lab head of `lab` to that PC. 400 for an unknown node |
+| DELETE `/api/v1/hierarchy/labs/{lab}/head` | operator | | `{"lab", "pinned": null}`; 404 if nothing was pinned |
+| POST `/api/v1/hierarchy/labs/{lab}/drain` | operator | `{"on"?: true}` | `{"lab", "drain"}`; `false` undoes it |
+
+Tree: `{"mode", "active" (leases are being granted), "paused" (reason or null), "settings", "root": {"node_id", "role", "epoch", "addr", "pcs_direct"}, "standbys": [node ids], "labs": [Lab], "orphans": [{"node_id", "lab", "leases", "silent_s", "expires_in_s"}], "unleasable_jobs": [job ids]}`. Lab = `{"lab", "pinned", "drain", "state": "active"|"partitioned"|"released"|"absent"|"none", "pcs_at_root", "pcs": [{"id", "host", "threads", "busy"}] (under the lab head), "silent_s", "orphaned_leases", "head": null | {"node_id", "host", "addr", "port", "api", "connected_s", "pcs", "threads", "leases" (as the lab head sees them: job, a, b, got, finished, age_s), "root_inflight" (as the root sees them), "granted_in_flight", "lab_granted", "lab_done", "leases_done", "lag_s" (age of its last status), "unacked", "partitioned", "released", "rate", "chunks_inflight"}}`.
+
+SSE `event` carries `labhead.join`, `labhead.leave`, `labhead.partition`, `labhead.heal`, `labhead.lease` (live, not stored), `hier.*`. New tunables (group Hierarchy): `hier_mode`, `lease_s`, `lab_head_min_pcs`, `lab_silence_s`, `lab_head_standby`, `lab_head_port`, `lab_part_s`.
+
+Wire (agents and heads only): `HELLO_W`'s Hello gains `lab_head {lab, port, api, pcs}`; frame `PARTIAL` (31) = a RESULT-shaped finished piece of a lease; CTRL keys `move_to`, `start_lab_head`, `hier_job`, `lab_keys`, `lab_release`, `lab_adopt`, `lab_exit`, `lab_drain` (root to agent/lab head) and `lab_status`, `leases`, `lease_done` (lab head to root). Old agents ignore every new key and frame.
+
 ## Advisor
 
 Suggestions next to the alerts; rules, options and the catalogue are in [ADVISOR.md](ADVISOR.md).

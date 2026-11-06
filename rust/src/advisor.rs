@@ -230,6 +230,22 @@ pub struct AdvObs {
     pub power_mode: String,
     pub keep_awake: u32,
     pub blob_sent_gb: f64,
+    pub hier: HierObs,
+}
+
+/// What the advisor knows about the two-level hierarchy (docs/HIERARCHY.md).
+#[derive(Clone, Debug, Default)]
+pub struct HierObs {
+    /// hier_mode: 0 off, 1 manual, 2 auto
+    pub mode: u8,
+    /// (lab, PCs in it) for every lab the root knows PCs of
+    pub labs: Vec<(String, usize)>,
+    pub heads: usize,
+    /// Labs with a pinned lab head that is partitioned, released or absent: (lab, state)
+    pub bad: Vec<(String, String)>,
+    /// `labhead.leave` / `labhead.partition` events in the last hour
+    pub leaves_1h: u32,
+    pub partitions_1h: u32,
 }
 
 impl AdvObs {
@@ -358,6 +374,23 @@ pub fn advise(o: &AdvObs, now: i64) -> Vec<Suggestion> {
                 .metric("dispatch_share", ds, ds * 0.5).cost(&format!("coarser chunks: the tail of each job grows by up to ~{new} s")).tte("jobs started after the change")
                 .conf(format!("{basis}; model: wait per number scales with 1/chunk length (rule of thumb)")).check("dispatch_share (breakdown) falls by half within 10 min of work").score(ds * 50.0 + if head_hot { 20.0 } else { 0.0 }));
         }
+        let big: Vec<&(String, usize)> = o.hier.labs.iter().filter(|l| l.1 >= o.t("lab_head_min_pcs") as usize).collect();
+        if (head_hot || ds > 0.15) && o.hier.mode == 0 && !big.is_empty() {
+            let pcs: usize = o.hier.labs.iter().map(|l| l.1).sum();
+            let (b1, b2, bl) = crate::sim::hier_model(pcs, big.len(), cur, o.t("lease_s"));
+            opts.push(Opt::new("lab_heads_auto", &format!("Lab heads, automatic: hier_mode 0 -> 2 ({} lab(s) of {} PCs or more)", big.len(), o.t("lab_head_min_pcs")))
+                .act(Action::Tune { key: "hier_mode".into(), from: 0.0, to: 2.0 })
+                .eff(format!("root busy ~{} -> ~{} of one core, each lab head ~{}; the head stops being the limit", pc(b1), pc(b2), pc(bl)))
+                .metric("dispatch_share", ds, ds * 0.3).cost("PCs reconnect once (about 2 s); a lab head loss costs ~2 s and a lease of recomputed work; jobs with a selector, blobs or a command/list kind pause the hierarchy")
+                .risk("med", true).tte("about 10 s").conf(format!("model: sim.rs cost model, {pcs} PCs, chunks {cur} s, lease {} s (docs/sim/HIERARCHY.md); measured on 1 machine in docs/HIERARCHY.md", o.t("lease_s")))
+                .check("dispatch_share falls and head_hot clears within 10 min").score(ds * 90.0 + if head_hot { 40.0 } else { 0.0 }));
+            opts.push(Opt::new("lab_heads_manual", "Lab heads, by hand: hier_mode 0 -> 1, then pin the PC you want per lab")
+                .act(Action::Tune { key: "hier_mode".into(), from: 0.0, to: 1.0 })
+                .steps(&["ck admin heads            (best PCs to host a lab head)", "ck admin hier pin LAB NODE_ID   (one per lab)"])
+                .eff(format!("same as automatic for the labs you pin: root busy ~{} -> ~{}", pc(b1), pc(b2))).metric("dispatch_share", ds, ds * 0.3)
+                .cost("you choose and keep an eye on the lab heads").risk("low", true).tte("minutes").conf("model: sim.rs cost model (docs/sim/HIERARCHY.md)".into())
+                .check("ck admin hier shows the lab heads active").score(ds * 60.0));
+        }
         if pipe < 16.0 {
             opts.push(Opt::new("pipeline_up", &format!("Queue deeper: pipeline {pipe} -> {}", pipe + 1.0))
                 .act(Action::Tune { key: "pipeline".into(), from: pipe, to: pipe + 1.0 }).auto()
@@ -369,6 +402,40 @@ pub fn advise(o: &AdvObs, now: i64) -> Vec<Suggestion> {
             "the head keeps spending its CPU on tiny chunks; PCs keep waiting between them".into()));
         if head_hot {
             out.last_mut().unwrap().id = "head_hot".into();
+        }
+    }
+
+    // lab heads that are not doing their job, and the lease length
+    for (lab, state) in &o.hier.bad {
+        let mut opts = vec![];
+        let best = o.best_head.as_ref().map(|b| format!("ck admin hier pin {lab} {}   ({}, score {:.2})", b.0, b.1, b.2)).unwrap_or_else(|| format!("ck admin hier pin {lab} NODE_ID   (see ck admin heads)"));
+        opts.push(Opt::new("move", "Move the lab head to another PC").steps(&[&best, "the old lab head hands its PCs back and exits; the new one is started on that PC"])
+            .eff("the lab's PCs run under a healthy lab head again; until then they work for the root directly".into()).cost("PCs of the lab reconnect once").risk("low", true).tte("about 20 s")
+            .conf(format!("measured: the lab head of '{lab}' is {state}")).check("ck admin hier shows the lab 'active'").score(60.0));
+        opts.push(Opt::new("unpin", "Unpin it: let the root choose again (auto mode) or leave the lab without a lab head").steps(&[&format!("ck admin hier unpin {lab}")])
+            .eff("the lab's PCs stay on the root; with hier_mode auto a new lab head is chosen by the head ranking".into()).cost("none").risk("low", true).tte("seconds").conf("rule of thumb".into()).check("the lab shows a lab head or its PCs at the root").score(40.0));
+        out.push(sug(format!("lab_head:{lab}"), "lab_head", "warn", format!("The lab head of '{lab}' is {state}"), format!("pinned lab head for '{lab}' is {state}; its PCs are not served by it"), 20.0, opts,
+            "the lab's PCs keep working for the root directly; the root loses the saving".into()));
+    }
+    {
+        let ls = o.t("lease_s");
+        if o.hier.mode > 0 && o.hier.leaves_1h > 0 && ls > 60.0 {
+            let to = bounded("lease_s", ls / 2.0);
+            out.push(sug("lease_long".into(), "lease_length", "tip", format!("Leases are long: {} lab head loss(es) in the last hour", o.hier.leaves_1h),
+                format!("lab head lost {} time(s) in the last hour; lease_s is {ls} s; a lost lab head costs about 0.75 s of job time per second of lease (simulated)", o.hier.leaves_1h), 120.0,
+                vec![Opt::new("lease_down", &format!("Shorter leases: lease_s {ls} -> {to} s")).act(Action::Tune { key: "lease_s".into(), from: ls, to }).auto()
+                    .eff(format!("work redone after a lab head loss falls from ~{ls} s to ~{to} s of the lab's work")).cost("a few more lease messages (root load stays under 2 % in the model)").tte("next lease").conf("model: docs/sim/HIERARCHY.md section 3 (4): loss grows linearly with L".into())
+                    .check("the next lab head loss recomputes less (job.breakdown recompute share)").score(35.0)],
+                "a lab head loss keeps costing a whole lease of recomputed work".into()));
+        }
+        if o.hier.mode > 0 && o.hier.partitions_1h > 0 && ls < 60.0 {
+            let to = bounded("lease_s", ls * 2.0);
+            out.push(sug("lease_short".into(), "lease_length", "tip", format!("Leases are short: {} lab head partition(s) in the last hour", o.hier.partitions_1h),
+                format!("a lab head went silent {} time(s) in the last hour (link or root stalls); lease_s is {ls} s, so its PCs idle once the leases run out", o.hier.partitions_1h), 120.0,
+                vec![Opt::new("lease_up", &format!("Longer leases: lease_s {ls} -> {to} s")).act(Action::Tune { key: "lease_s".into(), from: ls, to }).auto()
+                    .eff(format!("a lab keeps computing through a root outage or partition of up to ~{to} s instead of ~{ls} s")).cost("a lab head loss recomputes up to a lease more").tte("next lease")
+                    .conf("model: docs/sim/HIERARCHY.md section 3 (3): work in a partition window grows with L".into()).check("fewer idle PC-seconds during the next partition").score(35.0)],
+                "labs run out of leased work during short outages".into()));
         }
     }
 
@@ -737,6 +804,29 @@ mod tests {
         assert_eq!(r.action, Some(Action::Tune { key: "target_chunk_s".into(), from: 1.0, to: 2.0 }));
         assert!(d.options.last().unwrap().id == "nothing");
         assert!(advise(&AdvObs { jobs: vec![AdvJob { bd: Some(bd(50.0)), ..job() }], ..Default::default() }, 5).is_empty(), "5 % wait is fine");
+    }
+
+    #[test]
+    fn lab_head_rules() {
+        let mut o = AdvObs { jobs: vec![AdvJob { bd: Some(bd(250.0)), ..job() }], nodes: (0..5).map(|i| node(&i.to_string(), "active", true, 0)).collect(), ..Default::default() };
+        o.hier.labs = vec![("A".into(), 40), ("B".into(), 3)];
+        let s = advise(&o, 5);
+        let d = s.iter().find(|s| s.id == "dispatch_wait").unwrap();
+        let lab = d.options.iter().find(|o| o.id == "lab_heads_auto").expect("offered when a lab has enough PCs");
+        assert_eq!(lab.action, Some(Action::Tune { key: "hier_mode".into(), from: 0.0, to: 2.0 }));
+        assert!(lab.expected_effect.contains("root busy"), "{}", lab.expected_effect);
+        o.hier.mode = 2;
+        assert!(!advise(&o, 5).iter().find(|s| s.id == "dispatch_wait").unwrap().options.iter().any(|o| o.id.starts_with("lab_heads")), "already on");
+        o.hier.bad = vec![("A".into(), "partitioned".into())];
+        o.tun.insert("lease_s".into(), 120.0);
+        o.hier.leaves_1h = 2;
+        let s = advise(&o, 5);
+        assert!(ids(&s).contains(&"lab_head:A") && ids(&s).contains(&"lease_long"), "{:?}", ids(&s));
+        assert_eq!(s.iter().find(|s| s.id == "lease_long").unwrap().action, Some(Action::Tune { key: "lease_s".into(), from: 120.0, to: 60.0 }));
+        o.tun.insert("lease_s".into(), 10.0);
+        o.hier.partitions_1h = 1;
+        o.hier.leaves_1h = 0;
+        assert!(ids(&advise(&o, 5)).contains(&"lease_short"));
     }
 
     #[test]

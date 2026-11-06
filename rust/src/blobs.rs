@@ -659,7 +659,9 @@ pub fn probe(src: &Source, mb: f64) -> io::Result<(f64, f64, f64)> {
 // ------------------------------------------------------------------ agent --
 /// Where the agent's head is (for CTRL sources that say "the head").
 pub static HEAD_IP: Mutex<String> = Mutex::new(String::new());
-static FETCHING: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+/// Downloads in flight in this process -> the other connections that asked for the same blob meanwhile (virtual agents share one process and one
+/// cache; each connection must still hear "have" for it, or the head keeps waiting to stage a chunk on a PC that already holds the blob).
+static FETCHING: LazyLock<Mutex<HashMap<String, Vec<Arc<Mutex<Out>>>>>> = LazyLock::new(Default::default);
 static JOB_BLOBS: Mutex<Vec<(u64, Vec<String>, Option<(u16, String)>)>> = Mutex::new(Vec::new());
 
 /// Shas in the cache (complete files only).
@@ -735,8 +737,13 @@ pub fn agent_ctrl(v: &Value, w: &Arc<Mutex<Out>>) {
         let hashes: Option<Vec<[u8; 32]>> = f["pieces"].as_array().and_then(|a| a.iter().map(|h| unhex(h.as_str()?)?.try_into().ok()).collect());
         let (Some(hashes), Some(size), Some(piece)) = (hashes, f["size"].as_u64(), f["piece"].as_u64().filter(|p| *p > 0)) else { return };
         let srcs = sources(f);
-        if !FETCHING.lock().unwrap().insert(sha.clone()) {
-            return; // already on its way
+        {
+            let mut f = FETCHING.lock().unwrap();
+            if let Some(waiting) = f.get_mut(&sha) {
+                waiting.push(w.clone()); // already on its way: answer this connection when it lands
+                return;
+            }
+            f.insert(sha.clone(), vec![]);
         }
         let w = w.clone();
         thread::spawn(move || {
@@ -745,13 +752,18 @@ pub fn agent_ctrl(v: &Value, w: &Arc<Mutex<Out>>) {
                 Ok(g) => {
                     let gone = evict(&cache_dir(), (crate::tune::get("blob_cache_gb") * 1073741824.0) as u64, &[sha.clone()]);
                     info_log("blob.fetch", json!({"sha": sha, "bytes": g.bytes, "peer_bytes": g.peer_bytes, "source": g.from, "ms": g.ms, "evicted": gone.len()}));
-                    FETCHING.lock().unwrap().remove(&sha);
+                    let waiting = FETCHING.lock().unwrap().remove(&sha).unwrap_or_default();
+                    for o in &waiting {
+                        report_have(o, json!({}));
+                    }
                     report_have(&w, json!({"fetched": {"sha": sha, "bytes": g.bytes, "peer_bytes": g.peer_bytes, "from": g.from, "ms": g.ms}}));
                 }
                 Err(e) => {
                     crate::warnl!("blob.fetch_failed", "blob {}: {e}", &sha[..12]);
-                    FETCHING.lock().unwrap().remove(&sha);
-                    let _ = w.lock().unwrap().put(proto::CTRL, json!({"fetch_failed": {"sha": sha, "error": e.to_string()}}).to_string().as_bytes());
+                    let waiting = FETCHING.lock().unwrap().remove(&sha).unwrap_or_default();
+                    for o in std::iter::once(&w).chain(waiting.iter()) {
+                        let _ = o.lock().unwrap().put(proto::CTRL, json!({"fetch_failed": {"sha": sha, "error": e.to_string()}}).to_string().as_bytes());
+                    }
                 }
             }
         });

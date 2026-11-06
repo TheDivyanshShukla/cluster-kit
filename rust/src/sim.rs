@@ -1258,6 +1258,20 @@ impl HSim<'_> {
     }
 }
 
+/// Closed-form busy share of one core (docs/sim/HIERARCHY.md section 1) for the advisor: (1-level root, 2-level root, one lab head).
+/// Messages cost `svc + svc_agent x connected agents`; the root of a 2-level fleet sees one agent per lab, 2 lease messages per lease,
+/// one heartbeat every `hb_s` and one batch of finished pieces (`lab_part_s`, 0.5 s) per lab; a lab head also pays `merge` per chunk.
+/// (The built lab head batches, so the root does not pay `root_merge` per chunk as the study assumed.)
+pub fn hier_model(pcs: usize, labs: usize, chunk_s: f64, lease_s: f64) -> (f64, f64, f64) {
+    let s = HScn::default();
+    let (p, l) = (pcs as f64, labs.max(1) as f64);
+    let tasks = p / chunk_s.max(1e-3);
+    let one = tasks * (s.svc + s.svc_agent * p);
+    let root = l * (2.0 / lease_s.max(1e-3) + 1.0 / s.hb_s + 2.0 / crate::tune::get("lab_part_s").max(0.05)) * (s.svc + s.svc_agent * l);
+    let lab = tasks / l * (s.svc + s.svc_agent * p / l + s.merge);
+    (one.min(1.0), root.min(1.0), lab.min(1.0))
+}
+
 pub fn hsim(s: &HScn) -> HOut {
     let mut dr = Rng(s.seed ^ 0xA5A5_5A5A_1234_4321);
     let lp = s.lab_pcs.max(1);
@@ -1410,6 +1424,16 @@ fn hier_study(dir: &str) {
 fn lab_cap(s: &HScn) -> f64 {
     let mut dr = Rng(s.seed ^ 0xA5A5_5A5A_1234_4321);
     (0..s.pcs).map(|i| (i, dr.mult(s.speed_cv))).filter(|(i, _)| *i < s.lab_pcs).map(|(_, v)| v).sum()
+}
+
+#[cfg(test)]
+mod hier_model_tests {
+    #[test]
+    fn model_matches_the_study_table() {
+        // docs/sim/HIERARCHY.md (1): 1,000 PCs on 0.1 s chunks saturate one head; labs of 40 leave the root at under 1 %
+        let (one, root, lab) = super::hier_model(1000, 25, 0.1, 30.0);
+        assert!(one >= 0.99 && root < 0.05 && (0.1..0.3).contains(&lab), "{one} {root} {lab}");
+    }
 }
 
 #[cfg(test)]

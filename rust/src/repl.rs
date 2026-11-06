@@ -270,7 +270,7 @@ pub fn connected(ctx: &Ctx) -> usize {
 /// Re-read the connected nodes from the head state, expire old members, clear "candidate" once a quorum is back and
 /// replicate membership changes. Takes the State lock briefly: do not call it while holding that lock.
 pub fn refresh(ctx: &Ctx) {
-    let ids: HashSet<String> = ctx.sh.0.lock().unwrap().workers.values().filter_map(|w| w.hello.as_ref().map(|h| h.node_id.clone())).collect();
+    let ids: HashSet<String> = ctx.sh.0.lock().unwrap().workers.values().flat_map(|w| w.hello.as_ref().map(|h| h.node_id.clone()).into_iter().chain(w.lab_pcs.iter().cloned())).collect(); // PCs under a lab head count as connected
     let mut g = init(ctx);
     let now = Instant::now();
     for id in &ids {
@@ -338,7 +338,7 @@ pub fn config_entry(ctx: &Ctx) -> Value {
 }
 
 /// Store meta keys copied to standbys inside "config" entries (power, standby target, every tunable).
-pub const SETTINGS_META: &[&str] = &["power", "ha_settings", "tune", "asleep", "fence_key", "quotas"];
+pub const SETTINGS_META: &[&str] = &["power", "ha_settings", "tune", "asleep", "fence_key", "quotas", "hier"];
 
 /// Fence key: 32 random bytes in store meta (replicated to standbys, so a promoted standby has it). Epoch beacons that
 /// can fence a head or redirect a standby are signed with it; an unsigned `ck/1` beacon is only for agents, who follow
@@ -798,7 +798,7 @@ fn session(store: &mut Store, path: &Path, mut s: TcpStream, sb: &mut Sb) -> io:
     s.set_nodelay(true)?;
     s.set_read_timeout(Some(proto::lost_after() + crate::tune::secs("standby_step_s").mul_f64(sb.priority as f64)))?;
     let node = crate::identity::node_id();
-    let hello = Hello { node_id: node.clone(), host: crate::identity::host(), virtual_node: false, inv: crate::identity::inventory(), join_code: std::env::var("CK_JOIN_CODE").ok(), seen_proof: None };
+    let hello = Hello { node_id: node.clone(), host: crate::identity::host(), virtual_node: false, inv: crate::identity::inventory(), join_code: std::env::var("CK_JOIN_CODE").ok(), seen_proof: None, lab_head: None };
     let mut applied = num(store.meta("last_seq"));
     send(&mut s, proto::HELLO_S, &hello_s_payload(&hello, applied, num(store.meta("epoch"))))?;
     let mut r = io::BufReader::new(s.try_clone()?);

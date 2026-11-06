@@ -83,6 +83,10 @@ Test the failover on one machine any time with `scripts/chaos.sh`. It prints PAS
   - Put the night's PCs in a pool or label, and pass it with `--selector "pool=night"`.
   - Make sure no class reservation covers the time of the run.
 
+## 5b. Lab heads (hundreds of PCs)
+
+One root head saturates at about 500 PCs on 0.1 s chunks and 1,000 on 0.5 s (simulated; [sim/HIERARCHY.md](sim/HIERARCHY.md)). Past that, start one lab head per lab: `ck head --parent ROOT_IP:7700 --lab A` on a PC of the lab, `ck agent --head LABHEAD_IP:PORT` for the lab's PCs, and `ck admin hier settings mode=manual`. Or `mode=auto` and the root picks the best PC of each lab with at least `lab_head_min_pcs` PCs and starts it. `ck admin hier` shows who serves whom; `ck admin hier drain LAB` and `unpin` take a lab head out; `mode=off` returns everything to the root in the middle of a job. A dead lab head costs about 2 s and the chunks in flight; a frozen root is ridden out for one to two leases (`lease_s`, 30 s). Full guide: [HIERARCHY.md](HIERARCHY.md).
+
 ## 6. Backups and moving the head
 
 - **Everything is in `ck-data/head.db`** (SQLite). The standbys each hold a full copy that is replicated continuously, so losing the head PC loses nothing.

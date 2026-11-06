@@ -213,6 +213,7 @@ pub fn token(o: &Opts) {
 pub const CLI_MAP: &[(&str, &str, &str)] = &[
     ("GET", "/me", "no CLI needed: session"), ("GET", "/ha", "ck admin ha"), ("POST", "/ha/switchover", "ck admin switchover NODE"),
     ("POST", "/nodes/power", "ck admin sleep|wake"), ("GET", "/power", "ck admin power"), ("PUT", "/power", "ck admin power"), ("GET", "/ha/settings", "ck admin standbys"), ("PUT", "/ha/settings", "ck admin standbys"), ("GET", "/tunables", "ck admin tune"), ("PUT", "/tunables", "ck admin tune KEY VALUE|default"), ("GET", "/ha/candidates", "ck admin heads"), ("GET", "/logs", "ck logs"),
+    ("GET", "/hierarchy", "ck admin hier"), ("PUT", "/hierarchy/settings", "ck admin hier settings"), ("POST", "/hierarchy/labs/{lab}/head", "ck admin hier pin LAB NODE"), ("DELETE", "/hierarchy/labs/{lab}/head", "ck admin hier unpin LAB"), ("POST", "/hierarchy/labs/{lab}/drain", "ck admin hier drain LAB [off]"),
     ("GET", "/jobs/{id}/breakdown", "ck job breakdown ID"), ("GET", "/alerts", "ck admin alerts"), ("GET", "/advice", "ck admin advice"), ("GET", "/advice/history", "ck admin advice history"), ("PUT", "/advice/settings", "ck admin advice policy|on|off"), ("POST", "/advice/{id}/{op}", "ck admin advice preview|apply|undo|dismiss ID"), ("POST", "/alerts/{id}/ack", "ck admin alerts ack ID"),
     ("POST", "/experiments", "ck admin experiment upload DIR [NAME]"), ("GET", "/experiments", "ck admin experiment ls"), ("GET", "/experiments/{id}", "ck admin experiment show ID"), ("GET", "/report", "ck admin report [DAY]"), ("POST", "/bootstrap", "no CLI needed: first-run setup in the browser"),
     ("POST", "/login", "ck token"), ("POST", "/logout", "no CLI needed: session"), ("POST", "/tokens", "ck token"),
@@ -284,7 +285,7 @@ fn fmt_local(ms: i64, offset_min: i64) -> String {
 }
 
 fn usage_admin() -> ! {
-    die("usage: ck admin backup [PATH] | nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | net [probe] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | identify NODE... [SECS] | quota USER MAX_PCS MAX_RUNNING | heads | tune [KEY VALUE|default] | alerts [ack ID] | advice [preview|apply ID [OPTION] | undo ID | dismiss ID [HOURS] | history | policy KIND off|suggest|auto|default | on | off] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
+    die("usage: ck admin backup [PATH] | nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | net [probe] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | identify NODE... [SECS] | quota USER MAX_PCS MAX_RUNNING | heads | tune [KEY VALUE|default] | hier [settings KEY=VALUE.. | pin LAB NODE | unpin LAB | drain LAB [off]] | alerts [ack ID] | advice [preview|apply ID [OPTION] | undo ID | dismiss ID [HOURS] | history | policy KIND off|suggest|auto|default | on | off] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
 }
 
 fn send(o: &Opts, method: &str, path: &str, body: Value) -> Value {
@@ -519,6 +520,34 @@ pub fn admin(o: &Opts) {
             println!("{:>5}  {:<14} {:<12} {:<10} {:<9} why not", "score", "host", "lab", "role", "eligible");
             for c in v["candidates"].as_array().cloned().unwrap_or_default() {
                 println!("{:>5}  {:<14} {:<12} {:<10} {:<9} {}", dash(&c["score"]), dash(&c["host"]), dash(&c["lab"]), dash(&c["role"]), dash(&c["eligible"]), c["why"].as_str().unwrap_or(""));
+            }
+        }
+        Some("hier") => {
+            let sub = rest.get(1).map(String::as_str);
+            let v = match sub {
+                Some("settings") => {
+                    let mut body = serde_json::Map::new();
+                    for kv in &rest[2..] {
+                        let Some((k, x)) = kv.split_once('=') else { die("settings: KEY=VALUE ... (mode=off|manual|auto lease_s=30 lab_head_min_pcs=8 lab_silence_s=90 lab_head_standby=true)") };
+                        body.insert(k.into(), match x { "true" => true.into(), "false" => false.into(), _ => x.parse::<f64>().map_or_else(|_| x.into(), Value::from) });
+                    }
+                    send(o, "PUT", "/api/v1/hierarchy/settings", Value::Object(body))
+                }
+                Some("pin") if rest.len() == 4 => { send(o, "POST", &format!("/api/v1/hierarchy/labs/{}/head", enc(&rest[2])), serde_json::json!({"node": rest[3]})); call(o, "GET", "/api/v1/hierarchy") }
+                Some("unpin") if rest.len() == 3 => { call(o, "DELETE", &format!("/api/v1/hierarchy/labs/{}/head", enc(&rest[2]))); call(o, "GET", "/api/v1/hierarchy") }
+                Some("drain") if rest.len() >= 3 => { send(o, "POST", &format!("/api/v1/hierarchy/labs/{}/drain", enc(&rest[2])), serde_json::json!({"on": rest.get(3).map(String::as_str) != Some("off")})); call(o, "GET", "/api/v1/hierarchy") }
+                None => call(o, "GET", "/api/v1/hierarchy"),
+                _ => die("usage: ck admin hier [settings KEY=VALUE.. | pin LAB NODE | unpin LAB | drain LAB [off]]"),
+            };
+            let s = &v["settings"];
+            println!("hierarchy {}{}  lease {} s  min PCs {}  silence {} s", dash(&v["mode"]), if v["active"] == true { "" } else { " (inactive)" }, dash(&s["lease_s"]), dash(&s["lab_head_min_pcs"]), dash(&s["lab_silence_s"]));
+            if let Some(p) = v["paused"].as_str() { println!("paused: {p}"); }
+            println!("root {}  epoch {}  {} PC(s) direct", dash(&v["root"]["addr"]), dash(&v["root"]["epoch"]), dash(&v["root"]["pcs_direct"]));
+            println!("{:<14} {:<12} {:<12} {:>4} {:>8} {:>10} {:>6}  HEAD", "LAB", "STATE", "PINNED", "PCS", "LEASES", "GRANTED", "LAG");
+            for l in v["labs"].as_array().cloned().unwrap_or_default() {
+                let hd = &l["head"];
+                println!("{:<14} {:<12} {:<12} {:>4} {:>8} {:>10} {:>6}  {}", dash(&l["lab"]), dash(&l["state"]), dash(&l["pinned"]), hd["pcs"].as_u64().unwrap_or(0) + l["pcs_at_root"].as_u64().unwrap_or(0),
+                    dash(&hd["leases_done"]), dash(&hd["granted_in_flight"]), dash(&hd["lag_s"]), if hd.is_object() { format!("{} {}:{}", dash(&hd["host"]), dash(&hd["addr"]), dash(&hd["port"])) } else { "-".into() });
             }
         }
         Some("tune") => {
