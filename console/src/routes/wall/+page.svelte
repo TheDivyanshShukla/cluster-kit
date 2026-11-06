@@ -45,7 +45,8 @@
 
 <svelte:head><title>Wall · Cluster Kit</title></svelte:head>
 
-<div class="bg-background text-foreground flex h-dvh flex-col gap-[1.5vh] overflow-hidden p-[1.4vw]">
+<main class="bg-background text-foreground flex h-dvh flex-col gap-[1.5vh] overflow-hidden p-[1.4vw]">
+	<h1 class="sr-only">Cluster wall</h1>
 	<a href="/" class="bg-primary text-primary-foreground sr-only rounded-lg px-3 py-2 focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50">Leave wall mode</a>
 	<div class="flex flex-col gap-[1vw] lg:flex-row">
 	<div class="grid min-w-0 flex-1 grid-cols-2 gap-[1vw] md:grid-cols-4 lg:grid-cols-2">
@@ -131,4 +132,4 @@
 			{#each ticker as t (t.id)}<li class="truncate transition-opacity duration-700" style="opacity:{t.fade}">{t.text}</li>{/each}
 		</ul>
 	{/if}
-</div>
+</main>

@@ -52,7 +52,7 @@
 					{ key: 'role', label: 'Role', w: '76px', sort: true },
 					{ key: 'pcs', label: 'PCs', w: '64px' },
 					{ key: 'run', label: 'Jobs', w: '64px' },
-					{ key: 'save', label: '', w: '62px' }
+					{ key: 'save', label: 'Save', hideLabel: true, w: '62px' }
 				]
 			: [
 					{ key: 'name', label: 'Name', w: 'minmax(120px,1fr)', sort: true },
@@ -60,7 +60,7 @@
 					{ key: 'created', label: 'Created', w: '170px', sort: true },
 					{ key: 'pcs', label: 'Max PCs', w: '96px' },
 					{ key: 'run', label: 'Max running', w: '104px' },
-					{ key: 'save', label: '', w: '84px' }
+					{ key: 'save', label: 'Save', hideLabel: true, w: '84px' }
 				]
 	);
 	// quota editor: 0 means no limit. A draft exists only while the numbers differ from the saved ones.

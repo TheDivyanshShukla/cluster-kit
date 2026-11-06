@@ -29,12 +29,13 @@
 </script>
 
 <div class="relative min-h-0 flex-1 {cls}">
+	<!-- svelte-ignore a11y_no_noninteractive_tabindex (keyboard users scroll a region that has more content) -->
 	<div
 		bind:this={el}
 		bind:clientHeight={viewH}
 		class="thin absolute inset-0 overflow-auto overscroll-contain [overflow-anchor:none]"
 		onscroll={(e) => (upd(), onscroll?.(e))}
-		tabindex="-1"
+		tabindex={more.t || more.b ? 0 : -1}
 	>
 		<div class="min-h-full min-w-0">{@render children()}</div>
 	</div>

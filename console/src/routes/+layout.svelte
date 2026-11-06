@@ -82,6 +82,7 @@
 {:else if page.url.pathname === '/wall'}
 	{@render children()}
 {:else}
+	<a href="#main" class="bg-primary text-primary-foreground sr-only rounded-lg px-3 py-2 text-[13px] font-medium focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-50">Skip to main content</a>
 	<div class="flex h-dvh flex-col overflow-hidden md:flex-row">
 		<aside class="border-line bg-surface flex shrink-0 items-center gap-1 border-b px-3 py-1.5 md:h-dvh md:w-52 md:flex-col md:items-stretch md:border-r md:border-b-0 md:px-3 md:py-4">
 			<a href="/" class="mr-2 flex items-center gap-2 px-2 font-semibold tracking-tight md:mr-0 md:mb-5" aria-label="Cluster Kit home">
@@ -106,7 +107,7 @@
 				{/each}
 			</nav>
 			<div class="ml-auto flex items-center gap-1 md:mt-auto md:ml-0 md:flex-col md:items-stretch">
-				<p class="text-muted-foreground hidden px-2.5 pb-1 text-xs md:block" aria-live="polite">
+				<p class="text-muted-foreground hidden px-2.5 pb-1 text-xs md:block">
 					{#if live.link === 'reconnecting'}
 						<span class="text-warn inline-flex items-center gap-1"><WifiOff class="size-3.5" aria-hidden="true" />Reconnecting…</span>
 					{:else}
@@ -142,7 +143,7 @@
 				</details>
 			</div>
 		</aside>
-		<main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden p-3 md:p-4">
+		<main id="main" tabindex="-1" class="flex min-h-0 outline-none min-w-0 flex-1 flex-col overflow-hidden p-3 md:p-4">
 			{#if isStandby()}<div class="mb-3 shrink-0"><HaBanners /></div>{/if}
 			{#if live.link === 'reconnecting' && !isStandby()}
 				<p class="bg-raised border-line text-warn mb-3 flex shrink-0 items-center gap-2 rounded-lg border px-3 py-2 text-[13px]" role="status">

@@ -75,7 +75,7 @@
 		{ key: 'cpu', label: 'CPU', w: '88px', right: true, sort: true },
 		{ key: 'rate', label: 'Rate', w: '104px', right: true, sort: true, min: 1100 }
 	];
-	const cols = $derived<Col[]>([...(canAct ? [{ key: 'sel', label: '', w: '36px' }] : []), ...COLS.filter((c) => vp.w >= (c.min ?? 0))]);
+	const cols = $derived<Col[]>([...(canAct ? [{ key: 'sel', label: 'Select', hideLabel: true, w: '36px' }] : []), ...COLS.filter((c) => vp.w >= (c.min ?? 0))]);
 
 	function open(i: Item) {
 		focus = i.node.node_id;

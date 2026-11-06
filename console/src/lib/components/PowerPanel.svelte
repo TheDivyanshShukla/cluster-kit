@@ -45,7 +45,7 @@
 	}
 </script>
 
-<section class={bare ? '' : `${card} px-4 py-4`} aria-label="Power">
+<section class={bare ? '' : `${card} px-4 py-4`}>
 	{#if !bare}<div class="flex flex-wrap items-center justify-between gap-2">
 		<h2 class="flex items-center gap-2 font-medium"><Power class="text-muted-foreground size-4" aria-hidden="true" />Power</h2>
 	</div>{/if}

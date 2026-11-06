@@ -326,7 +326,19 @@
 		return { extra, host: it.node.host, lab, state: CLS_WORDS[cls], job: job == null ? null : `#${job} ${live.jobs[job]?.name ?? ''}`.trim(), rate: it.w && it.w.rate > 0 ? rate(it.w.rate) : null, last: ev ? ev.detail || ev.kind : null };
 	});
 	const jobs = $derived([...runningJobs(live.cluster)].sort((a, b) => a.id - b.id).slice(0, 8));
-	const summary = $derived(`Live system: ${total} PCs, ${counts.busy} working, ${counts.asleep} asleep, ${counts.lost} lost.`);
+	const summaryNow = $derived(`Live system: ${total} PCs, ${counts.busy} working, ${counts.asleep} asleep, ${counts.lost} lost.`);
+	// screen readers hear the counts at most every 20 s, not on every tick
+	let summary = $state('');
+	let said = 0;
+	$effect(() => {
+		const s = summaryNow;
+		const wait = Math.max(0, said + 20_000 - Date.now());
+		const t = setTimeout(() => ((summary = s), (said = Date.now())), wait);
+		return () => clearTimeout(t);
+	});
+	// text alternative to the canvas: a keyboard-reachable list of PCs (first 200, hidden until it has focus)
+	let listOpen = $state(false);
+	const pcList = $derived(listOpen ? engine?.items.slice(0, 200) ?? [] : []);
 	const sw: Record<Cls, string> = {
 		busy: 'bg-primary border-primary',
 		idle: 'bg-surface border-idle',
@@ -353,6 +365,16 @@
 		ondblclick={() => !wall && engine?.resetView()}
 	></canvas>
 	<p class="sr-only" aria-live="polite">{summary}</p>
+	{#if !wall}
+		<details class="bg-surface border-line sr-only z-30 rounded-lg border focus-within:not-sr-only focus-within:absolute focus-within:top-2 focus-within:left-2" ontoggle={(e) => (listOpen = e.currentTarget.open)}>
+			<summary class="cursor-pointer px-3 py-1.5 text-xs font-medium">PCs as a list ({total})</summary>
+			<ul class="thin max-h-64 overflow-auto py-1 text-xs">
+				{#each pcList as it (it.node.node_id)}
+					<li><button type="button" class="hover:bg-raised flex w-full gap-2 px-3 py-1 text-left" onclick={() => onpick?.(it.node.node_id)}><span class="font-medium">{it.node.host}</span><span class="text-muted-foreground">{it.node.online ? it.node.state : 'offline'}</span></button></li>
+				{/each}
+			</ul>
+		</details>
+	{/if}
 
 	{#if !engine || (!live.cluster && total === 0)}
 		<div class="absolute inset-0 grid grid-cols-2 gap-3 p-4" aria-busy="true">

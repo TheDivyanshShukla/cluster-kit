@@ -85,13 +85,13 @@
 					<legend class="mb-1 text-xs font-medium">Start (date YYYY-MM-DD, time HH:MM)</legend>
 					<input class={field} bind:value={f.startDate} inputmode="numeric" maxlength="10" placeholder="2026-11-05" aria-label="Start date" aria-invalid={!!errors.start} autocomplete="off" />
 					<input class={field} bind:value={f.startTime} inputmode="numeric" maxlength="5" placeholder="09:00" aria-label="Start time" aria-invalid={!!errors.start} autocomplete="off" />
-					<span class="text-bad col-span-2 text-xs">{errors.start ?? ''}</span>
+					<span class="text-bad col-span-2 text-xs" role="alert">{errors.start ?? ''}</span>
 				</fieldset>
 				<fieldset class="grid grid-cols-[1fr_6rem] gap-2">
 					<legend class="mb-1 text-xs font-medium">End (date YYYY-MM-DD, time HH:MM)</legend>
 					<input class={field} bind:value={f.endDate} inputmode="numeric" maxlength="10" placeholder="2026-11-05" aria-label="End date" aria-invalid={!!errors.end} autocomplete="off" />
 					<input class={field} bind:value={f.endTime} inputmode="numeric" maxlength="5" placeholder="17:00" aria-label="End time" aria-invalid={!!errors.end} autocomplete="off" />
-					<span class="text-bad col-span-2 text-xs">{errors.end ?? ''}</span>
+					<span class="text-bad col-span-2 text-xs" role="alert">{errors.end ?? ''}</span>
 				</fieldset>
 			</div>
 			<div class="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">

@@ -62,7 +62,7 @@
 	}
 </script>
 
-<section aria-label="Timetable">
+<section>
 	<h2 class="sr-only">Timetable</h2>
 	<p class="text-muted-foreground mt-0.5 text-[13px]">Weekly windows when matching PCs take no jobs, or fewer threads. Times are the head's local time (India by default). A window that ends before it starts runs overnight.</p>
 	{#if error}<p class="text-bad mt-2 text-[13px]" role="alert">{error}</p>{/if}
@@ -124,7 +124,7 @@
 						<button type="button" aria-pressed={f.days.has(i)} onclick={() => toggle(i)} class="border-line rounded-lg border px-3 py-1.5 text-[13px] {f.days.has(i) ? 'bg-primary text-primary-foreground border-primary' : 'bg-surface hover:bg-raised'}">{d}</button>
 					{/each}
 				</div>
-				<span class="text-bad mt-1 block text-xs">{errors.days ?? ''}</span>
+				<span class="text-bad mt-1 block text-xs" role="alert">{errors.days ?? ''}</span>
 			</fieldset>
 			<div class="grid gap-3 sm:grid-cols-[7rem_7rem_auto_7rem_1fr] sm:items-start">
 				<label class="block"><span class="mb-1 block text-xs font-medium">From (HH:MM)</span><input class={field} bind:value={f.start} inputmode="numeric" maxlength="5" placeholder="09:00" autocomplete="off" aria-invalid={!!errors.start} /><span class="text-bad mt-1 block text-xs">{errors.start ?? ''}</span></label>

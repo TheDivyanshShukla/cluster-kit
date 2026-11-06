@@ -73,7 +73,7 @@
 		{ key: 'detail', label: 'What happened', w: 'minmax(160px,3fr)', min: 1000 },
 		{ key: 'since', label: 'Opened', w: '120px', sort: true },
 		{ key: 'status', label: 'Status', w: '150px', sort: true, min: 700 },
-		{ key: 'ack', label: '', w: '88px', min: 700 }
+		{ key: 'ack', label: 'Acknowledge', hideLabel: true, w: '88px', min: 700 }
 	];
 	const cols = $derived<Col[]>(COLS.filter((c) => vp.w >= (c.min ?? 0) && (c.key !== 'ack' || canAck)));
 

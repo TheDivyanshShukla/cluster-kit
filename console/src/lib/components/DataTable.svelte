@@ -7,6 +7,8 @@
 		right?: boolean;
 		/** sortable (the key is the sorter name) */
 		sort?: boolean;
+		/** label is for screen readers only (icon / checkbox / action columns) */
+		hideLabel?: boolean;
 	}
 </script>
 
@@ -91,13 +93,11 @@
 								<span class="truncate">{c.label}</span>
 								{#if sort === c.key}{#if dir === 'asc'}<ArrowUp class="size-3 shrink-0" aria-hidden="true" />{:else}<ArrowDown class="size-3 shrink-0" aria-hidden="true" />{/if}{:else}<ArrowUpDown class="size-3 shrink-0 opacity-40" aria-hidden="true" />{/if}
 							</button>
-						{:else}<span class="truncate font-medium">{c.label}</span>{/if}
+						{:else}<span class="truncate font-medium {c.hideLabel ? 'sr-only' : ''}">{c.label}</span>{/if}
 					</div>
 				{/each}
 			</div>
-			{#if rows.length === 0}
-				{#if empty}{@render empty()}{/if}
-			{:else}
+			{#if rows.length > 0}
 				<div style={windowed ? `height:${rows.length * rowH}px;position:relative` : ''}>
 					<div style={windowed ? `position:absolute;inset-inline:0;top:${win.start * rowH}px` : ''}>
 						{#each slice as r, i (rowKey(r))}
@@ -120,6 +120,7 @@
 				</div>
 			{/if}
 		</div>
+		{#if rows.length === 0 && empty}{@render empty()}{/if}
 	</ScrollFade>
 	{#if fresh > 0}
 		<button type="button" class="bg-primary text-primary-foreground absolute top-10 left-1/2 z-30 -translate-x-1/2 rounded-full px-3 py-1 text-xs font-medium shadow-lg" onclick={toTop}>{fresh} new</button>

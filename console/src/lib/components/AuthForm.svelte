@@ -45,7 +45,7 @@
 			<span class="mb-1 block text-xs font-medium">Password</span>
 			<input class={field} type="password" bind:value={password} autocomplete={bootstrap ? 'new-password' : 'current-password'} required aria-describedby="pw-hint" />
 			{#if bootstrap}
-				<span id="pw-hint" class="mt-1 block text-xs {short ? 'text-bad' : 'text-muted-foreground'}">At least 12 characters.</span>
+				<span id="pw-hint" class="mt-1 block text-xs {short ? 'text-bad' : 'text-muted-foreground'}" aria-live="polite">At least 12 characters.</span>
 			{/if}
 		</label>
 

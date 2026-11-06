@@ -109,7 +109,7 @@
 								<span class="text-muted-foreground w-14 shrink-0 truncate text-xs" title={t.unit}>{t.unit}</span>
 								<button type="button" class="{btnGhost} size-9 shrink-0 px-0" aria-label="Reset {t.key} to {fmtNum(t.default)}" title="Reset to default ({fmtNum(t.default)})" disabled={ro || Number(shownValue(t)) === t.default} onclick={() => reset(t)}><RotateCcw class="size-4" aria-hidden="true" /></button>
 							</div>
-							<p class="mt-1 text-xs {err ? 'text-bad' : 'text-muted-foreground'}">{err ?? `${rangeHint(t)} · default ${fmtNum(t.default)}`}</p>
+							<p class="mt-1 text-xs {err ? 'text-bad' : 'text-muted-foreground'}" aria-live="polite">{err ?? `${rangeHint(t)} · default ${fmtNum(t.default)}`}</p>
 						</div>
 					</li>
 				{/each}

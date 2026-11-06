@@ -149,9 +149,9 @@
 				onclick={() => l.toggle(f.key, c.value)}
 				class="inline-flex h-6 items-center gap-1 rounded-full border px-2 text-xs whitespace-nowrap max-sm:h-8 {c.active
 					? 'border-primary bg-primary/10 text-foreground font-medium'
-					: 'border-line text-muted-foreground hover:bg-raised hover:text-foreground'} {c.count === 0 && !c.active ? 'opacity-50' : ''}"
+					: 'border-line text-muted-foreground hover:bg-raised hover:text-foreground'} "
 			>
-				{f.text?.(c.value) ?? c.value}<span class="num opacity-70">{c.count}</span>
+				{f.text?.(c.value) ?? c.value}<span class="num">{c.count}</span>
 			</button>
 		{/each}
 	</div>

@@ -180,19 +180,19 @@
 			<label class="block">
 				<span class="mb-1 block text-xs font-medium">Work per number (ns)</span>
 				<input class={field} type="number" inputmode="numeric" min="1" step="1" bind:value={form.synth_ns} oninput={clear('synth_ns')} aria-invalid={!!errors.synth_ns} aria-describedby="e-synth_ns" />
-				<span id="e-synth_ns" class="text-bad mt-1 block text-xs">{errors.synth_ns ?? ''}</span>
+				<span id="e-synth_ns" class="text-bad mt-1 block text-xs" role="alert">{errors.synth_ns ?? ''}</span>
 			</label>
 		{:else if form.kind === 'sha'}
 			<label class="block">
 				<span class="mb-1 block text-xs font-medium">SHA-256 to find (hex)</span>
 				<input class="{field} font-mono" bind:value={form.sha} oninput={clear('sha')} autocomplete="off" spellcheck="false" maxlength="64" aria-invalid={!!errors.sha} aria-describedby="e-sha" />
-				<span id="e-sha" class="text-bad mt-1 block text-xs">{errors.sha ?? ''}</span>
+				<span id="e-sha" class="text-bad mt-1 block text-xs" role="alert">{errors.sha ?? ''}</span>
 			</label>
 		{:else if form.kind === 'list'}
 			<label class="block">
 				<span class="mb-1 block text-xs font-medium">Command (each item arrives on its standard input)</span>
 				<input class="{field} font-mono" bind:value={form.cmd} oninput={clear('cmd')} autocomplete="off" spellcheck="false" aria-invalid={!!errors.cmd} aria-describedby="e-cmd" />
-				<span id="e-cmd" class="text-bad mt-1 block text-xs">{errors.cmd ?? ''}</span>
+				<span id="e-cmd" class="text-bad mt-1 block text-xs" role="alert">{errors.cmd ?? ''}</span>
 			</label>
 			<div>
 				<div class="mb-1 flex flex-wrap items-center justify-between gap-2">
@@ -206,7 +206,7 @@
 			<label class="block">
 				<span class="mb-1 block text-xs font-medium">Command</span>
 				<input class="{field} font-mono" bind:value={form.cmd} oninput={clear('cmd')} autocomplete="off" spellcheck="false" aria-invalid={!!errors.cmd} aria-describedby="e-cmd" />
-				<span id="e-cmd" class="text-bad mt-1 block text-xs">{errors.cmd ?? ''}</span>
+				<span id="e-cmd" class="text-bad mt-1 block text-xs" role="alert">{errors.cmd ?? ''}</span>
 			</label>
 		{/if}
 
@@ -215,17 +215,17 @@
 			<label class="block">
 				<span class="mb-1 block text-xs font-medium">Count (n)</span>
 				<input class={field} type="number" inputmode="numeric" min="1" step="1" bind:value={form.n} oninput={clear('n')} aria-invalid={!!errors.n} aria-describedby="e-n" />
-				<span id="e-n" class="text-bad mt-1 block text-xs">{errors.n ?? ''}</span>
+				<span id="e-n" class="text-bad mt-1 block text-xs" role="alert">{errors.n ?? ''}</span>
 			</label>
 			<label class="block">
 				<span class="mb-1 block text-xs font-medium">Start at (from)</span>
 				<input class={field} type="number" inputmode="numeric" min="0" step="1" bind:value={form.from} oninput={clear('from')} aria-invalid={!!errors.from} aria-describedby="e-from" />
-				<span id="e-from" class="text-bad mt-1 block text-xs">{errors.from ?? ''}</span>
+				<span id="e-from" class="text-bad mt-1 block text-xs" role="alert">{errors.from ?? ''}</span>
 			</label>
 			<label class="block">
 				<span class="mb-1 block text-xs font-medium">Chunk size</span>
 				<input class={field} type="number" inputmode="numeric" min="0" step="1" bind:value={form.chunk} oninput={clear('chunk')} aria-invalid={!!errors.chunk} aria-describedby="e-chunk" />
-				<span id="e-chunk" class="text-muted-foreground mt-1 block text-xs {errors.chunk ? 'text-bad' : ''}">{errors.chunk || '0 lets the head choose.'}</span>
+				<span id="e-chunk" class="text-muted-foreground mt-1 block text-xs {errors.chunk ? 'text-bad' : ''}" aria-live="polite">{errors.chunk || '0 lets the head choose.'}</span>
 			</label>
 		</div>
 		{/if}
@@ -258,7 +258,7 @@
 				<label class="block">
 					<span class="mb-1 block text-xs font-medium">Use at most this many PCs (empty = all)</span>
 					<input class={field} type="number" inputmode="numeric" min="1" step="1" placeholder="All PCs" bind:value={form.max_pcs} oninput={clear('max_pcs')} aria-invalid={!!errors.max_pcs} aria-describedby="e-max_pcs" />
-					<span id="e-max_pcs" class="text-bad mt-1 block text-xs">{errors.max_pcs ?? ''}</span>
+					<span id="e-max_pcs" class="text-bad mt-1 block text-xs" role="alert">{errors.max_pcs ?? ''}</span>
 				</label>
 				<div>
 					<p class="mb-1 text-xs font-medium">Placement</p>
@@ -268,7 +268,7 @@
 				<label class="block">
 					<span class="mb-1 block text-xs font-medium">Memory per copy, MB (optional)</span>
 					<input class={field} type="number" inputmode="numeric" min="1" step="1" placeholder="Not set" bind:value={form.mem_mb} oninput={clear('mem_mb')} aria-invalid={!!errors.mem_mb} aria-describedby="e-mem_mb" />
-					<span id="e-mem_mb" class="text-muted-foreground mt-1 block text-xs {errors.mem_mb ? 'text-bad' : ''}">{errors.mem_mb || 'Each PC runs only as many copies as fit in its free memory.'}</span>
+					<span id="e-mem_mb" class="text-muted-foreground mt-1 block text-xs {errors.mem_mb ? 'text-bad' : ''}" aria-live="polite">{errors.mem_mb || 'Each PC runs only as many copies as fit in its free memory.'}</span>
 				</label>
 			</div>
 		</details>
