@@ -118,7 +118,7 @@ Counted with the new `GET /api/v1/wire` (frames and bytes per kind, HTTP request
 | (c) root + 2 labs, longer chunks | 1,086 | 661, -39 % | 1.71 s, same |
 | (d) SDK run with 300 KB of shared blobs (first / repeat) | 48 / 8 HTTP requests, 88 / 84 frames | 19 / 9 HTTP, 52 / 41 frames | 10.0 / 9.1 s to 11.7 / 10.5 s (noise) |
 | (e) `ck.map`, 400 items (first / same call again) | 23 / 16 HTTP requests | 7 / 5 | 5.1 / 3.8 s to 6.7 / 5.2 s (noise; remote Python start dominates) |
-| (f) console first load | 1 page + 69 static files + 16 API GETs + 1 SSE; `ha/settings` and `select` fetched 3 times each | not changed (console is outside this task) | |
+| (f) console first load | 1 page + 69 static files + 16 API GETs + 1 SSE; `ha/settings` and `select` fetched 3 times each; 823 KB of uncompressed JS/CSS | 1 page + 3 static files (one JS bundle, one CSS, one font) + 12 API GETs + 1 SSE; 247 KB on the wire (pre-compressed gzip) | commits 7ebccd1, 2278315 |
 
 What changed:
 
