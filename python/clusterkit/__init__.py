@@ -1,7 +1,11 @@
 """Cluster Kit Python SDK: run ordinary Python work on the lab cluster. Standard library only. See docs/SDK.md."""
 from __future__ import annotations
-import ast, base64, functools, itertools, json, logging, math, os, pickle, resource, sys, threading, time, urllib.error, urllib.request, zlib
+import ast, base64, functools, gzip, itertools, json, logging, math, os, pickle, sys, threading, time, urllib.error, urllib.request, zlib
 import tracemalloc
+try:
+    import resource
+except ImportError:  # Windows: no getrusage; peak memory then comes from tracemalloc alone
+    resource = None  # type: ignore[assignment]
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generic, Literal, TypedDict, TypeVar, overload
@@ -110,6 +114,7 @@ def _http(method: str, path: str, body: Any = None, text: bool = False, timeout:
             req.add_header("Content-Length", str(length))
     if _cfg["token"]:
         req.add_header("Authorization", "Bearer " + _cfg["token"])
+    req.add_header("Accept-Encoding", "gzip")  # the head compresses big JSON (/cluster is ~0.5 MB per 1,000 PCs)
     # while a job runs, reads wait for a failover: the standby takes over the same address within seconds and keeps the job (CK_FAILOVER_SECS, default 60)
     deadline = time.monotonic() + (float(os.environ.get("CK_FAILOVER_SECS") or 60) if _in_job[0] and method in ("GET", "HEAD") else 0.0)
     tries = 0
@@ -117,6 +122,8 @@ def _http(method: str, path: str, body: Any = None, text: bool = False, timeout:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 data = r.read()
+                if r.headers.get("Content-Encoding") == "gzip":
+                    data = gzip.decompress(data)
             if tries:
                 _reconnected[0] = True
             break
@@ -388,7 +395,7 @@ def _profile(fn: Callable[..., Any], mode: str, items: list[Any], limit: float =
     # item 0 runs once under tracemalloc (peak memory; also the only timing when items are slow, so a 2 s item is not run twice);
     # the next ones run untraced and give the time per item. Item 0 runs in a thread so a hung function cannot hang the
     # caller: past `limit` it counts as a `limit`-second item (the plan then sends the work to the cluster, where timeout_s applies).
-    rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource else 0
     t0 = time.perf_counter()
     box: dict[str, Any] = {}
 
@@ -412,7 +419,7 @@ def _profile(fn: Callable[..., Any], mode: str, items: list[Any], limit: float =
     peak = box.get("peak", 0)
     first = time.perf_counter() - t0
     scale = 1 if sys.platform == "darwin" else 1024
-    rss = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss0) * scale
+    rss = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss0) * scale if resource else 0
     t0, rest = time.perf_counter(), {"done": 0}
 
     def more_items() -> None:  # untraced timing of a few more items, also in a thread: any one of them may hang

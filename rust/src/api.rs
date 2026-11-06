@@ -2079,7 +2079,13 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
     let req = Req { method: rq.method().as_str().to_string(), path: path.to_string(), query, cookie, bearer, body, ip, gz };
     let out = if req.body.len() > mb("max_body_mb") && !(req.method == "POST" && matches!(req.path.as_str(), "/api/v1/jobs" | "/api/v1/experiments")) { bad(&format!("body is over {} MB", crate::tune::get("max_body_mb"))) } else { route(ctx, auth, &req) };
     let _ = match out {
-        Out::Plain { status, ctype, headers, body } => {
+        Out::Plain { status, ctype, mut headers, mut body } => {
+            // big JSON (nodes, cluster, candidates: ~0.7 MB per 1,000 PCs) goes compressed when the client takes gzip (~30-50x smaller)
+            if gz && body.len() >= 16 << 10 && ctype.starts_with("application/json") && !headers.iter().any(|h| h.0 == "Content-Encoding") {
+                body = crate::gz::gzip(&body);
+                headers.push(("Content-Encoding", "gzip".into()));
+                headers.push(("Vary", "Accept-Encoding".into()));
+            }
             let mut r = Response::from_data(body).with_status_code(status).with_header(header("Content-Type", ctype));
             for (k, v) in headers {
                 r.add_header(header(k, &v));

@@ -5,6 +5,7 @@ Served by `ck head` on the dashboard port (`CK_PORT` + 2, default 7702), togethe
 ## Conventions
 
 - JSON in and out. Times are Unix milliseconds (`*_ms`). Big counts are plain numbers (all fit in 2^53).
+- Send `Accept-Encoding: gzip` and JSON replies of 16 KB or more come gzip-compressed (`/nodes` for 1,000 PCs: 679 KB -> 20 KB). The console files are stored pre-compressed. The Python SDK asks for it; `curl --compressed` does too.
 - Errors: HTTP status plus `{"error": {"code": "...", "message": "..."}}`. Codes: `invalid_request` 400, `unauthorized` 401, `forbidden` 403, `not_found` 404, `conflict` 409, `too_many_requests` 429, `unavailable` 503.
 - Pages: `?limit=` (default 50, max 500) and `?before=<id>`; the reply has `next` (the `before` value for the next page) or `null`.
 

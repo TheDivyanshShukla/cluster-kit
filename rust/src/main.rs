@@ -27,6 +27,7 @@ mod auth;
 mod blobs;
 mod client;
 mod dash;
+mod gz;
 #[cfg(feature = "gpu")]
 mod gpu;
 mod head;
