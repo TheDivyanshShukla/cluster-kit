@@ -16,13 +16,15 @@ class FakeHead:
     """Stands in for _http: runs the pushed script for real, two pieces per job (like two threads), joins in order."""
     def __init__(self, workers=None) -> None:
         self.jobs, self.posted, self.hang, self.cancelled, self.polls = {}, [], False, [], 0
+        self.long, self.calls = False, []  # long=True: answers ?wait= like a round-4 head (result inline); calls = every path asked
         self.workers = workers if workers is not None else [{"threads": 4, "mem_total": 8 << 30, "mem_used": 1 << 30, "node_id": f"n{i}"} for i in range(4)]
 
     def __call__(self, method, path, body=None, text=False, timeout=60, raw=False, length=None) -> Any:
         if path.startswith(("/api/v1/blobs", "/api/v1/net", "/api/v1/estimate")):  # an older head: no blob store
             raise ck.ClusterError(f"{method} {path}: HTTP 404 not found")
+        self.calls.append(method + " " + path.split("?")[0])
         if path == "/api/v1/cluster":
-            return {"workers": self.workers, "jobs": []}
+            return {"workers": self.workers, "jobs": [], **({"asleep": 0} if self.long else {})}
         if path == "/api/v1/nodes":
             return {"nodes": []}
         if method == "POST" and path == "/api/v1/jobs":
@@ -48,6 +50,10 @@ class FakeHead:
             return {"job": {"state": "cancelled"}}
         self.polls += 1
         n = len(self.posted[-1]["items"]) if self.posted else 1
+        if "?wait=" in path and self.long:
+            jid = int(path.split("?")[0].split("/")[4])
+            row = {"state": "running", "done": 1, "total": n} if self.hang else {"state": "done", "done": n, "total": n, "created_ms": 1000, "started_ms": 1010, "finished_ms": 1510}
+            return {"job": row, "long": True, **({} if self.hang else {"result": self.jobs[jid]})}
         if self.hang:
             return {"job": {"state": "running", "done": 1, "total": n, "created_ms": 1000, "started_ms": 1010}}
         return {"job": {"state": "done", "done": n, "total": n, "created_ms": 1000, "started_ms": 1010, "finished_ms": 1510}}
@@ -61,6 +67,7 @@ class T(unittest.TestCase):
         os.environ["CK_SDK_HOME"] = self.home.name  # never touch the real ~/.clusterkit
         ck.config(push=False, replan_min_s=2.0)
         ck._cmds.clear()
+        ck._lp.clear()
 
     def tearDown(self):
         self.home.cleanup()
@@ -82,6 +89,38 @@ class T(unittest.TestCase):
         self.assertEqual(ck.map(sdkfns.inc, items, local="never", reduce=sum), sum(i + 1 for i in items))
         b = self.head.posted[0]
         self.assertEqual((b["kind"], b["max_pcs"] >= 1, b["mem_mb"] >= 1), ("list", True, True))
+
+    def test_long_poll_one_wait_carries_the_result(self):
+        self.head.long = True
+        items = list(range(40))
+        self.assertEqual(ck.map(sdkfns.inc, items, local="never"), [i + 1 for i in items])
+        self.assertEqual(self.head.polls, 1, "one request waits for the job")
+        self.assertNotIn("GET /api/v1/nodes", self.head.calls, "asleep count comes with /cluster")
+        self.assertFalse([c for c in self.head.calls if c.endswith("/result")], "result came inline")
+        self.assertTrue(ck._lp[ck._cfg["head"]])
+        ck._lp.clear()
+
+    def test_old_head_falls_back_to_polling_once(self):
+        items = list(range(10))
+        self.assertEqual(ck.map(sdkfns.inc, items, local="never"), [i + 1 for i in items])
+        self.assertFalse(ck._lp[ck._cfg["head"]], "a head that ignores ?wait= is remembered")
+        self.assertTrue([c for c in self.head.calls if c.endswith("/result")])
+        ck._lp.clear()
+
+    def test_profile_is_reused_for_the_same_sample(self):
+        ck._prof_memo.clear()
+        n = [0]
+        orig = ck._profile
+        ck._profile = lambda *a, **k: (n.__setitem__(0, n[0] + 1), orig(*a, **k))[1]
+        try:
+            for _ in range(3):
+                ck.map(sdkfns.inc, list(range(40)), local="never")
+            self.assertEqual(n[0], 1)
+            ck.map(sdkfns.inc, list(range(1000, 1040)), local="never")  # other items: timed again
+            self.assertEqual(n[0], 2)
+        finally:
+            ck._profile = orig
+            ck._prof_memo.clear()
 
     def test_remote_error_has_traceback(self):
         with self.assertRaises(ck.RemoteError) as c:

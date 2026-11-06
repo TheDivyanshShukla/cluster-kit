@@ -254,7 +254,7 @@ fn session(ctx: &Arc<Ctx>, addr: &str, lab_name: &str) -> io::Result<()> {
     }
     let sock = s.try_clone()?;
     let (mut r, w) = conn(s)?;
-    let w = Arc::new(Mutex::new(Out { s: w, mac: mac_w }));
+    let w = Arc::new(Mutex::new(Out::new(w, mac_w)));
     // everything that did not get through before goes first, then the list of leases held, then requests for more
     {
         let mut g = lab();
@@ -287,7 +287,7 @@ fn session(ctx: &Arc<Ctx>, addr: &str, lab_name: &str) -> io::Result<()> {
     thread::spawn(move || {
         while {
             thread::sleep(heartbeat_every());
-            w2.lock().unwrap().put(HEARTBEAT, &[]).is_ok()
+            w2.lock().unwrap().beat().is_ok()
         } {}
     });
     let res: io::Result<()> = (|| -> io::Result<()> { loop {

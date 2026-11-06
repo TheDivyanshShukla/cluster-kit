@@ -102,7 +102,10 @@ pub fn cluster_json(ctx: &Ctx) -> Value {
         ws
     };
     let jobs = running_jobs(ctx);
-    json!({"now_ms": now_ms(), "workers": workers, "job": jobs.first(), "jobs": jobs})
+    // PCs that are enrolled and active but not connected (asleep or off): the SDK planner reads this instead of fetching /nodes
+    let on = online_ids(ctx);
+    let asleep = ctx.store.nodes().iter().filter(|n| n.state == "active" && !on.contains(&n.node_id)).count();
+    json!({"now_ms": now_ms(), "workers": workers, "job": jobs.first(), "jobs": jobs, "asleep": asleep})
 }
 
 /// All running jobs, as the head's dispatcher sees them.
@@ -353,6 +356,11 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
                    "needs_bootstrap": !auth.open && ctx.store.users().is_empty()}),
         ),
         ("GET", ["ha"]) => json_out(200, ha_json(ctx)),
+        ("GET", ["wire"]) => json_out(200, crate::proto::wire::json()),
+        ("POST", ["wire", "reset"]) => {
+            crate::proto::wire::reset();
+            json_out(200, json!({"ok": true}))
+        }
         ("POST", ["sim"]) => post_sim(who.as_ref(), r),
         ("POST", ["ha", "switchover"]) => {
             let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
@@ -542,7 +550,36 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
         ("GET", ["jobs", id]) | ("GET", ["jobs", id, "result"]) | ("POST", ["jobs", id, "cancel"]) => {
             let Some(job) = id.parse().ok().and_then(|id| ctx.store.job(id)) else { return fail(404, "not_found", "no such job") };
             match (r.method.as_str(), segs.get(2)) {
-                ("GET", None) => json_out(200, json!({"job": job_json(ctx, &etas(ctx, vec![job.clone()]).remove(0)), "parts": ctx.store.part_count(job.id)})),
+                ("GET", None) => {
+                    // Round 4: ?wait=S holds the request until the job is finished (at most S seconds, 10 max); ?result=1 then carries the
+                    // reduced result inline (one trip instead of poll + poll + fetch). Old heads ignore both and answer at once, so the
+                    // reply's "long" field tells a client which kind of head it is talking to.
+                    let wait = r.query.get("wait").and_then(|s| s.parse::<f64>().ok()).filter(|w| w.is_finite()).map(|w| w.clamp(0.0, 10.0));
+                    let mut job = job;
+                    if let Some(w) = wait.filter(|w| *w > 0.0 && !job.state.finished()) {
+                        if let Some(_slot) = LongPoll::enter() {
+                            let end = Instant::now() + Duration::from_secs_f64(w);
+                            while Instant::now() < end && !job.state.finished() {
+                                thread::sleep(Duration::from_millis(10));
+                                if let Some(j) = ctx.store.job(job.id) {
+                                    job = j;
+                                }
+                            }
+                        }
+                    }
+                    let mut v = json!({"job": job_json(ctx, &etas(ctx, vec![job.clone()]).remove(0)), "parts": ctx.store.part_count(job.id)});
+                    if wait.is_some() {
+                        v["long"] = json!(true);
+                        if job.state.as_str() == "done" && r.query.get("result").is_some_and(|x| x == "1") {
+                            if let Ok(b) = reduce::reduce(&job.kind, &job.reducer, &ctx.store.parts(job.id)) {
+                                if b.len() <= LONG_RESULT_MAX {
+                                    v["result"] = json!(String::from_utf8_lossy(&b));
+                                }
+                            }
+                        }
+                    }
+                    json_out(200, v)
+                }
                 ("GET", _) => {
                     let red = r.query.get("reducer").map(|s| pct_decode(s)).unwrap_or_else(|| job.reducer.clone());
                     match reduce::reduce(&job.kind, &red, &ctx.store.parts(job.id)) {
@@ -2008,6 +2045,9 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
     let cookie = hdr("Cookie").and_then(|c| c.split(';').filter_map(|p| p.trim().strip_prefix("ck_session=")).next().map(String::from));
     let bearer = hdr("Authorization").and_then(|a| a.strip_prefix("Bearer ").map(|t| t.trim().to_string()));
     let ip = rq.remote_addr().map_or(IpAddr::from([0, 0, 0, 0]), |a| a.ip());
+    if path != "/api/v1/wire" {
+        crate::proto::wire::http(rq.method().as_str(), path);
+    }
     if path.starts_with("/api/v1/blobs") && matches!(rq.method().as_str(), "PUT" | "GET" | "HEAD") && path != "/api/v1/blobs" || (path == "/api/v1/blobs" && rq.method().as_str() == "PUT") {
         match blob_http(ctx, auth, rq, path, cookie.as_deref(), bearer.as_deref()) {
             Ok(()) => return,
@@ -2078,6 +2118,30 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
             return
         }
     };
+}
+
+/// Long polls in flight (each holds a request thread); beyond the cap a wait is answered at once and the client backs off.
+static LONG_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const LONG_MAX: usize = 12;
+const LONG_RESULT_MAX: usize = 1 << 20;
+
+struct LongPoll;
+
+impl LongPoll {
+    fn enter() -> Option<LongPoll> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if LONG_OPEN.fetch_add(1, SeqCst) >= LONG_MAX {
+            LONG_OPEN.fetch_sub(1, SeqCst);
+            return None;
+        }
+        Some(LongPoll)
+    }
+}
+
+impl Drop for LongPoll {
+    fn drop(&mut self) {
+        LONG_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 static SSE_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

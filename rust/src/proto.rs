@@ -24,7 +24,7 @@ pub const MAX_FRAME: usize = 1 << 28;
 pub fn pipeline() -> usize {
     crate::tune::n("pipeline") as usize
 }
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 /// Tunable "heartbeat_s" (default 1 s).
 pub fn heartbeat_every() -> Duration {
     crate::tune::secs("heartbeat_s")
@@ -82,6 +82,13 @@ pub const SNAP_PIECE: usize = 32 << 20;
 /// Lab head -> root (docs/HIERARCHY.md): a finished piece of a leased range. Same payload as RESULT (56-byte header, then the
 /// merged body of the piece). The root stores it like a result, shrinks the lease, and ACKs it; it is not a request for more work.
 pub const PARTIAL: u8 = 31;
+/// Protocol v4 (round 4, fewer frames): a head sends TASK2 instead of ACK + TASK to an agent whose HELLO_W says version >= 4, and ACKS
+/// (one frame, many ACKs) when no TASK follows. A v3 agent gets the old ACK / TASK frames; a v4 agent works with a v3 head, which
+/// never sends the new kinds.
+///   TASK2 (head -> worker): n u32 LE, n x (job, start, end) u64 LE = results now durable (as ACK), then a TASK payload.
+///   ACKS  (head -> worker): n x (job, start, end) u64 LE.
+pub const TASK2: u8 = 32;
+pub const ACKS: u8 = 33;
 pub const CANCEL_RANGE: u8 = 28; // head -> worker: job, start, end: stop or skip this one chunk (the other copy won)
 
 pub const KIND_SHA: u8 = 0; // arg = prefix as nibbles; body = (n u64, sha256 [u8; 32])*
@@ -216,7 +223,55 @@ pub fn conn(s: TcpStream) -> io::Result<(BufReader<Sock>, Sock)> {
     Ok((BufReader::with_capacity(64 << 10, Sock(s.try_clone()?)), Sock(s)))
 }
 
+/// Round-4 trip counters: frames and bytes per kind, this process, both directions (GET /api/v1/wire). One relaxed add each.
+pub mod wire {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::Mutex;
+    const Z: AtomicU64 = AtomicU64::new(0);
+    pub static OUT: [AtomicU64; 256] = [Z; 256];
+    pub static IN: [AtomicU64; 256] = [Z; 256];
+    pub static BOUT: AtomicU64 = Z;
+    pub static BIN: AtomicU64 = Z;
+    pub static HTTP: Mutex<std::collections::BTreeMap<String, u64>> = Mutex::new(std::collections::BTreeMap::new());
+    pub fn out(k: u8, n: usize) {
+        OUT[k as usize].fetch_add(1, Relaxed);
+        BOUT.fetch_add(n as u64 + 5, Relaxed);
+    }
+    pub fn inn(k: u8, n: usize) {
+        IN[k as usize].fetch_add(1, Relaxed);
+        BIN.fetch_add(n as u64 + 5, Relaxed);
+    }
+    /// Count one HTTP request under "METHOD /a/b/c" (numbers and long hex ids collapsed to #).
+    pub fn http(method: &str, path: &str) {
+        let norm: Vec<&str> = path.trim_matches('/').split('/').take(5).map(|s| if !s.is_empty() && (s.bytes().all(|c| c.is_ascii_digit()) || (s.len() >= 16 && s.bytes().all(|c| c.is_ascii_hexdigit()))) { "#" } else { s }).collect();
+        let key = format!("{method} /{}", norm.join("/"));
+        let mut g = HTTP.lock().unwrap();
+        if g.len() < 400 || g.contains_key(&key) {
+            *g.entry(key).or_default() += 1;
+        }
+    }
+    pub fn name(k: u8) -> &'static str {
+        match k {
+            1 => "HELLO_W", 2 => "HELLO_C", 3 => "REQ", 4 => "TASK", 5 => "RESULT", 6 => "SUBMIT", 7 => "PART", 8 => "DONE", 9 => "PING", 10 => "PONG",
+            11 => "ERR", 12 => "CANCEL", 13 => "HEARTBEAT", 14 => "CTRL", 15 => "ACCEPTED", 16 => "ATTACH", 17 => "CHALLENGE", 18 => "PROOF", 19 => "KEY",
+            20 => "DENIED", 21 => "FAILED", 22 => "SUBMIT_JSON", 23 => "HELLO_S", 24 => "SNAPSHOT", 25 => "REPL", 26 => "REPL_ACK", 27 => "ACK",
+            28 => "CANCEL_RANGE", 29 => "SNAPSHOT_BEGIN", 30 => "SNAPSHOT_MORE", 31 => "PARTIAL", 32 => "TASK2", 33 => "ACKS", _ => "?",
+        }
+    }
+    pub fn json() -> serde_json::Value {
+        let side = |a: &[AtomicU64; 256]| -> serde_json::Value { (0..=255u8).filter(|k| a[*k as usize].load(Relaxed) > 0).map(|k| (name(k).to_string(), serde_json::json!(a[k as usize].load(Relaxed)))).collect::<serde_json::Map<_, _>>().into() };
+        serde_json::json!({"out": side(&OUT), "in": side(&IN), "bytes_out": BOUT.load(Relaxed), "bytes_in": BIN.load(Relaxed), "http": *HTTP.lock().unwrap()})
+    }
+    pub fn reset() {
+        OUT.iter().chain(IN.iter()).for_each(|a| a.store(0, Relaxed));
+        BOUT.store(0, Relaxed);
+        BIN.store(0, Relaxed);
+        HTTP.lock().unwrap().clear();
+    }
+}
+
 pub fn send(s: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
+    wire::out(kind, payload.len());
     let mut buf = Vec::with_capacity(5 + payload.len());
     buf.push(kind);
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -238,6 +293,7 @@ pub fn recv_max(s: &mut impl Read, max: usize) -> io::Result<(u8, Vec<u8>)> {
     }
     let mut p = vec![0; len];
     s.read_exact(&mut p)?;
+    wire::inn(h[0], len);
     Ok((h[0], p))
 }
 
@@ -276,6 +332,7 @@ pub fn fleet_open() -> bool {
 /// direction (the writer only seals, the reader only opens), both built from the node key.
 pub fn send_sealed(s: &mut impl Write, mac: &mut crate::auth::FrameMac, kind: u8, payload: &[u8]) -> io::Result<()> {
     let tag = mac.seal(kind, payload);
+    wire::out(kind, payload.len() + 40);
     // one buffer: header, payload, tag (was three copies of a 4 MB piece)
     let mut p = Vec::with_capacity(payload.len() + 45);
     p.push(kind);

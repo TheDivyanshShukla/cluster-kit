@@ -102,3 +102,33 @@ On commit 6786be3: 236 Rust tests pass; `scripts/chaos.sh` 5 of 5; `robust.py` 1
 
 - `--only` jobs still pause lab heads. A lab head has no standby. Leases are sized by the whole lab's speed, so a selector matching a few PCs of a big lab makes long leases.
 - A lab head cuts leases with its own chunk size; the root's chunk setting is not forwarded.
+
+## 8. Trips: frames and requests per flow, before and after (rt1)
+
+Counted with the new `GET /api/v1/wire` (frames and bytes per kind, HTTP requests per route; always on, one relaxed add per frame) and `scripts/stress/trips.py`. Fleet: 1 head + 3 agent processes x 4 virtual PCs (open fleet); hierarchy: root + 2 lab heads, 2 x 4 virtual PCs. Before = commit defad7a, after = this work. Counts are frames the head(s) sent, per run; all results exact. Wall times are from a Mac under load 12 to 40 (other agents were building), so seconds that did not move by more than noise are shown as "same".
+
+| Flow | Before | After | Wall |
+| --- | --- | --- | --- |
+| (a) chunk loop, flat, 589 small chunks | 1,784 frames out (ACK 592, TASK 595, PART 589); 3.0 per chunk | 1,207 (TASK2 563, PART 589, ACKS 9); 2.05 per chunk, -32 % | 1.77 s, same |
+| (a) 283 bigger chunks | 867 frames; 3.06 per chunk | 587; 2.07 per chunk, -32 % | 1.08 s, same |
+| (a) heartbeats while a job runs (60 chunks, 10 s, 12 PCs) | 120 out, 120 in | 100 out, 100 in | same |
+| (b) `ck run`, one chunk | 5 frames out | 5 (ACK becomes ACKS) | same |
+| (b) `ck run`, many chunks | one write per PART | PARTs queued for a client leave in one write | same |
+| (c) root + 2 labs, 400-number job, all three heads | 1,593 frames out (ACK 765, TASK 737) | 947 (TASK2 731, ACK 46, ACKS 27), -41 % | 2.80 s to 2.78 s |
+| (c) root + 2 labs, longer chunks | 1,086 | 661, -39 % | 1.71 s, same |
+| (d) SDK run with 300 KB of shared blobs (first / repeat) | 48 / 8 HTTP requests, 88 / 84 frames | 19 / 9 HTTP, 52 / 41 frames | 10.0 / 9.1 s to 11.7 / 10.5 s (noise) |
+| (e) `ck.map`, 400 items (first / same call again) | 23 / 16 HTTP requests | 7 / 5 | 5.1 / 3.8 s to 6.7 / 5.2 s (noise; remote Python start dominates) |
+| (f) console first load | 1 page + 69 static files + 16 API GETs + 1 SSE; `ha/settings` and `select` fetched 3 times each | not changed (console is outside this task) | |
+
+What changed:
+
+- **Protocol v4.** An agent whose hello says version 4 or higher gets the ACK for a stored result folded into the next TASK (`TASK2`), or batched with other waiting ACKs into one `ACKS` frame when no TASK follows (the feeder flushes before it waits for work, a result that earns no credit flushes at once, and the heartbeat thread flushes within one heartbeat). v3 agents and lab heads keep the old `ACK` and `TASK`. A v4 agent talking to a v3 head never sees the new kinds. Mixed fleets work in both directions; no refusal is needed.
+- **Heartbeats are skipped** when another frame left the same connection in the last half heartbeat, on head, agent and lab head. The longest silence a peer can see is 1.5 heartbeats.
+- **`GET /api/v1/jobs/{id}?wait=S&result=1`** holds the request until the job finishes (12 held at once) and returns a small result inline. The SDK waits with it instead of polling every 0.03 to 0.3 s, skips the `/result` fetch and the `/stream` connection, and reads the asleep count from `/cluster` (`asleep`) instead of `/nodes`. It remembers a head that ignores `wait` and polls as before. The SDK also reuses the profile of the same function on the same first items for 10 minutes.
+- **PART frames** for an attached client are written together when several are queued.
+
+Already minimal, left alone (measured): `ck run` already gets parts in the submit stream with no second fetch; the agent already holds 2 chunks (`pipeline`), so every RESULT is also the next request and no chunk waits on the network. Batching small results would delay the refill, so it was not done. Not done: have-list in the hello (saves one CTRL per connection, not per chunk), lab status folded into the parts frame (one CTRL per second per lab), parallel `/estimate` calls.
+
+Freeze tests for the folded ACK path (`scripts/stress/trips_freeze.py`, 12 PCs, ~20 s of work, bound 55 s): SIGSTOP one agent process for 9 s (23.9 s, exact), kill -9 one agent process with 2 chunks per PC prefetched (27.7 s, exact), SIGSTOP the head for 6 s (25.1 s, exact). Slow link through the netfault proxy: `mode_slow` 22.2 s and `mode_latency` 30.8 s, exact.
+
+Gate on the final binary: 242 Rust tests, `chaos.sh` 5 of 5, `robust.py all` 120 of 120, `lifecycle.py double` PASS, `hier_bench.py standby` and `comeback` ALL PASSED, SDK tests 60 of 60 (3 new), ruff clean. One timing-based SDK test (`test_advise_hot_loop_and_gil`, thread scaling) fails now and then when the Mac is loaded: 2 of 5 suite runs on the unchanged code, 2 of 6 on the new code, and it passes alone.

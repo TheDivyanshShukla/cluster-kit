@@ -704,7 +704,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     let (mac_w, mut mac_r) = if secure { let (w, r) = admit(&mut s, &node_id, &kp)?; (Some(w), Some(r)) } else { (None, None) };
     let sock = s.try_clone()?;
     let (mut r, w) = conn(s)?;
-    let w = Arc::new(Mutex::new(Out { s: w, mac: mac_w }));
+    let w = Arc::new(Mutex::new(Out::new(w, mac_w)));
     let send_w = |kind: u8, p: &[u8]| w.lock().unwrap().put(kind, p);
     CANCELLED.store(0, Relaxed); // job ids restart with each head
     crate::kernels::reset_piece_costs();
@@ -752,7 +752,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
         while {
             thread::sleep(heartbeat_every());
             if crate::blobs::take_resync() { crate::blobs::report_have(&w2, serde_json::json!({})); }
-            w2.lock().unwrap().put(HEARTBEAT, &[]).is_ok()
+            w2.lock().unwrap().beat().is_ok()
         } {}
     });
     // Reader thread: queues TASKs and applies CANCEL at once, even mid-chunk. A read error (incl. timeout) is passed on.
@@ -780,14 +780,8 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                     }
                 }
             }
-            Ok((ACK, p)) => {
-                if let (Ok(j), Ok(a), Ok(b)) = (u64_at(&p, 0), u64_at(&p, 8), u64_at(&p, 16)) {
-                    let mut u = unacked_r.lock().unwrap();
-                    if u.ack((j, a, b)) && u.by_seq.is_empty() {
-                        log_drained();
-                    }
-                }
-            }
+            Ok((ACK, p)) => ack_all(&unacked_r, &p),
+            Ok((crate::proto::ACKS, p)) => ack_all(&unacked_r, &p),
             Ok((CTRL, p)) => {
                 if let Some(t) = serde_json::from_slice::<serde_json::Value>(&p).ok().and_then(|v| v.get("tune").cloned()) {
                     crate::tune::apply_remote(&t);
@@ -810,7 +804,17 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                     }
                 }
             }
-            Ok((TASK, p)) => {
+            Ok((k @ (TASK | TASK2), mut p)) => {
+                if k == TASK2 {
+                    // v4: n ACKs, then the TASK payload
+                    let n = p.get(..4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+                    let end = 4usize.saturating_add(n.saturating_mul(24));
+                    if end > p.len() {
+                        continue;
+                    }
+                    ack_all(&unacked_r, &p[4..end]);
+                    p.drain(..end);
+                }
                 if let (Ok(j), Ok(a), Ok(b)) = (u64_at(&p, 0), u64_at(&p, 8), u64_at(&p, 16)) {
                     live_r.lock().unwrap().insert((j, a, b));
                 }
@@ -917,6 +921,20 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     res
 }
 
+/// Drop the copies of results the head says are durable: `p` is one or more (job, start, end) triples.
+fn ack_all(unacked: &Mutex<Unacked>, p: &[u8]) {
+    let mut u = unacked.lock().unwrap();
+    let mut any = false;
+    for t in p.chunks_exact(24) {
+        if let (Ok(j), Ok(a), Ok(b)) = (u64_at(t, 0), u64_at(t, 8), u64_at(t, 16)) {
+            any |= u.ack((j, a, b));
+        }
+    }
+    if any && u.by_seq.is_empty() {
+        log_drained();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,7 +959,7 @@ mod tests {
         let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (mut srv, _) = l.accept().unwrap();
         let (_r, sock) = conn(c).unwrap();
-        let w = Mutex::new(Out { s: sock, mac: None });
+        let w = Mutex::new(Out::new(sock, None));
         power_ctrl(br#"{"power":"sleep","wol":["aa:bb:cc:dd:ee:ff"],"standby_of":"127.0.0.1:1"}"#, &w);
         // the test binary is not `ck`, so the child exits at once, but spawn succeeds and standby_started is reported
         let mut mac = None;

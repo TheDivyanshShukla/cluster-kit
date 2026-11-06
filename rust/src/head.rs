@@ -265,10 +265,59 @@ fn cap_ctrl(sent: Option<u32>, want: Option<u32>) -> Option<Vec<u8>> {
 pub struct Out {
     pub s: Sock,
     pub mac: Option<FrameMac>,
+    /// Protocol v4 agent: ACKs wait here (24 bytes each) and ride on the next TASK (TASK2), or leave together as one ACKS frame.
+    pub fold: bool,
+    pub acks: Vec<u8>,
+    /// true while `acks` is not empty; an idle feeder reads it (without taking the Out lock) to know ACKs are waiting for it
+    pub dirty: Arc<std::sync::atomic::AtomicBool>,
+    /// when this connection last sent a frame: a HEARTBEAT is only needed after a quiet heartbeat_s (any frame resets the peer's timeout)
+    pub last: Instant,
 }
 
 impl Out {
+    pub fn new(s: Sock, mac: Option<FrameMac>) -> Out {
+        Out { s, mac, fold: false, acks: vec![], dirty: Arc::default(), last: Instant::now() }
+    }
+
     pub fn put(&mut self, kind: u8, p: &[u8]) -> io::Result<()> {
+        if self.fold {
+            if kind == ACK {
+                self.acks.extend_from_slice(p);
+                self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                return if self.acks.len() >= 24 * 256 { self.flush_acks() } else { Ok(()) };
+            }
+            if kind == TASK && !self.acks.is_empty() {
+                let mut q = Vec::with_capacity(4 + self.acks.len() + p.len());
+                q.extend_from_slice(&((self.acks.len() / 24) as u32).to_le_bytes());
+                q.append(&mut self.acks);
+                self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+                q.extend_from_slice(p);
+                return self.raw(TASK2, &q);
+            }
+        }
+        self.raw(kind, p)
+    }
+
+    /// Send the waiting ACKs as one frame (nothing to ride on, or a timer).
+    pub fn flush_acks(&mut self) -> io::Result<()> {
+        if self.acks.is_empty() {
+            return Ok(());
+        }
+        let a = std::mem::take(&mut self.acks);
+        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.raw(crate::proto::ACKS, &a)
+    }
+
+    /// A HEARTBEAT, unless some other frame went out within the last half period (a busy link needs none; the longest silence is 1.5 periods).
+    pub fn beat(&mut self) -> io::Result<()> {
+        if self.last.elapsed() < heartbeat_every().mul_f64(0.5) {
+            return Ok(());
+        }
+        self.raw(HEARTBEAT, &[])
+    }
+
+    fn raw(&mut self, kind: u8, p: &[u8]) -> io::Result<()> {
+        self.last = Instant::now();
         match &mut self.mac {
             Some(m) => send_sealed(&mut self.s, m, kind, p),
             None => send(&mut self.s, kind, p),
@@ -1800,6 +1849,7 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
         }
     }
     let mut in_mac = key.as_ref().map(|k| FrameMac::new(k));
+    let fold = version >= 4 && !hello.as_ref().is_some_and(|h| h.lab_head.is_some()); // v4 agents get TASK2 / ACKS; lab heads keep ACK + TASK
     sh.0.lock().unwrap().workers.insert(wid, Worker { addr: addr.clone(), threads, version, hello, state, presence: "idle".into(), joined: Some(Instant::now()), ..Default::default() });
     if let Some(n) = &node {
         publish_node(&ctx, &sh.0.lock().unwrap(), &n.0);
@@ -1811,7 +1861,7 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     // Reader (this thread) turns each REQ / RESULT into a credit; the feeder thread spends
     // credits on chunks. Two threads so results keep flowing while the feeder waits for work.
     let (mut r, w) = conn(s)?;
-    let w = Arc::new(Mutex::new(Out { s: w, mac: out_mac }));
+    let w = Arc::new(Mutex::new(Out { fold, ..Out::new(w, out_mac) }));
     sh.0.lock().unwrap().workers.get_mut(&wid).unwrap().out = Some(w.clone());
     ctrl_to(&w, tune_msg());
     if let Some(m) = proof_ctrl(&ctx) {
@@ -1878,9 +1928,17 @@ fn heartbeat_all(sh: Shared) {
         let outs: Vec<_> = sh.0.lock().unwrap().workers.values().filter_map(|w| w.out.clone()).collect();
         for o in outs {
             if let Ok(mut g) = o.try_lock() {
-                let _ = g.put(HEARTBEAT, &[]);
+                let _ = g.flush_acks(); // a folded ACK that found no TASK to ride on leaves within a heartbeat
+                let _ = g.beat();
             }
         }
+    }
+}
+
+fn flush_acks_of(ctx: &Ctx, wid: u64) {
+    let out = ctx.sh.0.lock().unwrap().workers.get(&wid).and_then(|w| w.out.clone());
+    if let Some(o) = out {
+        let _ = o.lock().unwrap().flush_acks();
     }
 }
 
@@ -1890,7 +1948,8 @@ fn read_results(r: &mut impl Read, mac: &mut Option<FrameMac>, ctx: &Ctx, wid: u
         match k {
             RESULT => {
                 if !finish_credit(ctx, wid, &p)? {
-                    continue; // resent after a failover: no TASK was spent on it
+                    flush_acks_of(ctx, wid); // resent after a failover: no TASK was spent on it, so no TASK carries its ACK
+                    continue;
                 }
             }
             PARTIAL => {
@@ -2011,6 +2070,7 @@ fn ctrl_in(ctx: &Ctx, wid: u64, p: &[u8]) {
 
 fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>) {
     let sh = &ctx.sh;
+    let dirty = w.lock().unwrap().dirty.clone();
     while credits.recv().is_ok() {
         let (job, a, b, kind, arg, mem, jb, hj) = {
             let mut st = sh.0.lock().unwrap();
@@ -2037,6 +2097,13 @@ fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>
                     wk.sent.insert((t.0, t.1, t.2), Instant::now());
                     crate::lgc!("chunk.dispatch", {"job": t.0, "a": t.1, "b": t.2, "wid": wid});
                     break (t.0, t.1, t.2, t.3, t.4, mem, jb, hj);
+                }
+                if dirty.load(std::sync::atomic::Ordering::Relaxed) {
+                    // nothing to send: the waiting ACKs must not wait for work that may be a long time coming
+                    drop(st);
+                    let _ = w.lock().unwrap().flush_acks();
+                    st = sh.0.lock().unwrap();
+                    continue;
                 }
                 // 2 s timeout: an idle node re-checks for an overdue chunk to copy (watchdog also wakes it every 5 s)
                 st = sh.1.wait_timeout(st, Duration::from_secs(2)).unwrap().0;
@@ -2156,9 +2223,23 @@ fn serve_client(s: TcpStream, ctx: Arc<Ctx>, token: &[u8]) -> io::Result<()> {
 }
 
 fn stream(w: &mut Sock, rx: mpsc::Receiver<(u8, Vec<u8>)>) -> io::Result<()> {
-    for (k, body) in rx {
-        send(w, k, &body)?;
-        if k == DONE || k == ERR {
+    // Round 4: every frame already queued for this client leaves in one write (a fast job queues hundreds of PARTs per second)
+    let mut buf: Vec<u8> = vec![];
+    while let Ok(first) = rx.recv() {
+        let (mut last, mut next) = (first.0, Some(first));
+        while let Some((k, body)) = next.take() {
+            crate::proto::wire::out(k, body.len());
+            buf.push(k);
+            buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&body);
+            last = k;
+            if buf.len() < (1 << 20) && k != DONE && k != ERR {
+                next = rx.try_recv().ok();
+            }
+        }
+        io::Write::write_all(w, &buf)?;
+        buf.clear();
+        if last == DONE || last == ERR {
             break;
         }
     }
@@ -3502,6 +3583,31 @@ mod tests {
     }
 
     #[test]
+    fn v4_acks_ride_on_the_next_task_or_leave_together() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cli = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (mut srv, _) = l.accept().unwrap();
+        let mut o = Out { fold: true, ..Out::new(Sock(cli), None) };
+        o.put(ACK, &pack(&[1, 0, 10])).unwrap();
+        o.put(ACK, &pack(&[1, 10, 20])).unwrap();
+        assert!(o.dirty.load(Relaxed));
+        let task = pack(&[1, 20, 30]);
+        o.put(TASK, &task).unwrap(); // two ACKs + the TASK in one frame
+        assert!(!o.dirty.load(Relaxed));
+        let (k, p) = recv(&mut srv).unwrap();
+        assert_eq!((k, u64_at(&p, 12).unwrap(), u64_at(&p, 36).unwrap(), &p[..4], &p[52..]), (TASK2, 0, 10, &2u32.to_le_bytes()[..], &task[..]));
+        o.put(TASK, &task).unwrap(); // nothing waiting: a plain TASK
+        assert_eq!(recv(&mut srv).unwrap(), (TASK, task));
+        o.put(ACK, &pack(&[1, 20, 30])).unwrap();
+        o.flush_acks().unwrap();
+        assert_eq!(recv(&mut srv).unwrap(), (crate::proto::ACKS, pack(&[1, 20, 30])));
+        let mut old = Out::new(Sock(TcpStream::connect(l.local_addr().unwrap()).unwrap()), None); // a v3 agent: ACK goes out at once
+        let (mut srv2, _) = l.accept().unwrap();
+        old.put(ACK, &pack(&[2, 0, 1])).unwrap();
+        assert_eq!(recv(&mut srv2).unwrap(), (ACK, pack(&[2, 0, 1])));
+    }
+
+    #[test]
     fn pending_acks_dup_acks_and_cancel_range() {
         let c = ctx();
         let j = submit(&c, spec(20)).unwrap();
@@ -3509,7 +3615,7 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let cli = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (mut srv, _) = l.accept().unwrap();
-        let out = Arc::new(Mutex::new(Out { s: Sock(cli), mac: None }));
+        let out = Arc::new(Mutex::new(Out::new(Sock(cli), None)));
         {
             let mut st = c.sh.0.lock().unwrap();
             st.workers.insert(1, Worker { addr: "a".into(), state: "active".into(), out: Some(out), ..Default::default() });

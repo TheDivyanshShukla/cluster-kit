@@ -439,6 +439,26 @@ def _profile(fn: Callable[..., Any], mode: str, items: list[Any], limit: float =
     return per, max(peak, rss) / 1048576
 
 
+_prof_memo: dict[Any, tuple[float, tuple[float, float]]] = {}  # (fn, mode, sample, size class) -> (when, (item_s, peak_mb))
+
+
+def _profile_memo(fn: Callable[..., Any], mode: str, items: list[Any], limit: float) -> tuple[float, float]:
+    """`_profile`, but the same function on the same first items (and a similar count) within 10 minutes reuses the last timing:
+    a sweep that calls ck.map again and again no longer runs its sample items locally before every call (up to ~2 s each)."""
+    try:
+        key = (fn, mode, repr(items[:3])[:4000], len(items).bit_length())
+        hit = _prof_memo.get(key)
+    except Exception:  # noqa: BLE001 - an unhashable function or a repr that fails: just profile
+        return _profile(fn, mode, items, limit)
+    if hit and time.monotonic() - hit[0] < 600:
+        return hit[1]
+    r = _profile(fn, mode, items, limit)
+    if len(_prof_memo) >= 32:
+        _prof_memo.pop(next(iter(_prof_memo)))
+    _prof_memo[key] = (time.monotonic(), r)
+    return r
+
+
 def _cluster_view(o: Opts) -> tuple[list[tuple[int, float | None]], int, float, int]:
     """[(threads, free_mb)] of usable PCs, asleep count, rtt seconds, queue note."""
     t0 = time.perf_counter()
@@ -461,12 +481,15 @@ def _cluster_view(o: Opts) -> tuple[list[tuple[int, float | None]], int, float, 
         total, used = w.get("mem_total") or 0, w.get("mem_used") or 0
         pcs.append((th, (total - used) / 1048576 if total else None))
     asleep = 0
-    try:
-        for nd in _http("GET", "/api/v1/nodes", timeout=10).get("nodes", []):
-            if nd.get("state") == "active" and not nd.get("online") and (allowed is None or nd["node_id"] in allowed):
-                asleep += 1
-    except ClusterError:
-        pass
+    if allowed is None and isinstance(c.get("asleep"), int):  # a head from round 4 counts them in /cluster: one trip less
+        asleep = c["asleep"]
+    else:
+        try:
+            for nd in _http("GET", "/api/v1/nodes", timeout=10).get("nodes", []):
+                if nd.get("state") == "active" and not nd.get("online") and (allowed is None or nd["node_id"] in allowed):
+                    asleep += 1
+        except ClusterError:
+            pass
     return pcs, asleep, rtt, len(c.get("jobs") or ([c["job"]] if c.get("job") else []))
 
 
@@ -491,7 +514,7 @@ def _batch_size(per: float, n: int, slots: int, o: Opts) -> int:
 
 def _plan(fn: Callable[..., Any], items: list[Any], mode: str, o: Opts, profile: tuple[float, float] | None = None) -> Plan:
     n = len(items)
-    per, peak_mb = profile or (_profile(fn, mode, items, min(30.0, o["timeout_s"] or 30.0)) if n else (0.0, 0.0))
+    per, peak_mb = profile or (_profile_memo(fn, mode, items, min(30.0, o["timeout_s"] or 30.0)) if n else (0.0, 0.0))
     cpus = os.cpu_count() or 1
     procs = min(cpus, n) if per * n > 1.0 else 1
     local_s = n * per / procs + (0.2 if procs > 1 else 0)
@@ -686,8 +709,54 @@ class _Replan(Exception):
     pass
 
 
+_lp: dict[str, bool] = {}  # head -> does it hold ?wait= requests (a head from before round 4 ignores them and answers at once)
+
+
+def _await_long(jid: int, timeout_s: float | None, check: Callable[[dict[str, Any], float], None] | None, st: dict[str, Any] | None) -> dict[str, Any] | None:
+    """One request that returns when the job finishes (at most `w` s later, so progress still reaches `check`), carrying the result
+    when it is small: a run costs submit + this + nothing, where polling cost 10 to 30 requests and a fetch. None = old head."""
+    head, t0 = _cfg["head"], time.time()
+    while True:
+        t1 = time.time()
+        w = 2.0 if check else 5.0  # `check` (replan) looks at progress once per answer
+        if timeout_s:
+            w = max(0.05, min(w, timeout_s - (t1 - t0)))
+        d = _http("GET", f"/api/v1/jobs/{jid}?wait={w:g}&result=1", timeout=w + 30)
+        if not d.get("long"):
+            _lp[head] = False
+            return None
+        _lp[head], row, now = True, d["job"], time.time()
+        if _reconnected[0] and st and st.get("blobs"):  # the head changed under us: put back what the standby had not copied yet
+            _reconnected[0] = False
+            for h in st["blobs"]:
+                h.on = None
+            _bulk.upload(st["blobs"], _self)
+        state = row.get("state")
+        if state == "done":
+            if st is not None:
+                st.update(push=False, text=d.get("result"))
+            return row
+        if state in ("failed", "cancelled"):
+            raise ClusterError(f"job {jid} {state}: {row.get('error')}")
+        if timeout_s and now - t0 > timeout_s:
+            try:
+                _http("POST", f"/api/v1/jobs/{jid}/cancel", {})
+            except ClusterError:
+                pass
+            raise ClusterError(f"job {jid} timed out after {timeout_s} s and was cancelled")
+        if check and state == "running":
+            check(row, now - t0)
+        if now - t1 < w * 0.5:  # the head answered early without a result (its long-poll slots are full): do not spin
+            time.sleep(min(0.25, w * 0.5 - (now - t1)))
+
+
 def _await(jid: int, timeout_s: float | None, check: Callable[[dict[str, Any], float], None] | None = None, st: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Wait for the job; returns its final row. Events from the stream wake us at once; without a live stream, poll."""
+    """Wait for the job; returns its final row. Long-poll when the head can; else events from the stream wake us at once, else poll."""
+    if _lp.get(_cfg["head"], True):
+        row = _await_long(jid, timeout_s, check, st)
+        if row is not None:
+            return row
+    _stream.ensure()
     t0, delay, polled = time.time(), 0.03, time.time()
     safety = 3.0 if _stream.live and _cfg["push"] and _stream.trusted() else None
     while True:
@@ -804,7 +873,6 @@ def _checker(pl: Plan, o: Opts, items: list[Any], st: dict[str, Any]) -> Callabl
 
 def _cluster_run(fn: Callable[..., Any], mode: str, items: list[Any], pl: Plan, o: Opts, st: dict[str, Any]) -> list[Any]:
     st.update(attempts=0)
-    _stream.ensure()
     for attempt in range(o["retries"] + 1):
         st["attempts"] += 1
         jid = None
@@ -813,7 +881,9 @@ def _cluster_run(fn: Callable[..., Any], mode: str, items: list[Any], pl: Plan, 
             row = _await(jid, o["timeout_s"], _checker(pl, o, items, st), st)
             st["detect_t"] = time.time()
             t0 = time.perf_counter()
-            text = _http("GET", f"/api/v1/jobs/{jid}/result", text=True, timeout=300)
+            text = st.pop("text", None)  # a head from round 4 sends a small result along with the "done" row
+            if text is None:
+                text = _http("GET", f"/api/v1/jobs/{jid}/result", text=True, timeout=300)
             st["fetch_s"] = time.perf_counter() - t0
             break
         except _Replan:

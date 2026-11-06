@@ -30,7 +30,8 @@ Served by `ck head` on the dashboard port (`CK_PORT` + 2, default 7702), togethe
 
 | Method and path | Role | Reply |
 | --- | --- | --- |
-| GET `/api/v1/cluster` | viewer | `{"now_ms", "workers": [Worker], "job": JobRow or null}`. `job` is the running job. |
+| GET `/api/v1/cluster` | viewer | `{"now_ms", "workers": [Worker], "job": JobRow or null, "asleep": n}`. `job` is the running job; `asleep` counts enrolled, active PCs that are not connected. |
+| GET `/api/v1/wire` | viewer | `{"out": {KIND: n}, "in": {KIND: n}, "bytes_out", "bytes_in", "http": {"METHOD /route": n}}`: frames this process sent and received by kind since start (or since the last reset), and HTTP requests by route (numbers and long ids shown as `#`). Needs no flag. `POST /api/v1/wire/reset` zeroes it. `scripts/stress/trips.py` reads it. |
 | GET `/api/v1/nodes` | viewer | `{"nodes": [NodeRow]}`: every PC ever seen, with `inventory` parsed as an object. A PC that works under a lab head has `via_lab` (the lab name) and `live`: `{"threads", "busy", "virtual", "host", "cpu" (percent), "mem_pct"}` as its lab head last reported it (about every second); both are null for a PC the root serves itself. |
 
 Worker has the same fields as `/stats`: `id`, `addr`, `threads`, `chunks`, `numbers`, `secs`, `rate`, `busy`, `cpu`, `mem_used`, `mem_total`, `version`, `node_id`, `host`, `virtual`, `inv`, `presence`, `blocked`, `cap`, `energy_j` (CPU package joules since the agent started, from Linux RAPL; 0 when unknown or virtual).
@@ -55,7 +56,7 @@ JobRow fields:
 | --- | --- | --- | --- |
 | GET `/api/v1/jobs` | viewer | | `{"jobs": [JobRow], "next"}`, newest first |
 | POST `/api/v1/jobs` | researcher | see below | `{"job": JobRow}` |
-| GET `/api/v1/jobs/{id}` | viewer | | `{"job": JobRow, "parts": n}` |
+| GET `/api/v1/jobs/{id}` | viewer | | `{"job": JobRow, "parts": n}`. With `?wait=S` (0 to 10 s) the request is held until the job finishes or S seconds pass and the reply gains `"long": true`; with `&result=1` a finished job's reduced result (up to 1 MiB) comes along as `"result"` (text). At most 12 waits are held at once; beyond that the reply is immediate. Heads before round 4 ignore both and send no `long` field. |
 | GET `/api/v1/jobs/{id}/result` | viewer | | `text/plain` result, described below |
 | POST `/api/v1/jobs/{id}/cancel` | researcher for own jobs, operator for any | | `{"job": JobRow}`; 409 if the job already finished |
 

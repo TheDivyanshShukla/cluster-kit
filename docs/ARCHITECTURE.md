@@ -36,7 +36,7 @@ Ports (all move with `CK_PORT`): 7700 TCP agents and `ck run`, 7701 UDP discover
 3. The head cuts a chunk sized to that PC's measured speed and sends it. Each agent keeps two chunks (`pipeline`): one running, one queued, so it never waits on the network. With lab heads on, a lab head does steps 2 to 6 for its own PCs and the root only hands it leases.
 4. If the job names blobs, the head tells the agent where to fetch them; the agent verifies each piece by sha256 and caches the blob.
 5. The agent runs the chunk (built-in kernel, your command, or the SDK runner) and sends the result. The result also asks for the next chunk.
-6. The head stores the result as a part (the same `(job, start, end)` twice keeps one row) and, when a standby is connected, waits for the standby to acknowledge it. Then it sends an ACK and the agent drops its copy.
+6. The head stores the result as a part (the same `(job, start, end)` twice keeps one row) and, when a standby is connected, waits for the standby to acknowledge it. Then it sends an ACK and the agent drops its copy. To a protocol v4 agent the ACK is not a frame of its own: it rides on the next TASK (`TASK2`), or leaves with other waiting ACKs as one `ACKS` frame when no TASK follows (see the top of `rust/src/proto.rs`).
 7. When every range is covered, the reducer combines the parts. The state becomes `done`, and the client prints the result or the SDK returns it.
 
 ## Failure handling
