@@ -215,6 +215,22 @@ pub fn recv_max(s: &mut impl Read, max: usize) -> io::Result<(u8, Vec<u8>)> {
     Ok((h[0], p))
 }
 
+/// `recv_max` with one overall deadline (not per read): a sender that drips a byte per second cannot hold the thread.
+pub fn recv_by(s: &mut TcpStream, max: usize, total: Duration) -> io::Result<(u8, Vec<u8>)> {
+    struct By<'a>(&'a mut TcpStream, std::time::Instant);
+    impl Read for By<'_> {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            let left = self.1.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "frame deadline"));
+            }
+            self.0.set_read_timeout(Some(left))?;
+            self.0.read(b)
+        }
+    }
+    recv_max(&mut By(s, std::time::Instant::now() + total), max)
+}
+
 pub fn pack(nums: &[u64]) -> Vec<u8> {
     nums.iter().flat_map(|n| n.to_le_bytes()).collect()
 }

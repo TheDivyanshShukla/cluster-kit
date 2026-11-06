@@ -1,1 +1,0 @@
-import{St as e}from"./BdQVl7rk.js";var t=e({w:typeof innerWidth==`number`?innerWidth:1280});typeof window<`u`&&addEventListener(`resize`,()=>t.w=innerWidth,{passive:!0});var n=()=>t.w<640;export{t as n,n as t};

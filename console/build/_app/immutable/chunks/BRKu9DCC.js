@@ -1,0 +1,1 @@
+import{_ as e,v as t}from"./Cdxv086n.js";import{C as n}from"./CNWTo9T3.js";var r={name:`check`,size:24,node:[[`path`,{d:`M20 6 9 17l-5-5`}]]};r.node;var i=new Set([`$$slots`,`$$events`,`$$legacy`]);function a(a,o){let s=e(o,i);n(a,t(()=>s,{get icon(){return r}}))}export{a as t};

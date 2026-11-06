@@ -14,7 +14,7 @@ fn connect_client(o: &Opts) -> (BufReader<Sock>, Sock) {
     let ip = o.head.as_deref().unwrap_or("127.0.0.1");
     let s = TcpStream::connect((ip, port())).unwrap_or_else(|e| die(&format!("cannot reach head {ip}:{}: {e}", port())));
     let (r, mut w) = conn(s).unwrap();
-    send(&mut w, HELLO_C, &[]).unwrap();
+    send(&mut w, HELLO_C, std::env::var("CK_TOKEN").unwrap_or_default().as_bytes()).unwrap();
     (r, w)
 }
 
@@ -214,7 +214,7 @@ fn reattach(o: &Opts, id: u64) -> (BufReader<Sock>, Sock) {
             let Some(a) = addr.to_socket_addrs().ok().and_then(|mut a| a.next()) else { continue };
             let Ok(s) = TcpStream::connect_timeout(&a, Duration::from_secs(2)) else { continue };
             let Ok((r, mut w)) = conn(s) else { continue };
-            if send(&mut w, HELLO_C, &[]).is_ok() && send(&mut w, ATTACH, &id.to_le_bytes()).is_ok() {
+            if send(&mut w, HELLO_C, std::env::var("CK_TOKEN").unwrap_or_default().as_bytes()).is_ok() && send(&mut w, ATTACH, &id.to_le_bytes()).is_ok() {
                 eprintln!("re-attached job {id} on {addr}");
                 crate::lg!(Info, "client.reattach", {"job": id, "head": addr});
                 return (r, w);

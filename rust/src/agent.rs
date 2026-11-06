@@ -380,6 +380,7 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
         println!("GPU: this ck was built without the gpu feature, using the CPU");
     }
     crate::blobs::start_server(); // once per process; virtual agents share it
+    let _ = crate::blobs::cached(); // hash-check the blob cache once now, not inside the first session where it would delay heartbeats
     static SAMPLER: Once = Once::new();
     SAMPLER.call_once(|| {
         thread::spawn(sampler);
@@ -706,6 +707,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                 send_w(REQ, &[])?; // skip it, but keep the pipeline full
                 continue;
             }
+            CANCELLED_RANGE.0.store(u64::MAX, Relaxed); // a CANCEL_RANGE for an earlier run of this chunk must not stop this run
             let (kind, arg) = (p.get(24).copied().unwrap_or(KIND_SHA), p.get(25..).unwrap_or(&[]));
             let t = Instant::now();
             crate::lgc!("chunk.start", {"job": job, "a": a, "b": b});

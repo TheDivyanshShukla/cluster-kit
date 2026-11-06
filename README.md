@@ -147,7 +147,7 @@ tune       on | off       low-latency network settings (Linux, Windows); reverts
 
 Rules are tagged `daskcluster-head`, `daskcluster-worker`, `daskcluster-ck-head` and `daskcluster-ck-worker`. Nothing else in your firewall is touched.
 
-**Security:** these programs have no authentication. Anyone on the LAN can run code on every PC: through Dask, or through `ck run --cmd`. Use them on trusted networks only. Fixing this comes before any campus-wide use (see docs/CONSOLE_REQUIREMENTS.md, section SEC).
+**Security:** the Dask programs (py) have no authentication: anyone on the LAN can run code on every PC through them, so use them on trusted networks only. The Rust kit (rs) does: PCs join with a join code and prove a node key, links are sealed, and `ck run` needs an API token in `CK_TOKEN` (`cmd` and list jobs need the operator role). Only a test fleet started with `CK_FLEET=open` skips these checks.
 
 ## Benchmarks
 

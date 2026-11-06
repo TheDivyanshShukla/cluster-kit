@@ -85,7 +85,7 @@
 		<div role="table" aria-label={label} aria-rowcount={rows.length + 1} style="min-width:{minW}px">
 			<div role="row" class="bg-surface border-line text-muted-foreground sticky top-0 z-10 grid items-center border-b text-xs" style="grid-template-columns:{tpl};height:{HEAD}px">
 				{#each cols as c (c.key)}
-					<div role="columnheader" aria-sort={c.sort && sort === c.key ? (dir === 'asc' ? 'ascending' : 'descending') : undefined} class="min-w-0 px-3 {c.right ? 'text-right' : ''}">
+					<div role="columnheader" aria-sort={c.sort && sort === c.key ? (dir === 'asc' ? 'ascending' : 'descending') : undefined} class="min-w-0 px-3 max-sm:px-2 {c.right ? 'text-right' : ''}">
 						{#if c.sort && onsort}
 							<button type="button" class="hover:text-foreground inline-flex max-w-full items-center gap-1 font-medium max-sm:min-h-9 {sort === c.key ? 'text-foreground' : ''}" onclick={() => onsort(c.key)}>
 								<span class="truncate">{c.label}</span>
@@ -112,7 +112,7 @@
 								tabindex={onrow ? 0 : undefined}
 							>
 								{#each cols as c (c.key)}
-									<div role="cell" class="min-w-0 px-3 {c.right ? 'text-right' : ''}">{@render cell(r, c, idx)}</div>
+									<div role="cell" class="min-w-0 px-3 max-sm:px-2 {c.right ? 'text-right' : ''}">{@render cell(r, c, idx)}</div>
 								{/each}
 							</div>
 						{/each}

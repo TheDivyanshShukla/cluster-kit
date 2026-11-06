@@ -364,19 +364,34 @@ def _bulk_mb(b: float) -> str:
     return f"{b / 1e9:.2f} GB" if b >= 1e9 else f"{b / 1e6:.1f} MB" if b >= 1e5 else f"{b / 1e3:.1f} KB"
 
 
-def _profile(fn: Callable[..., Any], mode: str, items: list[Any]) -> tuple[float, float]:
+def _profile(fn: Callable[..., Any], mode: str, items: list[Any], limit: float = 30.0) -> tuple[float, float]:
     n = len(items)
     k = max(3, math.ceil(n * 0.01))
     # item 0 runs once under tracemalloc (peak memory; also the only timing when items are slow, so a 2 s item is not run twice);
-    # the next ones run untraced and give the time per item
+    # the next ones run untraced and give the time per item. Item 0 runs in a thread so a hung function cannot hang the
+    # caller: past `limit` it counts as a `limit`-second item (the plan then sends the work to the cluster, where timeout_s applies).
     rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     t0 = time.perf_counter()
+    box: dict[str, Any] = {}
+
+    def first_item() -> None:
+        try:
+            _runner.apply(mode, fn, items[0])
+        except BaseException as e:  # noqa: BLE001 - re-raised in the caller
+            box["err"] = e
+        box["peak"] = tracemalloc.get_traced_memory()[1]
+
     tracemalloc.start()
-    try:
-        _runner.apply(mode, fn, items[0])
-        peak = tracemalloc.get_traced_memory()[1]
-    finally:
-        tracemalloc.stop()
+    th = threading.Thread(target=first_item, daemon=True)
+    th.start()
+    th.join(limit)
+    tracemalloc.stop()
+    if th.is_alive():
+        log.warning("item 0 still running after %.0f s locally; planning it as a slow item (it keeps running in the background)", limit)
+        return limit, 0.0
+    if "err" in box:
+        raise box["err"]
+    peak = box.get("peak", 0)
     first = time.perf_counter() - t0
     scale = 1 if sys.platform == "darwin" else 1024
     rss = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss0) * scale
@@ -440,7 +455,7 @@ def _batch_size(per: float, n: int, slots: int, o: Opts) -> int:
 
 def _plan(fn: Callable[..., Any], items: list[Any], mode: str, o: Opts, profile: tuple[float, float] | None = None) -> Plan:
     n = len(items)
-    per, peak_mb = profile or (_profile(fn, mode, items) if n else (0.0, 0.0))
+    per, peak_mb = profile or (_profile(fn, mode, items, min(30.0, o["timeout_s"] or 30.0)) if n else (0.0, 0.0))
     cpus = os.cpu_count() or 1
     procs = min(cpus, n) if per * n > 1.0 else 1
     local_s = n * per / procs + (0.2 if procs > 1 else 0)

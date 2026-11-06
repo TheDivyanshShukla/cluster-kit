@@ -225,7 +225,7 @@ fn run_cmd_par(job: u64, cmd: &[u8], a: u64, b: u64, out: Option<&std::path::Pat
     let t = Instant::now();
     let res: Vec<_> = (0..parts)
         .into_par_iter()
-        .map(|i| run_cmd(cmd, job, parts, a + i * step, (a + (i + 1) * step).min(b), out))
+        .map(|i| run_cmd(cmd, job, parts, a + i * step, (a + (i + 1) * step).min(b), a, out))
         .collect();
     note_piece_cost(job, b - a, parts, t.elapsed().as_secs_f64());
     let fails: Vec<&(bool, String)> = res.iter().filter_map(|r| r.as_ref().err()).collect();
@@ -256,7 +256,7 @@ fn run_list_par(job: u64, arg: &[u8], a: u64, b: u64, out: Option<&std::path::Pa
             let (lo, hi) = ((i * step) as usize, ((i + 1) * step).min(n) as usize);
             let mut stdin = lines[lo..hi].join(&b'\n');
             stdin.push(b'\n');
-            run_cmd_in(cmd, job, parts, a + lo as u64, a + hi as u64, Some(&stdin), out)
+            run_cmd_in(cmd, job, parts, a + lo as u64, a + hi as u64, a, Some(&stdin), out)
         })
         .collect();
     note_piece_cost(job, n, parts, t.elapsed().as_secs_f64());
@@ -354,12 +354,13 @@ impl Drop for OutDir {
 }
 
 /// One piece of a `--cmd` job (JOB-04): env CK_*, exit 0 = ok, 75 = retry, anything else = failed.
-fn run_cmd(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
-    run_cmd_in(cmd, job, pieces, a, b, None, out)
+fn run_cmd(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, chunk_a: u64, out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
+    run_cmd_in(cmd, job, pieces, a, b, chunk_a, None, out)
 }
 
 /// `stdin` = Some(items): a list job piece. The command gets no START END arguments, only the env vars and the items.
-fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, stdin: Option<&[u8]>, out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
+/// `chunk_a` = start of the whole chunk (a piece's `a` differs): a cancel of the job or of that chunk kills the program.
+fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, chunk_a: u64, stdin: Option<&[u8]>, out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
     let scratch = env::temp_dir().join(format!("ck-scratch-{}-{}", std::process::id(), SCRATCH_SEQ.fetch_add(1, Relaxed)));
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch).map_err(|e| (false, format!("scratch dir: {e}")))?;
@@ -374,7 +375,7 @@ fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, stdin: Option<&
     if warm == 0 { c.env("CK_WARM", "off"); }
     c.envs(crate::blobs::env_for(job)); // wave 13: CK_BLOBS, CK_BLOB_<i>
     let cap = out_max();
-    let out = run_capped(&mut c, stdin, cap);
+    let out = run_capped(&mut c, stdin, cap, &|| cancelled(job, chunk_a));
     let _ = fs::remove_dir_all(&scratch);
     let (code, stdout, stderr, over) = out.map_err(|e| (false, format!("could not start the program: {e}")))?;
     if over {
@@ -391,12 +392,31 @@ fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, stdin: Option<&
     }
 }
 
-/// Run `c`, reading stdout as it comes: past `cap` bytes the child is killed (a program printing 1 GB never sits in
-/// RAM). Returns (exit code, stdout, last 64 KiB of stderr, over-cap).
-fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize) -> std::io::Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
+/// Run `c` in its own process group, reading stdout as it comes: past `cap` bytes, or when `stop()` turns true (job or
+/// chunk cancelled), the whole group is killed (a program printing 1 GB never sits in RAM; a hung one frees the PC).
+/// Children the program left behind are killed when it exits. Returns (exit code, stdout, last 64 KiB of stderr, over-cap);
+/// a stopped run returns code None.
+/// ponytail: a child that leaves the group (setsid) is not reached; unix only (Windows: no process groups, only the shell is killed on over-cap).
+fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn() -> bool) -> std::io::Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
     use std::io::Read;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(c, 0);
     c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut ch = c.spawn()?;
+    let pid = ch.id();
+    let killgrp = move || {
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            // SAFETY: plain libc call; a negative pid addresses the process group we created for the child.
+            unsafe { kill(-(pid as i32), 9) };
+        }
+        #[cfg(not(unix))]
+        let _ = pid;
+    };
     if let Some(items) = stdin {
         let mut si = ch.stdin.take().unwrap();
         let items = items.to_vec();
@@ -404,31 +424,54 @@ fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize) -> std::io::Res
         std::thread::spawn(move || { let _ = si.write_all(&items); }); // a closed pipe (program ignored stdin) is fine
     }
     let mut se = ch.stderr.take().unwrap();
-    let err_t = std::thread::spawn(move || {
+    let (err_tx, err_rx) = channel();
+    std::thread::spawn(move || {
         let (mut tail, mut buf) = (Vec::<u8>::new(), [0u8; 8192]);
         while let Ok(n) = se.read(&mut buf) {
             if n == 0 { break; }
             tail.extend_from_slice(&buf[..n]);
             if tail.len() > 131072 { tail.drain(..tail.len() - 65536); }
         }
-        tail
+        let _ = err_tx.send(tail);
     });
     let mut so = ch.stdout.take().unwrap();
-    let (mut out, mut buf, mut over) = (Vec::new(), vec![0u8; 65536], false);
-    loop {
-        let n = so.read(&mut buf).unwrap_or(0);
-        if n == 0 { break; }
-        if out.len() + n > cap { over = true; break; }
-        out.extend_from_slice(&buf[..n]);
-    }
-    if over {
-        let _ = ch.kill();
-        drop(so);
-        let _ = ch.wait();
-        return Ok((None, Vec::new(), Vec::new(), true)); // stderr thread is left to finish on its own
-    }
+    let (out_tx, out_rx) = channel();
+    std::thread::spawn(move || {
+        let (mut out, mut buf, mut over) = (Vec::new(), vec![0u8; 65536], false);
+        loop {
+            let n = so.read(&mut buf).unwrap_or(0);
+            if n == 0 { break; }
+            if out.len() + n > cap { over = true; killgrp(); break; }
+            out.extend_from_slice(&buf[..n]);
+        }
+        let _ = out_tx.send((out, over));
+    });
+    // Wait for stdout to close (normally the moment the program exits), checking every 20 ms for a cancel and for a program
+    // that exited while a child it left behind still holds the pipe (killing the group closes it).
+    let mut stopped = false;
+    let (out, over) = loop {
+        match out_rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(v) => break v,
+            Err(RecvTimeoutError::Timeout) if !stopped && stop() => {
+                stopped = true;
+                killgrp();
+                let _ = ch.kill(); // off unix there is no group: at least the program itself
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if ch.try_wait()?.is_some() { killgrp(); }
+            }
+            Err(_) => break (Vec::new(), false),
+        }
+    };
     let status = ch.wait()?;
-    let tail = err_t.join().unwrap_or_default();
+    killgrp(); // background children of a finished chunk
+    if over {
+        return Ok((None, Vec::new(), Vec::new(), true));
+    }
+    if stopped {
+        return Ok((None, Vec::new(), Vec::new(), false));
+    }
+    let tail = err_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
     Ok((status.code(), out, tail, false))
 }
 
@@ -457,12 +500,24 @@ mod tests {
         let t = Instant::now();
         let mut c = Command::new("sh");
         c.args(["-c", "yes | head -c 1000000000"]);
-        let (_, out, _, over) = run_capped(&mut c, None, 1 << 20).unwrap();
+        let (_, out, _, over) = run_capped(&mut c, None, 1 << 20, &|| false).unwrap();
         assert!(over && out.is_empty() && t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
         let mut c = Command::new("sh");
         c.args(["-c", "cat; echo e >&2; exit 3"]);
-        let (code, out, err, over) = run_capped(&mut c, Some(b"hi"), 1 << 20).unwrap();
+        let (code, out, err, over) = run_capped(&mut c, Some(b"hi"), 1 << 20, &|| false).unwrap();
         assert_eq!((code, out, err, over), (Some(3), b"hi".to_vec(), b"e\n".to_vec(), false));
+        // a cancel kills the whole group: a hung program and its background child, both holding stdout
+        let t = Instant::now();
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 100 & sleep 100"]);
+        let (code, _, _, over) = run_capped(&mut c, None, 1 << 20, &|| t.elapsed() > Duration::from_millis(200)).unwrap();
+        assert!(code.is_none() && !over && t.elapsed().as_secs() < 3, "{:?}", t.elapsed());
+        // a program that exits leaving a child on the pipe returns at once (the group is killed)
+        let t = Instant::now();
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 100 & echo done"]);
+        let (code, out, _, _) = run_capped(&mut c, None, 1 << 20, &|| false).unwrap();
+        assert!(code == Some(0) && out == b"done\n" && t.elapsed().as_secs() < 3, "{:?}", t.elapsed());
     }
 
     #[test]
@@ -516,7 +571,7 @@ mod tests {
 
     #[cfg(unix)]
     fn cmd(script: &str, a: u64, b: u64) -> Result<Vec<u8>, (bool, String)> {
-        run_cmd(format!("sh -c '{script}' x").as_bytes(), 7, 2, a, b, None)
+        run_cmd(format!("sh -c '{script}' x").as_bytes(), 7, 2, a, b, a, None)
     }
 
     #[cfg(unix)]
@@ -549,7 +604,7 @@ mod tests {
         assert!(e.0 && e.1.contains("75") && e.1.contains("oops"), "{e:?}");
         let e = cmd("echo a >&2; echo last >&2; exit 3", 0, 1).unwrap_err();
         assert!(!e.0 && e.1 == "exit 3: last", "{e:?}");
-        assert!(run_cmd(b"/no/such/program-x", 1, 1, 0, 1, None).is_err());
+        assert!(run_cmd(b"/no/such/program-x", 1, 1, 0, 1, 0, None).is_err());
         // mixed pieces: retry only if every failing piece said 75
         assert_eq!(run_cmd_par(1, b"sh -c 'exit 75' x", 0, 4, None).unwrap_err().0, true);
     }
@@ -593,7 +648,7 @@ mod tests {
     fn ck_out_files_are_collected_and_limited() {
         let d = OutDir::new().unwrap();
         let p = d.0.clone();
-        run_cmd(b"sh -c 'echo hi > $CK_OUT/a.txt; echo yo > $CK_OUT/b_$CK_START.txt; mkdir $CK_OUT/sub; echo x > $CK_OUT/sub/c' x", 7, 1, 4, 9, Some(&d.0)).unwrap();
+        run_cmd(b"sh -c 'echo hi > $CK_OUT/a.txt; echo yo > $CK_OUT/b_$CK_START.txt; mkdir $CK_OUT/sub; echo x > $CK_OUT/sub/c' x", 7, 1, 4, 9, 4, Some(&d.0)).unwrap();
         let f = d.files(1).unwrap();
         assert_eq!(f.iter().map(|x| (x.0.as_str(), x.2)).collect::<Vec<_>>(), vec![("a.txt", 3), ("b_4.txt", 3)], "top-level regular files only");
         std::fs::write(d.0.join("big"), vec![0u8; 2 << 20]).unwrap();

@@ -19,6 +19,32 @@ pub fn default_path() -> PathBuf {
     PathBuf::from(std::env::var("CK_DATA").unwrap_or_else(|_| "ck-data".into())).join("head.db")
 }
 
+/// One head process per data directory: hold an exclusive advisory lock on `CK_DATA/head.lock` for the life of the process
+/// (the OS drops it on exit or kill -9). A second head on the same directory would write the same SQLite file as a split brain.
+/// Calling it again in the same process (a standby that promotes) is a no-op. No-op off unix.
+pub fn lock_data() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        static LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+        extern "C" {
+            fn flock(fd: i32, op: i32) -> i32;
+        }
+        if LOCK.get().is_some() {
+            return Ok(());
+        }
+        let dir = default_path().parent().map(Path::to_path_buf).unwrap_or_default();
+        std::fs::create_dir_all(&dir).map_err(|x| format!("create {}: {x}", dir.display()))?;
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("head.lock")).map_err(|x| format!("head.lock: {x}"))?;
+        // SAFETY: plain libc call on a file descriptor we own (LOCK_EX | LOCK_NB).
+        if unsafe { flock(f.as_raw_fd(), 2 | 4) } != 0 {
+            return Err(format!("another ck head already uses the data directory {} (one head per CK_DATA)", dir.display()));
+        }
+        let _ = LOCK.set(f);
+    }
+    Ok(())
+}
+
 /// Retention (wave 14): delete old events and, if `parts_days` > 0, parts of long-finished jobs, in batches of 2,000
 /// rows on its own connection so dispatch never waits long. Returns (events, parts) deleted.
 pub fn prune(path: &Path, events_days: u64, parts_days: u64, now_ms: i64) -> Result<(u64, u64), String> {
@@ -75,6 +101,9 @@ pub fn maintenance_thread() {
         let mut last_prune = std::time::Instant::now() - std::time::Duration::from_secs(3600);
         std::thread::sleep(std::time::Duration::from_secs(30)); // after the head's own startup and migrations
         loop {
+            if !path.exists() {
+                crate::warnl!("store.missing", "{} was deleted while the head runs: new results are going to an unlinked file and are lost at restart; restore a backup and restart", path.display());
+            }
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
             if last_prune.elapsed().as_secs() >= 600 {
                 last_prune = std::time::Instant::now();
@@ -261,6 +290,8 @@ fn setup(mut c: Connection) -> Result<Store, String> {
     c.busy_timeout(std::time::Duration::from_millis(5000)).map_err(e)?;
     c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;").map_err(e)?;
     migrate(&mut c)?;
+    // t2: a read-only CK_DATA opens fine and then fails every write; refuse at start instead of serving 500s.
+    c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).and_then(|v| c.execute_batch(&format!("PRAGMA user_version={v}"))).map_err(|x| format!("database is not writable (read-only CK_DATA or disk?): {x}"))?;
     Ok(Store { conn: Mutex::new(c) })
 }
 
@@ -280,7 +311,10 @@ impl Store {
         // A damaged file or WAL opens on whatever SQLite can recover; say so loudly instead of starting silently.
         let check: String = s.db().query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap_or_else(|x| x.to_string());
         if check != "ok" {
-            crate::warnl!("store.corrupt", "{}: integrity check failed ({check}); restore a backup (docs/OPERATIONS.md section 6)", path.display());
+            if std::env::var("CK_IGNORE_CORRUPT").is_err() {
+                return Err(format!("{}: integrity check failed ({check}); restore a backup (docs/OPERATIONS.md section 6), or set CK_IGNORE_CORRUPT=1 to start on what is readable", path.display()));
+            }
+            crate::warnl!("store.corrupt", "{}: integrity check failed ({check}); started anyway (CK_IGNORE_CORRUPT)", path.display());
         } else if !had_data && had_wal {
             crate::warnl!("store.corrupt", "{}: database file was empty but a WAL existed; started from what the WAL held", path.display());
         }

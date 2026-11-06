@@ -356,10 +356,11 @@ impl Drop for Active {
 
 fn handle(s: TcpStream) -> io::Result<()> {
     s.set_nodelay(true)?;
+    let mut s = s;
+    let (k, id) = proto::recv_by(&mut s, 4096, Duration::from_secs(10))?; // unauthenticated: small and with a deadline
     s.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut w = s.try_clone()?;
     let mut r = BufReader::with_capacity(1 << 16, s);
-    let (k, id) = recv(&mut r)?;
     let t = {
         let mut g = TICKETS.lock().unwrap();
         let id = String::from_utf8_lossy(&id).to_string();
@@ -663,7 +664,22 @@ static JOB_BLOBS: Mutex<Vec<(u64, Vec<String>, Option<(u16, String)>)>> = Mutex:
 
 /// Shas in the cache (complete files only).
 pub fn cached() -> Vec<String> {
-    scan(&cache_dir()).into_iter().map(|x| x.0).collect()
+    // t2: the head trusts this list, so a file whose bytes no longer hash to its name (bit rot, torn write, wrong length) must
+    // not be in it. Hashed once per process per (name, length); a bad one is deleted so the head fetches it again.
+    // ponytail: later rot in a file already verified by this process is not seen until restart.
+    static OK: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    let ok = OK.get_or_init(Default::default);
+    let dir = cache_dir();
+    scan(&dir).into_iter().filter(|(n, len, _)| {
+        if ok.lock().unwrap().get(n) == Some(len) { return true; }
+        let good = File::open(dir.join(n)).and_then(|mut f| hash_stream(&mut f, None, 4 << 20, u64::MAX)).is_ok_and(|h| h.0 == *n);
+        if good { ok.lock().unwrap().insert(n.clone(), *len); } else {
+            crate::warnl!("blob.corrupt", "cached blob {} does not match its hash; deleted, will be fetched again", &n[..12]);
+            let _ = fs::remove_file(dir.join(n));
+            let _ = fs::remove_file(dir.join(format!("{n}.idx")));
+        }
+        good
+    }).map(|x| x.0).collect()
 }
 
 pub fn report_have(w: &Mutex<Out>, extra: Value) {

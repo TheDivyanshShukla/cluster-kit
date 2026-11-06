@@ -36,7 +36,7 @@ export function layoutScene(pcs: PcIn[], labs: LabIn[], prev: Map<string, string
 	const defs: LabIn[] = [...labs].sort((a, b) => a.id - b.id);
 	if (groups.has(0)) {
 		const n = groups.get(0)!.length;
-		defs.push({ id: 0, name: 'Unassigned', w: Math.max(4, Math.ceil(Math.sqrt(n * 1.6))), h: 1 });
+		defs.push({ id: 0, name: 'Unassigned', w: Math.max(6, Math.ceil(Math.sqrt(n * 1.6))), h: 1 });
 	}
 	// every lab gets a box; size grows only when more PCs need seats than the lab has
 	const boxes: { def: LabIn; cols: number; rows: number; members: PcIn[] }[] = defs.map((def) => {

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { CircleAlert, Lock, UserPlus } from '@lucide/svelte';
+	import { MediaQuery } from 'svelte/reactivity';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import { Role, type Quota } from '#lib/api/schema.ts';
 	import DataTable, { type Col } from '#lib/components/DataTable.svelte';
@@ -42,14 +43,26 @@
 	};
 	const l = new Listing<Row>(spec);
 	const res = $derived(l.run(users));
-	const cols: Col[] = [
-		{ key: 'name', label: 'Name', w: 'minmax(120px,1fr)', sort: true },
-		{ key: 'role', label: 'Role', w: '110px', sort: true },
-		{ key: 'created', label: 'Created', w: '170px', sort: true },
-		{ key: 'pcs', label: 'Max PCs', w: '96px' },
-		{ key: 'run', label: 'Max running', w: '104px' },
-		{ key: 'save', label: '', w: '84px' }
-	];
+	// phones: drop Created and shrink the quota columns so the table fits without sideways scroll
+	const phone = new MediaQuery('max-width: 639px');
+	const cols: Col[] = $derived(
+		phone.current
+			? [
+					{ key: 'name', label: 'Name', w: 'minmax(80px,1fr)', sort: true },
+					{ key: 'role', label: 'Role', w: '76px', sort: true },
+					{ key: 'pcs', label: 'PCs', w: '64px' },
+					{ key: 'run', label: 'Jobs', w: '64px' },
+					{ key: 'save', label: '', w: '62px' }
+				]
+			: [
+					{ key: 'name', label: 'Name', w: 'minmax(120px,1fr)', sort: true },
+					{ key: 'role', label: 'Role', w: '110px', sort: true },
+					{ key: 'created', label: 'Created', w: '170px', sort: true },
+					{ key: 'pcs', label: 'Max PCs', w: '96px' },
+					{ key: 'run', label: 'Max running', w: '104px' },
+					{ key: 'save', label: '', w: '84px' }
+				]
+	);
 	// quota editor: 0 means no limit. A draft exists only while the numbers differ from the saved ones.
 	let draft = $state<Record<string, { pcs: number; run: number }>>({});
 	let qBusy = $state('');
@@ -124,13 +137,13 @@
 				<div class="p-4"><EmptyState icon={CircleAlert} title="Could not load users" body={error} /></div>
 			{:else}
 				{#if qError}<p class="text-bad px-3 pt-2 text-[13px]" role="alert">{qError}</p>{/if}
-				<DataTable label="Users" rows={res.rows} {cols} minW={720} rowKey={(u) => u.name} sort={l.state.sort} dir={l.state.dir} onsort={(c) => l.sortBy(c)}>
+				<DataTable label="Users" rows={res.rows} {cols} minW={phone.current ? 0 : 720} rowKey={(u) => u.name} sort={l.state.sort} dir={l.state.dir} onsort={(c) => l.sortBy(c)}>
 					{#snippet cell(u, c)}
 						{#if c.key === 'name'}<span class="block truncate font-medium"><Hl text={u.name} q={l.state.q} /></span>
 						{:else if c.key === 'role'}{u.role}
 						{:else if c.key === 'pcs' || c.key === 'run'}
 							<input
-								class="{field} num h-8 w-full px-2 py-1 text-right"
+								class="{field} num h-8 w-full px-2 py-1 text-right [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
 								type="number"
 								min="0"
 								step="1"
@@ -140,7 +153,7 @@
 								oninput={(e) => edit(u, c.key as 'pcs' | 'run', e.currentTarget.valueAsNumber)}
 							/>
 						{:else if c.key === 'save'}
-							{#if dirty(u)}<button type="button" class="{btnPrimary} h-8 px-3" disabled={qBusy === u.name || !okNum(dv(u).pcs) || !okNum(dv(u).run)} onclick={() => saveQuota(u)}>Save</button>{/if}
+							{#if dirty(u)}<button type="button" class="{btnPrimary} h-8 px-3 max-sm:px-2" disabled={qBusy === u.name || !okNum(dv(u).pcs) || !okNum(dv(u).run)} onclick={() => saveQuota(u)}>Save</button>{/if}
 						{:else}<span class="text-muted-foreground whitespace-nowrap">{datetime(u.created_ms)}</span>{/if}
 					{/snippet}
 					{#snippet empty()}

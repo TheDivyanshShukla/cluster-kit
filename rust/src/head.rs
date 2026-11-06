@@ -796,18 +796,23 @@ fn watchdog(ctx: Arc<Ctx>) {
             late.extend(w.sent.iter().filter(|(k, t)| now.duration_since(**t) > task_limit(w.rate, k.2 - k.1)).map(|(k, _)| (*wid, *k)));
         }
         let mut outs = vec![];
+        let mut timeout_sends: Sends = vec![];
         for (wid, k) in late {
             let w = st.workers.get_mut(&wid).unwrap();
             w.inflight.retain(|t| *t != k);
             w.sent.remove(&k);
             let who = w.addr.clone();
             event(&ctx, "task.timeout", "head", &format!("job {} chunk {}..{} on {who} took too long", k.0, k.1, k.2));
+            if let Some(o) = w.out.clone() {
+                timeout_sends.push((o, CANCEL_RANGE, pack(&[k.0, k.1, k.2]))); // the PC kills the stuck program and is free again
+            }
             if !held(&st, k) {
                 outs.push((k.0, chunk_failed(&ctx, &mut st, k.0, k.1, k.2, true, "timed out")));
             }
             settle_drain(&ctx, &mut st, wid);
         }
         drop(st);
+        flush(timeout_sends);
         for (job, o) in outs {
             cancel_outs(o, job);
         }
@@ -1224,7 +1229,7 @@ fn admit(s: &mut TcpStream, ctx: &Ctx, h: &Hello, addr: &str) -> io::Result<Resu
         Plan::Challenge(key) => {
             let n = auth::nonce();
             send(s, CHALLENGE, &n)?;
-            Ok(match recv(s)? {
+            Ok(match crate::proto::recv_by(s, 1024, Duration::from_secs(10))? {
                 (PROOF, p) if auth::verify(&key, &n, &h.node_id, &p) => Ok(key),
                 _ => Err("wrong key".into()),
             })
@@ -1351,7 +1356,18 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
         return Ok((ack_now(&st), credit));
     }
     // ponytail: the store write happens under the State lock so ATTACH sees parts and live frames without a gap.
-    if !ctx.store.add_part(job, a, b, &p[RESULT_HDR..]).unwrap_or_else(|e| { crate::warnl!("job.error", "job {job}: {e}"); true }) {
+    let stored = match ctx.store.add_part(job, a, b, &p[RESULT_HDR..]) {
+        Ok(n) => n,
+        Err(e) => {
+            // t2: a failed write (disk full, read-only, I/O error) is NOT a stored result: no ACK, no progress, run the chunk again.
+            crate::warnl!("job.error", "job {job}: result {a}..{b} not stored ({e}); queued again");
+            acct_waste(&mut st, job, wid, secs, None);
+            requeue_missing(&mut st, job, vec![(a, b)]);
+            sh.1.notify_all();
+            return Ok((vec![], credit));
+        }
+    };
+    if !stored {
         acct_waste(&mut st, job, wid, secs, None);
         return Ok((ack_now(&st), credit)); // already stored (re-run, speculative copy, or an agent resending after a failover, HA-04): ACK at once
     }
@@ -1746,7 +1762,10 @@ fn serve_standby_conn(mut s: TcpStream, ctx: Arc<Ctx>, p: &[u8]) -> io::Result<(
     crate::repl::serve_standby(&ctx, s, p, sk)
 }
 
-fn serve_client(s: TcpStream, ctx: Arc<Ctx>) -> io::Result<()> {
+fn serve_client(s: TcpStream, ctx: Arc<Ctx>, token: &[u8]) -> io::Result<()> {
+    // The TCP client path used to run anyone's SUBMIT (cmd jobs included) with no credentials. Now HELLO_C carries an API token
+    // (env CK_TOKEN on the `ck run` side); same roles as POST /jobs: cmd and list need operator, the rest researcher.
+    let who = crate::users::Auth::from_env().who(&ctx.store, None, std::str::from_utf8(token).ok().map(str::trim).filter(|t| !t.is_empty()));
     let peer = s.peer_addr().map_or("?".into(), |a| a.ip().to_string());
     let (mut r, mut w) = conn(s)?;
     loop {
@@ -1755,6 +1774,18 @@ fn serve_client(s: TcpStream, ctx: Arc<Ctx>) -> io::Result<()> {
             PING => send(&mut w, PONG, &p)?,
             SUBMIT | SUBMIT_JSON => {
                 let spec = if k == SUBMIT { Ok(client_job(&p, &peer)) } else { client_job_json(&p, &peer) };
+                let spec = spec.and_then(|mut sp| {
+                    let need = if matches!(sp.kind, KIND_CMD | KIND_LIST) { crate::users::Role::Operator } else { crate::users::Role::Researcher };
+                    match &who {
+                        Some(w) if w.role >= need => {
+                            sp.submitter = w.name.clone();
+                            Ok(sp)
+                        }
+                        Some(_) => Err(format!("forbidden: needs the {} role", need.name())),
+                        None if crate::proto::fleet_open() => Ok(sp), // dev/test fleet: anyone may join, so anyone may submit
+                        None => Err("unauthorized: set CK_TOKEN (an API token) for ck run".into()),
+                    }
+                });
                 let (tx, rx) = mpsc::channel();
                 let row = match spec.and_then(|spec| submit_with(&ctx, spec, Some(tx))) {
                     Ok(row) => row,
@@ -1763,6 +1794,7 @@ fn serve_client(s: TcpStream, ctx: Arc<Ctx>) -> io::Result<()> {
                 send(&mut w, ACCEPTED, &row.id.to_le_bytes())?;
                 return stream(&mut w, rx); // a client that leaves does not cancel the job (JOB-02)
             }
+            ATTACH if who.is_none() && !crate::proto::fleet_open() => return send(&mut w, ERR, b"unauthorized: set CK_TOKEN"),
             ATTACH => return attach(&ctx, &mut w, u64_at(&p, 0)?),
             _ => {}
         }
@@ -1917,6 +1949,7 @@ fn resume(ctx: &Ctx) {
 pub fn run(o: &Opts) {
     now(); // start the dashboard clock
     let sh: Shared = Arc::default();
+    crate::store::lock_data().unwrap_or_else(|e| die(&e));
     let store = crate::store::Store::open(&crate::store::default_path()).unwrap_or_else(|e| die(&format!("database: {e}")));
     let ctx = Arc::new(Ctx { sh: sh.clone(), store: Arc::new(store), bus: Default::default(), repl: Default::default() });
     crate::tune::load(ctx.store.meta("tune").as_deref());
@@ -1985,12 +2018,11 @@ pub fn run(o: &Opts) {
             let _ = s.set_nodelay(true);
             // nobody has vouched for this connection yet: a hello is small and must arrive soon. Without the limits a
             // silent TCP connect held a thread forever and a 256 MiB "hello" was allocated before it was read.
-            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-            let first = crate::proto::recv_max(&mut s, 1 << 20);
+            let first = crate::proto::recv_by(&mut s, 1 << 20, Duration::from_secs(10));
             let _ = s.set_read_timeout(None);
             let _ = match first { // hello is read unbuffered so nothing is left in a buffer
                 Ok((HELLO_W, p)) => serve_worker(s, ctx, &p, wid),
-                Ok((HELLO_C, _)) => serve_client(s, ctx),
+                Ok((HELLO_C, p)) => serve_client(s, ctx, &p),
                 Ok((HELLO_S, p)) => serve_standby_conn(s, ctx, &p),
                 _ => Ok(()),
             };

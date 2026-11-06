@@ -898,7 +898,9 @@ fn session(store: &mut Store, path: &Path, mut s: TcpStream, sb: &mut Sb) -> io:
                     tx.send(&mut s, proto::REPL_ACK, &applied.to_le_bytes())?;
                 }
             }
-            _ => {} // HEARTBEAT and anything unknown
+            // an idle link carries nothing else, and the primary drops a standby it has not heard from for lost_after_s (T1 netfault)
+            proto::HEARTBEAT => tx.send(&mut s, proto::HEARTBEAT, &[])?,
+            _ => {} // anything unknown
         }
     }
 }
@@ -936,7 +938,20 @@ fn watch_beacons(epoch: Arc<AtomicU64>, head: Arc<Mutex<String>>, cur: Arc<Mutex
 pub fn run_standby(o: &crate::Opts) {
     let first = o.head.clone().unwrap_or_else(|| crate::die("--standby needs --head PRIMARY_IP"));
     let path = crate::store::default_path();
-    let mut store = Store::open(&path).unwrap_or_else(|e| crate::die(&format!("database: {e}")));
+    crate::store::lock_data().unwrap_or_else(|e| crate::die(&e));
+    // t2: a standby's database is only a copy of the primary's. If it will not open or fails the integrity check, move it aside and
+    // take a fresh snapshot (an unsynced standby never promotes: the "synced" meta key is set only after a snapshot or replay).
+    let mut store = Store::open(&path).or_else(|e| {
+        crate::warnl!("store.corrupt", "standby database unusable ({e}); moved aside, a full copy will be taken from the primary");
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        for ext in ["", "-wal", "-shm"] {
+            let (mut from, mut to) = (path.as_os_str().to_owned(), path.as_os_str().to_owned());
+            from.push(ext);
+            to.push(format!("{ext}.bad-{ts}"));
+            let _ = std::fs::rename(from, to);
+        }
+        Store::open(&path)
+    }).unwrap_or_else(|e| crate::die(&format!("database: {e}")));
     sb_fence(&store);
     let epoch = Arc::new(AtomicU64::new(num(store.meta("epoch"))));
     let head = Arc::new(Mutex::new(first));
