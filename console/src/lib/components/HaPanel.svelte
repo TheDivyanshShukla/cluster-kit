@@ -27,9 +27,11 @@
 	let tuneNote = $state('');
 	$effect(() => {
 		if (full)
-			api.haSettings()
-				.then((r) => ((want = r.settings.target_standbys), (sel = r.settings.selector), (tuned = true), (live.haCfg = r.settings)))
-				.catch(() => (tuneNote = 'Could not load the standby settings.'));
+			void loadHaCfg().then(() => {
+				const c = live.haCfg; // shared load: the topology panel asks for the same settings at the same moment
+				if (c) ((want = c.target_standbys), (sel = c.selector), (tuned = true));
+				else tuneNote = 'Could not load the standby settings.';
+			});
 	});
 	const validWant = $derived(Number.isInteger(want) && want >= 0 && want <= 5);
 	async function saveTune() {
@@ -39,7 +41,7 @@
 			want = r.settings.target_standbys;
 			sel = r.settings.selector;
 			live.haCfg = r.settings;
-			void loadHaCfg();
+			void loadHaCfg(true);
 			tuneNote = 'Saved. The head recruits or releases standbys within a minute.';
 		} catch (e) {
 			tuneNote = e instanceof ApiError ? e.message : 'The head did not answer.';

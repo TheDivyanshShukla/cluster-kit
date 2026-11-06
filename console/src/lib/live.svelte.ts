@@ -56,15 +56,24 @@ function noteWake(n: NodeRow) {
 	else delete live.wakeSince[n.node_id];
 }
 
-export async function loadHaCfg() {
-	try {
-		const { settings } = await api.haSettings();
-		live.haCfg = settings;
-		const q = settings.selector.trim();
-		live.haCandidates = q ? (await api.select(q)).node_ids : Object.keys(live.nodes);
-	} catch {
-		// a role that may not read the settings simply gets no recruit slot
-	}
+let haLoad: Promise<void> | null = null;
+let haAt = 0;
+/** HA settings + the PCs its selector matches. Callers at the same moment share one request, and a load in the last 2 s
+ *  is reused unless `force` (an SSE change or a save): panels mounting together used to fetch it three times. */
+export function loadHaCfg(force = false): Promise<void> {
+	if (haLoad) return haLoad;
+	if (!force && Date.now() - haAt < 2000) return Promise.resolve();
+	haLoad = (async () => {
+		try {
+			const { settings } = await api.haSettings();
+			live.haCfg = settings;
+			const q = settings.selector.trim();
+			live.haCandidates = q ? (await api.select(q)).node_ids : Object.keys(live.nodes);
+		} catch {
+			// a role that may not read the settings simply gets no recruit slot
+		}
+	})().finally(() => ((haLoad = null), (haAt = Date.now())));
+	return haLoad;
 }
 export async function loadPowerCfg() {
 	try {
@@ -198,7 +207,7 @@ function connect() {
 	listen('changed', (v) => Changed.safeParse(v), ({ what }) => {
 		live.rev[what]++;
 		if (what === 'labels') void loadFleet();
-		if (what === 'candidates') void loadHaCfg();
+		if (what === 'candidates') void loadHaCfg(true);
 	});
 	listen('log', (v) => LogBatch.safeParse(v), ({ lines }) => {
 		live.logTail = [...lines.slice().reverse(), ...live.logTail].slice(0, TAIL_MAX);
@@ -212,7 +221,7 @@ function connect() {
 		if (ev.kind.startsWith('power.') && live.powerCfg) void loadPowerCfg();
 		if (ev.kind === 'ha.recruit') {
 			void loadHa();
-			void loadHaCfg();
+			void loadHaCfg(true);
 		}
 	});
 	s.onerror = () => {
