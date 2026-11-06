@@ -1,0 +1,8 @@
+case,makespan_s,delta_vs_same_arch_no_fault_s,delta_pct,recomputed_units,regranted_units,ideal_s
+"1-level, no fault",1801.38,0.00,0.000,0,0,1800.2
+"1-level, root killed at 10 min, standby 5.7 s",1805.91,4.53,0.252,0,0,1800.2
+"1-level, root killed at 10 min, manual restart 300 s",2100.21,298.83,16.589,0,0,1800.2
+"2-level, no fault",1800.90,0.00,0.000,0,0,1800.2
+"2-level, lab head killed at 10 min",1803.25,2.35,0.130,1575,3001,1800.2
+"2-level, root killed at 10 min, standby 5.7 s",1800.90,0.00,0.000,0,0,1800.2
+"2-level, root killed at 10 min, manual restart 300 s",2071.05,270.15,15.001,0,0,1800.2

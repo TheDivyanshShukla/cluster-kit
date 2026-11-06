@@ -21,6 +21,7 @@
 //!   auth      credentials and frame MACs              install  system service
 //!   gpu       SHA-256 on the GPU (feature "gpu")
 
+mod advisor;
 mod agent;
 mod auth;
 mod blobs;

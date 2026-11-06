@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
-	import { BellOff, Check, CircleAlert } from '@lucide/svelte';
+	import { BellOff, Check, CircleAlert, Lightbulb } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import type { Alert } from '#lib/api/schema.ts';
 	import { alertOrder, KIND_LABEL, mergeAlerts, SEV_LABEL, SEVERITIES } from '#lib/alerts.ts';
@@ -20,6 +20,8 @@
 	import { vp } from '#lib/viewport.svelte.ts';
 	import { btnGhost } from '#lib/ui.ts';
 
+	import { openCount, suggestionsText } from '#lib/advisor.ts';
+	const nAdvice = $derived(openCount(live.advice));
 	let rows0 = $state<Alert[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
@@ -88,6 +90,9 @@
 </script>
 
 <Page title="Alerts" subtitle="Slow or flaky PCs, a busy head, a lagging standby, a reserve about to break. Thresholds are in System, group Alerts.">
+	{#snippet actions()}
+		{#if nAdvice > 0}<a href="/advisor" class="text-primary inline-flex min-h-6 items-center gap-1.5 text-[13px] font-medium hover:underline"><Lightbulb class="size-3.5" aria-hidden="true" />{suggestionsText(nAdvice)}</a>{/if}
+	{/snippet}
 	<Panel title="Alerts" count={activeN ? `${activeN} active` : 'none active'} scroll={false} pad={false}>
 		{#snippet toolbar()}
 			<ListToolbar {l} rows={rows0} shown={res.rows.length} total={rows0.length} placeholder="Search alerts" />

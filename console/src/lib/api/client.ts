@@ -53,6 +53,13 @@ import {
 	JobFiles,
 	Net,
 	TemplateList,
+	AdviceList,
+	AdviceHistory,
+	AdviceReplyList,
+	AdviceApplyReply,
+	AdvicePreviewReply,
+	AdviceSettingsReply,
+	type AdviceMode,
 	type Role
 } from './schema';
 
@@ -227,6 +234,14 @@ export const api = {
 	experiments: () => call('GET', '/api/v1/experiments', ExperimentList),
 	experiment: (id: number) => call('GET', `/api/v1/experiments/${id}`, ExperimentOne),
 	report: (day: string) => call('GET', `/api/v1/report?day=${encodeURIComponent(day)}`, DayReportReply),
+	// advisor
+	advice: () => call('GET', '/api/v1/advice', AdviceList),
+	adviceHistory: () => call('GET', '/api/v1/advice/history', AdviceHistory),
+	setAdvice: (b: { enabled?: boolean; policy?: Record<string, AdviceMode | null> }) => call('PUT', '/api/v1/advice/settings', AdviceSettingsReply, b),
+	advicePreview: (id: string, option?: string) => call('POST', `/api/v1/advice/${encodeURIComponent(id)}/preview`, AdvicePreviewReply, option ? { option } : {}),
+	adviceApply: (id: string, option?: string) => call('POST', `/api/v1/advice/${encodeURIComponent(id)}/apply`, AdviceApplyReply, option ? { option } : {}),
+	adviceUndo: (id: string) => call('POST', `/api/v1/advice/${encodeURIComponent(id)}/undo`, AdviceReplyList, {}),
+	adviceDismiss: (id: string, snooze_h = 24) => call('POST', `/api/v1/advice/${encodeURIComponent(id)}/dismiss`, AdviceReplyList, { snooze_h }),
 	// legacy
 	stats: (detail = false) => call('GET', detail ? '/stats?detail=1' : '/stats', Stats)
 };

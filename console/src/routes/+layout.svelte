@@ -1,7 +1,7 @@
 <script lang="ts">
 	import '../app.css';
 	import { page } from '$app/state';
-	import { Bell, CalendarClock, CircleAlert, FileText, FlaskConical, Gauge, Sigma, Search, ListChecks, Radio, LogOut, Map as MapIcon, Moon, MonitorPlay, Network, Server, Settings, SlidersHorizontal, Sun, User as UserIcon, Users, WifiOff } from '@lucide/svelte';
+	import { Bell, Lightbulb, CalendarClock, CircleAlert, FileText, FlaskConical, Gauge, Sigma, Search, ListChecks, Radio, LogOut, Map as MapIcon, Moon, MonitorPlay, Network, Server, Settings, SlidersHorizontal, Sun, User as UserIcon, Users, WifiOff } from '@lucide/svelte';
 	import type { LayoutProps } from './$types';
 	import AuthForm from '#lib/components/AuthForm.svelte';
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
@@ -13,6 +13,7 @@
 	import { authed, loadMe, roleNow, session, signOut, userNow } from '#lib/session.svelte.ts';
 	import { palette } from '#lib/palette.svelte.ts';
 	import { btnGhost } from '#lib/ui.ts';
+	import { openCount, suggestionsText } from '#lib/advisor.ts';
 
 	let { children }: LayoutProps = $props();
 	$effect(() => void loadMe());
@@ -37,12 +38,14 @@
 			{ href: '/experiments', label: 'Experiments', icon: FlaskConical, show: true },
 			{ href: '/sim', label: 'Simulation', icon: Sigma, show: atLeast(roleNow(), 'researcher') },
 			{ href: '/alerts', label: 'Alerts', icon: Bell, show: true },
+			{ href: '/advisor', label: 'Advisor', icon: Lightbulb, show: true },
 			{ href: '/report', label: 'Report', icon: FileText, show: true },
 			{ href: '/wall', label: 'Wall mode', icon: MonitorPlay, show: true },
 			{ href: '/settings', label: 'System', icon: Settings, show: atLeast(roleNow(), 'operator') },
 			{ href: '/users', label: 'Users', icon: Users, show: atLeast(roleNow(), 'admin') }
 		].filter((n) => n.show)
 	);
+	const nAdvice = $derived(openCount(live.advice));
 	const nActive = $derived(live.alerts.filter((a) => a.active).length);
 	const isActive = (href: string) => (href === '/' ? page.url.pathname === '/' : page.url.pathname.startsWith(href));
 
@@ -102,7 +105,7 @@
 							? 'bg-raised text-foreground font-medium'
 							: 'text-muted-foreground hover:bg-raised hover:text-foreground'}"
 					>
-						<item.icon class="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span class="max-md:sr-only">{item.label}</span>{#if item.href === '/alerts' && nActive > 0}<span class="bg-bad text-primary-foreground num ml-auto rounded-full px-1.5 text-[11px] max-md:absolute max-md:hidden" aria-label="{nActive} active alerts">{nActive}</span>{/if}
+						<item.icon class="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span class="max-md:sr-only">{item.label}</span>{#if item.href === '/alerts' && nActive > 0}<span class="bg-bad text-primary-foreground num ml-auto rounded-full px-1.5 text-[11px] max-md:absolute max-md:hidden" aria-label="{nActive} active alerts">{nActive}</span>{/if}{#if item.href === '/advisor' && nAdvice > 0}<span class="bg-primary text-primary-foreground num ml-auto rounded-full px-1.5 text-[11px] max-md:absolute max-md:hidden" aria-label="{suggestionsText(nAdvice)}">{nAdvice}</span>{/if}
 					</a>
 				{/each}
 			</nav>

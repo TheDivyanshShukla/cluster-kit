@@ -170,16 +170,19 @@ pub fn run(o: &Opts) {
                 let (name, sha, c) = (f["name"].as_str().unwrap_or(""), f["sha"].as_str().unwrap_or(""), &f["chunk"]);
                 println!("{:>10}-{:<10} {:>12}  {}  {}", dash(&c[0]), dash(&c[1]), dash(&f["size"]), &sha[..sha.len().min(12)], name);
                 if let Some(d) = &dir {
-                    if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+                    // nested names (d/e/x.txt) are fine; no absolute paths, backslashes, or empty/dot parts (no `..`)
+                    if name.is_empty() || name.starts_with('/') || name.contains('\\') || name.split('/').any(|c| c.is_empty() || c.starts_with('.')) {
                         die(&format!("refusing unsafe file name {name:?}"));
                     }
                     let to = std::path::Path::new(d).join(format!("{}-{}", dash(&c[0]), dash(&c[1])));
-                    std::fs::create_dir_all(&to).unwrap_or_else(|e| die(&format!("{}: {e}", to.display())));
+                    let dest = to.join(name);
+                    let parent = dest.parent().unwrap_or(&to).to_path_buf();
+                    std::fs::create_dir_all(&parent).unwrap_or_else(|e| die(&format!("{}: {e}", parent.display())));
                     let r = request(o, "GET", &format!("/api/v1/blobs/{}", enc(sha)), None, &[]).unwrap_or_else(|e| die(&e));
                     if r.status >= 400 {
                         die(&ok_json(r).unwrap_err());
                     }
-                    std::fs::write(to.join(name), &r.body).unwrap_or_else(|e| die(&e.to_string()));
+                    std::fs::write(&dest, &r.body).unwrap_or_else(|e| die(&e.to_string()));
                 }
             }
         }
@@ -210,7 +213,7 @@ pub fn token(o: &Opts) {
 pub const CLI_MAP: &[(&str, &str, &str)] = &[
     ("GET", "/me", "no CLI needed: session"), ("GET", "/ha", "ck admin ha"), ("POST", "/ha/switchover", "ck admin switchover NODE"),
     ("POST", "/nodes/power", "ck admin sleep|wake"), ("GET", "/power", "ck admin power"), ("PUT", "/power", "ck admin power"), ("GET", "/ha/settings", "ck admin standbys"), ("PUT", "/ha/settings", "ck admin standbys"), ("GET", "/tunables", "ck admin tune"), ("PUT", "/tunables", "ck admin tune KEY VALUE|default"), ("GET", "/ha/candidates", "ck admin heads"), ("GET", "/logs", "ck logs"),
-    ("GET", "/jobs/{id}/breakdown", "ck job breakdown ID"), ("GET", "/alerts", "ck admin alerts"), ("POST", "/alerts/{id}/ack", "ck admin alerts ack ID"),
+    ("GET", "/jobs/{id}/breakdown", "ck job breakdown ID"), ("GET", "/alerts", "ck admin alerts"), ("GET", "/advice", "ck admin advice"), ("GET", "/advice/history", "ck admin advice history"), ("PUT", "/advice/settings", "ck admin advice policy|on|off"), ("POST", "/advice/{id}/{op}", "ck admin advice preview|apply|undo|dismiss ID"), ("POST", "/alerts/{id}/ack", "ck admin alerts ack ID"),
     ("POST", "/experiments", "ck admin experiment upload DIR [NAME]"), ("GET", "/experiments", "ck admin experiment ls"), ("GET", "/experiments/{id}", "ck admin experiment show ID"), ("GET", "/report", "ck admin report [DAY]"), ("POST", "/bootstrap", "no CLI needed: first-run setup in the browser"),
     ("POST", "/login", "ck token"), ("POST", "/logout", "no CLI needed: session"), ("POST", "/tokens", "ck token"),
     ("GET", "/users", "no CLI needed: console user admin"), ("POST", "/users", "no CLI needed: console user admin"),
@@ -281,7 +284,7 @@ fn fmt_local(ms: i64, offset_min: i64) -> String {
 }
 
 fn usage_admin() -> ! {
-    die("usage: ck admin backup [PATH] | nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | net [probe] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | identify NODE... [SECS] | quota USER MAX_PCS MAX_RUNNING | heads | tune [KEY VALUE|default] | alerts [ack ID] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
+    die("usage: ck admin backup [PATH] | nodes | approve ID... | state STATE ID... | labs | lab-add NAME W H | place NODE LAB X Y | unplace NODE | join-code [USES] [TTL_MIN]\n  | select SELECTOR | label NODE KEY=VALUE|KEY= ... | pools | pool NAME NODE... | pool-rm NAME | caps | cap SELECTOR THREADS | cap-rm ID\n  | reserves | reserve SELECTOR N [PCT] | reserve-rm ID | windows | window SELECTOR DAYS START END block|cap [THREADS] | window-rm ID\n  | reservations | reservation SELECTOR START END (local \"YYYY-MM-DD HH:MM\", quote them) | reservation-rm ID | estimate N [SELECTOR] | net [probe] | ha | switchover NODE | sleep ID... | wake ID... | power [off|eco] [IDLE_MIN] [KEEP_AWAKE] | standbys [N] [SELECTOR] | identify NODE... [SECS] | quota USER MAX_PCS MAX_RUNNING | heads | tune [KEY VALUE|default] | alerts [ack ID] | advice [preview|apply ID [OPTION] | undo ID | dismiss ID [HOURS] | history | policy KIND off|suggest|auto|default | on | off] | experiment upload DIR [NAME] | experiment ls | experiment show ID | report [YYYY-MM-DD] | config-export > file | config-import FILE   (env: CK_REASON, CK_AUTO=1, CK_DRY_RUN=1, CK_TOKEN)")
 }
 
 fn send(o: &Opts, method: &str, path: &str, body: Value) -> Value {
@@ -558,6 +561,7 @@ pub fn admin(o: &Opts) {
                 println!("{:>5}  {:<16} {:<5} {:<7} {:<14} {:<9} {}", dash(&a["id"]), dash(&a["kind"]), dash(&a["severity"]), if a["active"] == true { "active" } else { "closed" }, dash(&a["node_id"]), dash(&a["acked_by"]), dash(&a["detail"]));
             }
         }
+        Some("advice") => advice(o, &rest[1..]),
         Some("experiment") => match rest.get(1).map(String::as_str) {
             Some("upload") => {
                 let dir = std::path::Path::new(arg(o, 2));
@@ -684,5 +688,52 @@ pub fn blob(o: &Opts) {
             std::io::stdout().write_all(&r.body).ok();
         }
         _ => die("usage: ck blob put FILE | ls | get SHA   (head: --head IP; auth: CK_TOKEN)"),
+    }
+}
+
+/// `ck admin advice ...`: the advisor's suggestions, each with ranked options (docs/ADVISOR.md).
+fn advice(o: &Opts, a: &[String]) {
+    let at = |i: usize| a.get(i).map(String::as_str);
+    let show = |v: &Value| {
+        let list = v["suggestions"].as_array().cloned().unwrap_or_default();
+        if list.is_empty() {
+            println!("nothing to improve right now{}", if v["enabled"] == false { " (advisor is off: ck admin advice on)" } else { "" });
+        }
+        for s in list {
+            println!("\n[{}] {}  ({}, policy {})\n  why: {}", dash(&s["severity"]), dash(&s["title"]), dash(&s["id"]), dash(&s["policy"]), dash(&s["why"]));
+            for op in s["options"].as_array().cloned().unwrap_or_default() {
+                println!("  {} {:<10} {}\n      effect: {}  |  cost: {}  |  risk: {}{}  |  in: {}\n      confidence: {}  |  check: {}",
+                    if op["recommended"] == true { "*" } else { "-" }, dash(&op["id"]), dash(&op["title"]), dash(&op["expected_effect"]), dash(&op["cost"]),
+                    dash(&op["risk"]), if op["reversible"] == true { ", reversible" } else { "" }, dash(&op["time_to_effect"]), dash(&op["confidence"]), dash(&op["success_check"]));
+            }
+        }
+    };
+    match at(0) {
+        None => show(&call(o, "GET", "/api/v1/advice")),
+        Some("history") => {
+            let v = call(o, "GET", "/api/v1/advice/history");
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        Some(op @ ("preview" | "apply" | "undo" | "dismiss")) => {
+            let id = at(1).unwrap_or_else(|| die("usage: ck admin advice preview|apply|undo|dismiss ID [OPTION|HOURS]"));
+            let body = match (op, at(2)) {
+                ("dismiss", Some(h)) => serde_json::json!({"snooze_h": h.parse::<f64>().unwrap_or_else(|_| die("HOURS must be a number"))}),
+                ("preview" | "apply", Some(opt)) => serde_json::json!({"option": opt}),
+                _ => serde_json::json!({}),
+            };
+            let v = send(o, "POST", &format!("/api/v1/advice/{}/{op}", enc(id)), body);
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        Some("policy") => {
+            let (Some(kind), Some(mode)) = (at(1), at(2)) else { die("usage: ck admin advice policy KIND off|suggest|auto|default") };
+            let m = if mode == "default" { Value::Null } else { Value::String(mode.into()) };
+            send(o, "PUT", "/api/v1/advice/settings", serde_json::json!({"policy": {kind: m}}));
+            println!("policy {kind} = {mode}");
+        }
+        Some(sw @ ("on" | "off")) => {
+            send(o, "PUT", "/api/v1/advice/settings", serde_json::json!({"enabled": sw == "on"}));
+            println!("advisor {sw}");
+        }
+        Some(x) => die(&format!("unknown advice command {x:?}")),
     }
 }

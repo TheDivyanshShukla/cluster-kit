@@ -255,3 +255,21 @@ Result upload capability (for bulk results, never the user token): for every cmd
 - Quotas (SCH-04). User JSON gains `"quota": {"max_pcs": 0, "max_running": 0}` (0 = no limit). `PUT /api/v1/users/{name}/quota` (admin; a missing key keeps its value; both 0 removes the quota; stored in meta `quotas`, replicated). A user's running jobs together never hold chunks on more than `max_pcs` PCs (a PC already working for the user may keep going, no new PC joins; speculative copies obey it too); the user's jobs beyond the oldest `max_running` take no chunks and show state `queued`. Job JSON gains `"wait_reason"`: null | `quota` | `priority` | `no_pcs` (a running job that holds no PC now). CLI: `ck admin quota USER MAX_PCS MAX_RUNNING`.
 - `POST /api/v1/sim` is in the role table (researcher) and the CLI map (`ck sim` runs the same scenario locally).
 - New tunables: `out_files_mb`, `blob_partial_ms` (500), `blob_stall_s` (20), `blob_offer_s` (5), `log_batch` (200), `cand_recheck_s` (5); they replace the wave 14 constants.
+
+## Advisor
+
+Suggestions next to the alerts; rules, options and the catalogue are in [ADVISOR.md](ADVISOR.md).
+
+| Route | Role | Body | Reply |
+|---|---|---|---|
+| GET `/api/v1/advice` | viewer | | `{"enabled", "policy": {kind: "off"|"suggest"|"auto"}, "suggestions": [Suggestion], "accuracy": {kind: 0..1}}` |
+| GET `/api/v1/advice/history` | viewer | | `{"history": [Applied], "accuracy"}` newest first |
+| PUT `/api/v1/advice/settings` | admin | `{"enabled"?: bool, "policy"?: {kind: mode or null}}` | `{"enabled", "policy", "suggestions"}` |
+| POST `/api/v1/advice/{id}/preview` | operator | `{"option"?: id}` (default: recommended) | `{"option", "preview": {"would_change", "valid", "error"}, "changes_nothing": true}`; 409 if the suggestion no longer applies |
+| POST `/api/v1/advice/{id}/apply` | admin | `{"option"?: id}` | `{"applied": Applied, "suggestions"}`; re-checks against fresh data (409 if gone), 400 if the option has only steps; audit event `advice.applied` |
+| POST `/api/v1/advice/{id}/undo` | admin | | `{"suggestions"}`; restores the old value; 404 if nothing to undo |
+| POST `/api/v1/advice/{id}/dismiss` | operator | `{"snooze_h"?: 24}` | `{"suggestions"}` |
+
+Suggestion = `{"id", "kind", "severity": "info"|"tip"|"warn", "title", "why", "options": [Option], "effect", "action" (the recommended option's), "since_ms", "policy", "accuracy"}`. Option = `{"id", "title", "action": {"type": "tune"|"node_state"|"ha_target"|"power"|"doc", ...} or null, "steps": [text], "expected_effect", "metric", "metric_from", "metric_to", "cost", "risk": "low"|"med"|"high", "reversible", "auto_safe", "time_to_effect", "confidence", "success_check", "recommended", "score"}`. Applied = `{"id", "kind", "option", "action", "by", "auto", "ts_ms", "metric", "before", "predicted", "follow_s", "undone", "outcome": {"observed", "predicted_gain", "observed_gain", "hit"} or null}`. SSE event `advice` sends `{"suggestions": [...]}` whenever the list changes. Events: `advice.applied`, `advice.auto`, `advice.undone`, `advice.dismissed`, `advice.settings`, `advice.outcome`.
+
+Needs wiring outside the advisor's files: `users::min_role` currently gives every `/api/v1/advice*` route viewer (the handlers enforce operator/admin themselves), and `users::ROUTES` / `jobcli::CLI_MAP` have no entry for these routes.

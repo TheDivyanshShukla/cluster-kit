@@ -320,31 +320,94 @@ impl OutDir {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).ok().map(|_| OutDir(d))
     }
-    /// Regular files at the top of the directory, sorted: (name, path, size). Err(message) = over `limit_mb`, too many, or a bad name.
+    /// Regular files in the directory and its sub-directories (symlinks are never followed), sorted: (relative name with `/`, path, size).
+    /// Err(message) = over `limit_mb`, too many, or a bad name.
     pub fn files(&self, limit_mb: u64) -> Result<Vec<(String, std::path::PathBuf, u64)>, String> {
         let mut v = vec![];
         let mut total = 0u64;
-        for e in fs::read_dir(&self.0).map_err(|e| format!("CK_OUT: {e}"))?.flatten() {
-            let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
-            if !m.is_file() {
-                continue;
+        let mut todo = vec![(self.0.clone(), String::new(), 0u8)];
+        while let Some((dir, prefix, depth)) = todo.pop() {
+            for e in fs::read_dir(&dir).map_err(|e| format!("CK_OUT: {e}"))?.flatten() {
+                let Ok(m) = fs::symlink_metadata(e.path()) else { continue };
+                let name = e.file_name().to_string_lossy().into_owned();
+                if m.is_dir() && depth < 8 {
+                    if name.is_empty() || name.starts_with('.') {
+                        return Err(format!("output directory name {name:?} is not allowed (no leading dot)"));
+                    }
+                    todo.push((e.path(), format!("{prefix}{name}/"), depth + 1));
+                    continue;
+                }
+                if !m.is_file() {
+                    continue;
+                }
+                let rel = format!("{prefix}{name}");
+                if name.is_empty() || rel.len() > 200 || name.starts_with('.') || name.contains(['/', '\\']) {
+                    return Err(format!("output file name {rel:?} is not allowed (1 to 200 characters, no leading dot, no backslashes)"));
+                }
+                total += m.len();
+                if total > limit_mb << 20 {
+                    return Err(format!("output files are over the {limit_mb} MB limit (out_files_mb)"));
+                }
+                v.push((rel, e.path(), m.len()));
+                if v.len() > 1000 {
+                    return Err("more than 1000 output files in one chunk".into());
+                }
             }
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.is_empty() || name.len() > 200 || name.starts_with('.') || name.contains(['/', '\\']) {
-                return Err(format!("output file name {name:?} is not allowed (1 to 200 characters, no leading dot, no slashes)"));
-            }
-            total += m.len();
-            if total > limit_mb << 20 {
-                return Err(format!("output files are over the {limit_mb} MB limit (out_files_mb)"));
-            }
-            v.push((name, e.path(), m.len()));
-        }
-        if v.len() > 1000 {
-            return Err("more than 1000 output files in one chunk".into());
         }
         v.sort();
         Ok(v)
     }
+}
+
+/// Bytes of regular files under `d` (symlinks not followed), for the running size check.
+fn dir_bytes(d: &std::path::Path, depth: u8) -> u64 {
+    let Ok(rd) = fs::read_dir(d) else { return 0 };
+    rd.flatten().map(|e| match fs::symlink_metadata(e.path()) {
+        Ok(m) if m.is_file() => m.len(),
+        Ok(m) if m.is_dir() && depth < 8 => dir_bytes(&e.path(), depth + 1),
+        _ => 0,
+    }).sum()
+}
+
+/// Physical RAM of this PC in bytes (0 = unknown).
+fn total_ram() -> u64 {
+    static R: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        if let Ok(m) = fs::read_to_string("/proc/meminfo") {
+            return m.lines().find_map(|l| l.strip_prefix("MemTotal:")?.split_whitespace().next()?.parse::<u64>().ok()).unwrap_or(0) * 1024;
+        }
+        Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Resident memory (bytes) of every process in group `pgid`. Linux: /proc/<pid>/stat; elsewhere `ps`.
+/// ponytail: Linux page size assumed 4096; the sum counts shared pages once per process.
+fn group_rss(pgid: u32) -> u64 {
+    if let Ok(rd) = fs::read_dir("/proc") {
+        let mut sum = 0u64;
+        for e in rd.flatten() {
+            if !e.file_name().as_encoded_bytes().iter().all(u8::is_ascii_digit) { continue }
+            let Ok(st) = fs::read_to_string(e.path().join("stat")) else { continue };
+            let Some(rest) = st.rsplit_once(')').map(|x| x.1) else { continue };
+            let f: Vec<&str> = rest.split_whitespace().collect(); // [0]=state [1]=ppid [2]=pgrp ... [21]=rss
+            if f.get(2).and_then(|x| x.parse::<u32>().ok()) == Some(pgid) {
+                sum += f.get(21).and_then(|x| x.parse::<u64>().ok()).unwrap_or(0) * 4096;
+            }
+        }
+        return sum;
+    }
+    let Ok(o) = Command::new("ps").args(["-axo", "pgid=,rss="]).output() else { return 0 };
+    String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| {
+        let mut w = l.split_whitespace();
+        (w.next()?.parse::<u32>().ok()? == pgid).then(|| w.next()?.parse::<u64>().ok()).flatten()
+    }).sum::<u64>() * 1024
+}
+
+/// What the watchdog enforces while a program runs (0 / None = off).
+#[derive(Default, Clone, Copy)]
+struct Limits<'a> {
+    mem_bytes: u64,
+    out: Option<(&'a std::path::Path, u64)>,
 }
 
 impl Drop for OutDir {
@@ -375,9 +438,14 @@ fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, chunk_a: u64, s
     if warm == 0 { c.env("CK_WARM", "off"); }
     c.envs(crate::blobs::env_for(job)); // wave 13: CK_BLOBS, CK_BLOB_<i>
     let cap = out_max();
-    let out = run_capped(&mut c, stdin, cap, &|| cancelled(job, chunk_a));
+    let mem_bytes = (total_ram() as f64 * crate::tune::get("job_mem_pct") / 100.0) as u64;
+    let lim = Limits { mem_bytes, out: out.map(|p| (p, crate::tune::n("out_files_mb") << 20)) };
+    let out = run_capped(&mut c, stdin, cap, &|| cancelled(job, chunk_a), lim);
     let _ = fs::remove_dir_all(&scratch);
-    let (code, stdout, stderr, over) = out.map_err(|e| (false, format!("could not start the program: {e}")))?;
+    let (code, stdout, stderr, over, why) = out.map_err(|e| (false, format!("could not start the program: {e}")))?;
+    if let Some(w) = why {
+        return Err((false, w));
+    }
     if over {
         return Err((false, format!("output over the {} MiB limit (program stopped)", cap >> 20)));
     }
@@ -397,7 +465,7 @@ fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, chunk_a: u64, s
 /// Children the program left behind are killed when it exits. Returns (exit code, stdout, last 64 KiB of stderr, over-cap);
 /// a stopped run returns code None.
 /// ponytail: a child that leaves the group (setsid) is not reached; unix only (Windows: no process groups, only the shell is killed on over-cap).
-fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn() -> bool) -> std::io::Result<(Option<i32>, Vec<u8>, Vec<u8>, bool)> {
+fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn() -> bool, lim: Limits) -> std::io::Result<(Option<i32>, Vec<u8>, Vec<u8>, bool, Option<String>)> {
     use std::io::Read;
     use std::sync::mpsc::{channel, RecvTimeoutError};
     #[cfg(unix)]
@@ -448,7 +516,10 @@ fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn()
     });
     // Wait for stdout to close (normally the moment the program exits), checking every 20 ms for a cancel and for a program
     // that exited while a child it left behind still holds the pipe (killing the group closes it).
-    let mut stopped = false;
+    // The same tick is the memory / CK_OUT watchdog: sampled every 300 / 500 ms, and only once the program has run 250 ms,
+    // so a short piece never pays for it.
+    let (born, mut mem_at, mut out_at) = (Instant::now(), Instant::now(), Instant::now());
+    let (mut stopped, mut why) = (false, None::<String>);
     let (out, over) = loop {
         match out_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(v) => break v,
@@ -458,6 +529,25 @@ fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn()
                 let _ = ch.kill(); // off unix there is no group: at least the program itself
             }
             Err(RecvTimeoutError::Timeout) => {
+                if !stopped && born.elapsed() >= Duration::from_millis(250) {
+                    if lim.mem_bytes > 0 && mem_at.elapsed() >= Duration::from_millis(300) {
+                        mem_at = Instant::now();
+                        if group_rss(pid) > lim.mem_bytes {
+                            why = Some(format!("memory over the {} MB limit (job_mem_pct), program stopped", lim.mem_bytes >> 20));
+                        }
+                    }
+                    if let (None, Some((d, max)), true) = (&why, lim.out, out_at.elapsed() >= Duration::from_millis(500)) {
+                        out_at = Instant::now();
+                        if dir_bytes(d, 0) > max {
+                            why = Some(format!("output files are over the {} MB limit (out_files_mb), program stopped", max >> 20));
+                        }
+                    }
+                    if why.is_some() {
+                        stopped = true;
+                        killgrp();
+                        let _ = ch.kill();
+                    }
+                }
                 if ch.try_wait()?.is_some() { killgrp(); }
             }
             Err(_) => break (Vec::new(), false),
@@ -466,13 +556,13 @@ fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn()
     let status = ch.wait()?;
     killgrp(); // background children of a finished chunk
     if over {
-        return Ok((None, Vec::new(), Vec::new(), true));
+        return Ok((None, Vec::new(), Vec::new(), true, None));
     }
     if stopped {
-        return Ok((None, Vec::new(), Vec::new(), false));
+        return Ok((None, Vec::new(), Vec::new(), false, why));
     }
     let tail = err_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
-    Ok((status.code(), out, tail, false))
+    Ok((status.code(), out, tail, false, None))
 }
 
 #[cfg(test)]
@@ -500,24 +590,47 @@ mod tests {
         let t = Instant::now();
         let mut c = Command::new("sh");
         c.args(["-c", "yes | head -c 1000000000"]);
-        let (_, out, _, over) = run_capped(&mut c, None, 1 << 20, &|| false).unwrap();
+        let (_, out, _, over, _) = run_capped(&mut c, None, 1 << 20, &|| false, Limits::default()).unwrap();
         assert!(over && out.is_empty() && t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
         let mut c = Command::new("sh");
         c.args(["-c", "cat; echo e >&2; exit 3"]);
-        let (code, out, err, over) = run_capped(&mut c, Some(b"hi"), 1 << 20, &|| false).unwrap();
+        let (code, out, err, over, _) = run_capped(&mut c, Some(b"hi"), 1 << 20, &|| false, Limits::default()).unwrap();
         assert_eq!((code, out, err, over), (Some(3), b"hi".to_vec(), b"e\n".to_vec(), false));
         // a cancel kills the whole group: a hung program and its background child, both holding stdout
         let t = Instant::now();
         let mut c = Command::new("sh");
         c.args(["-c", "sleep 100 & sleep 100"]);
-        let (code, _, _, over) = run_capped(&mut c, None, 1 << 20, &|| t.elapsed() > Duration::from_millis(200)).unwrap();
+        let (code, _, _, over, _) = run_capped(&mut c, None, 1 << 20, &|| t.elapsed() > Duration::from_millis(200), Limits::default()).unwrap();
         assert!(code.is_none() && !over && t.elapsed().as_secs() < 3, "{:?}", t.elapsed());
         // a program that exits leaving a child on the pipe returns at once (the group is killed)
         let t = Instant::now();
         let mut c = Command::new("sh");
         c.args(["-c", "sleep 100 & echo done"]);
-        let (code, out, _, _) = run_capped(&mut c, None, 1 << 20, &|| false).unwrap();
+        let (code, out, _, _, _) = run_capped(&mut c, None, 1 << 20, &|| false, Limits::default()).unwrap();
         assert!(code == Some(0) && out == b"done\n" && t.elapsed().as_secs() < 3, "{:?}", t.elapsed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_kills_memory_hog_and_runaway_output() {
+        // ~300 MB resident against a 100 MB cap
+        let t = Instant::now();
+        let mut c = Command::new("sh");
+        c.args(["-c", "exec python3 -c 'b = bytearray(300 * 1024 * 1024); b[::4096] = b\"x\" * len(b[::4096]); import time; time.sleep(30)'"]);
+        let (code, _, _, _, why) = run_capped(&mut c, None, 1 << 20, &|| false, Limits { mem_bytes: 100 << 20, out: None }).unwrap();
+        assert!(code.is_none() && why.as_deref().is_some_and(|w| w.contains("memory over the 100 MB")) && t.elapsed().as_secs() < 10, "{why:?} {:?}", t.elapsed());
+        // growing CK_OUT past 1 MB while running
+        let d = OutDir::new().unwrap();
+        let t = Instant::now();
+        let mut c = Command::new("sh");
+        c.env("CK_OUT", &d.0).args(["-c", "mkdir $CK_OUT/n; while :; do head -c 600000 /dev/zero >> $CK_OUT/n/f; sleep 0.05; done"]);
+        let (code, _, _, _, why) = run_capped(&mut c, None, 1 << 20, &|| false, Limits { mem_bytes: 0, out: Some((&d.0, 1 << 20)) }).unwrap();
+        assert!(code.is_none() && why.as_deref().is_some_and(|w| w.contains("out_files_mb")) && t.elapsed().as_secs() < 10, "{why:?}");
+        // an honest program is left alone
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 0.6; echo ok"]);
+        let (code, out, _, _, why) = run_capped(&mut c, None, 1 << 20, &|| false, Limits { mem_bytes: 1 << 30, out: Some((&d.0, 1 << 40)) }).unwrap();
+        assert_eq!((code, out, why), (Some(0), b"ok\n".to_vec(), None));
     }
 
     #[test]
@@ -650,7 +763,7 @@ mod tests {
         let p = d.0.clone();
         run_cmd(b"sh -c 'echo hi > $CK_OUT/a.txt; echo yo > $CK_OUT/b_$CK_START.txt; mkdir $CK_OUT/sub; echo x > $CK_OUT/sub/c' x", 7, 1, 4, 9, 4, Some(&d.0)).unwrap();
         let f = d.files(1).unwrap();
-        assert_eq!(f.iter().map(|x| (x.0.as_str(), x.2)).collect::<Vec<_>>(), vec![("a.txt", 3), ("b_4.txt", 3)], "top-level regular files only");
+        assert_eq!(f.iter().map(|x| (x.0.as_str(), x.2)).collect::<Vec<_>>(), vec![("a.txt", 3), ("b_4.txt", 3), ("sub/c", 2)], "nested files kept with their relative path");
         std::fs::write(d.0.join("big"), vec![0u8; 2 << 20]).unwrap();
         assert!(d.files(1).unwrap_err().contains("over the 1 MB"));
         std::fs::write(d.0.join(".hidden"), b"x").unwrap();

@@ -117,6 +117,7 @@ pub const KNOBS: &[Knob] = &[
     k("backup_every_h", "Retention", 0.0, 0.0, 8760.0, "h", Head, "The head saves a copy of head.db to ck-data/backups this often; 0 = off."),
     k("backup_keep", "Retention", 7.0, 1.0, 1000.0, "files", Head, "Scheduled backups kept; the oldest are deleted."),
     k("out_files_mb", "Agent limits", 256.0, 1.0, 65_536.0, "MB", Agent, "Output files (CK_OUT) a command chunk may leave behind; more makes the chunk fail."),
+    k("job_mem_pct", "Agent limits", 80.0, 0.0, 100.0, "%", Agent, "A command program (all its processes together) is stopped when it uses more than this share of the PC's RAM; 0 = no limit."),
     k("log_batch", "Logging", 200.0, 10.0, 10_000.0, "lines", Head, "Most log lines sent to the console in one live batch."),
     k("cand_recheck_s", "Dynamic heads", 5.0, 1.0, 600.0, "s", Head, "Live head ranking is recomputed at most this often for the console."),
     k("warm_idle_s", "SDK", 120.0, 0.0, 3600.0, "s", Agent, "Idle seconds before a PC's warm Python worker exits; 0 = warm runner off."),

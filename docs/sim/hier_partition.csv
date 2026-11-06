@@ -1,0 +1,6 @@
+arch,lease_s,ttl_s,pct_of_full_speed_during_partition,wasted_units
+1-level,0,90,1.7,0
+2-level,10,90,18.4,0
+2-level,30,90,51.7,0
+2-level,60,90,84.6,0
+2-level,120,90,100.0,0

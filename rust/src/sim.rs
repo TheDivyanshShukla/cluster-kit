@@ -24,11 +24,13 @@
 //!   "seed": 1, "sample_s": 1, "max_s": 86400                       max_s = stop an unfinished run
 //! }
 //! A scenario with a "day" key runs the job-level day simulator instead (see `day()` below).
+//! A scenario with a "hier" key runs one two-level (root + lab heads) run; {"hier_study": 1} runs the four hierarchy
+//! studies and writes hier_*.csv (see the hierarchy section at the end of this file and docs/sim/HIERARCHY.md).
 use crate::sched::{self, ChunkPolicy};
 use crate::{die, Opts};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 struct Rng(u64);
 impl Rng {
@@ -140,23 +142,23 @@ enum K {
     Fail { n: usize },
     Up { n: usize },
 }
-struct Ev {
+struct Ev<T = K> {
     t: f64,
     seq: u64,
-    k: K,
+    k: T,
 }
-impl PartialEq for Ev {
+impl<T> PartialEq for Ev<T> {
     fn eq(&self, o: &Self) -> bool {
         self.seq == o.seq
     }
 }
-impl Eq for Ev {}
-impl PartialOrd for Ev {
+impl<T> Eq for Ev<T> {}
+impl<T> PartialOrd for Ev<T> {
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
         Some(self.cmp(o))
     }
 }
-impl Ord for Ev {
+impl<T> Ord for Ev<T> {
     fn cmp(&self, o: &Self) -> Ordering {
         o.t.total_cmp(&self.t).then(o.seq.cmp(&self.seq)) // min-heap
     }
@@ -504,6 +506,15 @@ pub fn run(o: &Opts) {
     let dir = std::env::var("CK_SIM_OUT").unwrap_or_else(|_| "sim-out".into());
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| die(&format!("{dir}: {e}")));
     if let Ok(v) = serde_json::from_str::<Value>(&text) {
+        if v.get("hier_study").is_some() {
+            return hier_study(&dir);
+        }
+        if let Some(h) = v.get("hier") {
+            let o = hsim(&HScn::from_json(h));
+            let sm = o.summary();
+            std::fs::write(format!("{dir}/summary.json"), serde_json::to_string_pretty(&sm).unwrap()).unwrap_or_else(|e| die(&e.to_string()));
+            return println!("{sm}");
+        }
         if v.get("day").is_some() {
             let t0 = std::time::Instant::now();
             let mut r = day(&v);
@@ -811,6 +822,596 @@ pub fn day(v: &Value) -> Value {
         "hours": hours, "jobs": rows, "_timeline": tl})
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Hierarchy mode (docs/sim/HIERARCHY.md): root head + `lab` sub-heads. A lab head asks the root for a LEASE (a big range,
+// `lease_s` seconds of the lab's work), chunks it for its own PCs with the same head cost model, merges the results and
+// reports the whole lease back in one message. The root sees each lab head as one worker. Work is counted in PC-seconds at
+// nominal speed (1 unit = 1 s of one average PC); a chunk is `chunk_s` units. Every constant marked ASSUMPTION in the doc
+// is a field here. Not modelled: PC failures, jitter, relay batching, lab-head restart (PCs stay on the root after a kill).
+#[derive(Clone)]
+pub struct HScn {
+    pub pcs: usize,
+    pub lab_pcs: usize,       // PCs per lab (also the size of the partitioned group in 1-level runs)
+    pub two_level: bool,
+    pub speed_cv: f64,
+    pub chunk_s: f64,
+    pub n: f64,               // job size in PC-seconds
+    pub lease_s: f64,         // L: seconds of lab work per lease
+    pub refill: f64,          // ASSUMPTION: a lab asks for the next lease when its pool drops under refill x L of work
+    pub ttl_s: f64,           // ASSUMPTION: root fences all leases of a lab head it has not heard from for ttl_s (lab heartbeats every hb_s)
+    pub hb_s: f64,            // ASSUMPTION: lab head heartbeat period; its root cost is added analytically (the heartbeats are not events)
+    pub lat: f64,             // PC <-> its head, one way
+    pub wan: f64,             // lab head <-> root, one way
+    pub svc: f64,             // head time per message (s), the calibrated 379 us ...
+    pub svc_agent: f64,       // ... + 0.199 us per connected agent
+    pub merge: f64,           // ASSUMPTION: lab head time to merge one chunk result
+    pub root_merge: f64,      // ASSUMPTION: root time per chunk in a lease report
+    pub inflight: u32,
+    pub reconnect: f64,       // ASSUMPTION: PCs of a dead lab head reach the root after reconnect x (1 .. 1.5)
+    pub kill_lab: Option<(usize, f64)>,        // (lab, at)
+    pub root_kill: Option<(f64, f64)>,         // (at, outage): standby 5.7 s, or a manual restart
+    pub part: Option<(usize, f64, f64)>,       // (lab, at, length): lab cut off from the root
+    pub seed: u64,
+    pub max_s: f64,
+    pub warm_s: f64,          // rates are measured after this time
+}
+
+impl Default for HScn {
+    fn default() -> Self {
+        HScn { pcs: 200, lab_pcs: 50, two_level: false, speed_cv: 0.03, chunk_s: 1.0, n: 1e12, lease_s: 30.0, refill: 0.5, ttl_s: 90.0, hb_s: 2.0, lat: 3e-4, wan: 5e-4, svc: 379e-6, svc_agent: 0.199e-6, merge: 20e-6, root_merge: 2e-6, inflight: 2, reconnect: 1.5, kill_lab: None, root_kill: None, part: None, seed: 1, max_s: 86400.0, warm_s: 0.0 }
+    }
+}
+
+impl HScn {
+    pub fn from_json(h: &Value) -> HScn {
+        let d = HScn::default();
+        let opt = |k: &str| h.get(k).and_then(Value::as_array).map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0)).collect::<Vec<_>>());
+        HScn {
+            pcs: f(h, "pcs", d.pcs as f64) as usize,
+            lab_pcs: f(h, "lab_pcs", d.lab_pcs as f64).max(1.0) as usize,
+            two_level: h["two_level"].as_bool().unwrap_or(false),
+            speed_cv: f(h, "speed_cv", d.speed_cv),
+            chunk_s: f(h, "chunk_s", d.chunk_s).max(1e-3),
+            n: f(h, "n", d.n),
+            lease_s: f(h, "lease_s", d.lease_s),
+            refill: f(h, "refill", d.refill),
+            ttl_s: f(h, "ttl_s", d.ttl_s),
+            hb_s: f(h, "hb_s", d.hb_s).max(1e-3),
+            lat: f(h, "latency_ms", d.lat * 1e3) / 1e3,
+            wan: f(h, "wan_ms", d.wan * 1e3) / 1e3,
+            svc: f(h, "service_us", d.svc * 1e6) / 1e6,
+            svc_agent: f(h, "service_us_per_agent", d.svc_agent * 1e6) / 1e6,
+            merge: f(h, "merge_us", d.merge * 1e6) / 1e6,
+            root_merge: f(h, "root_merge_us", d.root_merge * 1e6) / 1e6,
+            inflight: f(h, "inflight", 2.0).max(1.0) as u32,
+            reconnect: f(h, "reconnect_s", d.reconnect),
+            kill_lab: opt("kill_lab").filter(|a| a.len() == 2).map(|a| (a[0] as usize, a[1])),
+            root_kill: opt("root_kill").filter(|a| a.len() == 2).map(|a| (a[0], a[1])),
+            part: opt("partition").filter(|a| a.len() == 3).map(|a| (a[0] as usize, a[1], a[2])),
+            seed: f(h, "seed", 1.0) as u64,
+            max_s: f(h, "max_s", d.max_s),
+            warm_s: f(h, "warm_s", 0.0),
+        }
+    }
+}
+
+pub struct HOut {
+    pub finished: bool,
+    pub end_s: f64,
+    pub ideal_s: f64,
+    pub done: f64,
+    pub tasks_s: f64,        // chunk results processed per second by all heads, after warm_s
+    pub root_cpu: f64,       // busy fraction of the root's one service thread, after warm_s
+    pub root_msgs_s: f64,
+    pub lab_cpu_max: f64,
+    pub redone: f64,         // units the root took back from an expired lease and gave out again
+    pub wasted: f64,         // units computed for a fenced lease or lost with a dead lab head (computed twice)
+    pub lost_with_lab: f64,
+    pub part_units: f64,     // units finished by the PCs of the partitioned lab inside the partition window
+}
+
+impl HOut {
+    pub fn summary(&self) -> Value {
+        json!({"finished": self.finished, "makespan_s": self.finished.then_some(self.end_s), "end_s": self.end_s, "ideal_s": self.ideal_s, "done": self.done,
+            "tasks_per_s": self.tasks_s, "root_cpu_pct": 100.0 * self.root_cpu, "root_msgs_per_s": self.root_msgs_s, "lab_cpu_max_pct": 100.0 * self.lab_cpu_max,
+            "redone_units": self.redone, "wasted_units": self.wasted, "lost_with_lab_units": self.lost_with_lab, "partition_window_units": self.part_units})
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HK {
+    Arr { pc: usize, ep: u32, c: u64 }, // a request (c = 0) or a chunk result reaches the PC's head
+    Fin { pc: usize, ep: u32, c: u64 },
+    Req { lab: usize },                 // lease request reaches the root
+    Rep { lab: usize, l: usize },       // lease report reaches the root
+    Grant { lab: usize, l: usize },     // lease (or NONE) reaches the lab head
+    Fence { lab: usize },               // root gives up on a silent lab head: its unreported leases go back to the pool
+    Kill { lab: usize },
+    Back { pc: usize, ep: u32 },        // a PC of a dead lab head reaches the root
+    Poll { lab: usize },
+}
+const NONE: usize = usize::MAX;
+
+struct HPc {
+    speed: f64,
+    lab: usize,
+    srv: usize, // 0 = root, 1 + lab = its lab head
+    ep: u32,
+    used: u32,
+    busy_until: f64,
+    idle: bool,
+}
+struct HLab {
+    alive: bool,
+    pcs: Vec<usize>,
+    pool: VecDeque<usize>,
+    pool_u: f64,
+    idle: Vec<usize>,
+    req_out: bool,
+    hold: f64,
+    cap: f64,
+}
+struct Lease {
+    lab: usize,
+    units: f64,
+    disp: f64,
+    done: f64,
+    nch: u32,
+    closed: bool,
+    fenced: bool,
+}
+
+struct HSim<'a> {
+    s: &'a HScn,
+    pcs: Vec<HPc>,
+    labs: Vec<HLab>,
+    leases: Vec<Lease>,
+    heap: BinaryHeap<Ev<HK>>,
+    seq: u64,
+    free: Vec<f64>,
+    busy: Vec<f64>,
+    pending: f64,
+    done: f64,
+    chunks: HashMap<u64, (usize, f64, usize)>, // id -> (pc, len, lease)
+    next: u64,
+    root_conn: usize,
+    alive_labs: usize,
+    root_idle: Vec<usize>,
+    tasks: u64,
+    root_msgs: u64,
+    redone: f64,
+    wasted: f64,
+    lost: f64,
+    part_u: f64,
+    finish: Option<f64>,
+}
+
+impl HSim<'_> {
+    fn push(&mut self, t: f64, k: HK) {
+        self.seq += 1;
+        self.heap.push(Ev { t, seq: self.seq, k });
+    }
+    /// a message between lab `lab` and the root, sent at t, waits for the end of the partition
+    fn cutd(&self, lab: usize, t: f64) -> f64 {
+        match self.s.part {
+            Some((l, p0, len)) if l == lab && t >= p0 && t < p0 + len => p0 + len,
+            _ => t,
+        }
+    }
+    fn serve(&mut self, srv: usize, t: f64, cost: f64) -> f64 {
+        let mut st = t.max(self.free[srv]);
+        if let (0, Some((at, rec))) = (srv, self.s.root_kill) {
+            if st >= at && st < at + rec {
+                st = at + rec; // the standby is promoting (or the root restarts); the queue waits
+            }
+        }
+        let fin = st + cost;
+        self.free[srv] = fin;
+        self.busy[srv] += cost;
+        fin
+    }
+    fn send(&mut self, pc: usize, t: f64, c: u64) {
+        let (ep, srv, lab) = (self.pcs[pc].ep, self.pcs[pc].srv, self.pcs[pc].lab);
+        let t = if srv == 0 && !self.s.two_level { self.cutd(lab, t) } else { t }; // 1-level: the cut lab's PCs talk to the root
+        self.push(t + self.s.lat, HK::Arr { pc, ep, c });
+    }
+    fn request(&mut self, pc: usize, t: f64) {
+        self.pcs[pc].used += 1;
+        self.send(pc, t, 0);
+    }
+    fn assign(&mut self, pc: usize, fin: f64, len: f64, l: usize) {
+        self.next += 1;
+        let id = self.next;
+        self.chunks.insert(id, (pc, len, l));
+        let p = &mut self.pcs[pc];
+        p.used += 1;
+        let end = (fin + self.s.lat).max(p.busy_until) + len / p.speed;
+        p.busy_until = end;
+        let ep = p.ep;
+        self.push(end, HK::Fin { pc, ep, c: id });
+    }
+    /// work is available at lab `lab` (or the root): ask idle slots for it
+    fn wake(&mut self, t: f64, lab: Option<usize>) {
+        let avail = lab.map_or(self.pending, |l| self.labs[l].pool_u);
+        let mut k = (avail / self.s.chunk_s).ceil() as usize;
+        let list = match lab {
+            Some(l) => std::mem::take(&mut self.labs[l].idle),
+            None => std::mem::take(&mut self.root_idle),
+        };
+        let mut keep = vec![];
+        for pc in list {
+            if k == 0 {
+                keep.push(pc);
+                continue;
+            }
+            self.pcs[pc].idle = false;
+            while k > 0 && self.pcs[pc].used < self.s.inflight {
+                self.request(pc, t);
+                k -= 1;
+            }
+            if self.pcs[pc].used < self.s.inflight {
+                self.pcs[pc].idle = true;
+                keep.push(pc);
+            }
+        }
+        match lab {
+            Some(l) => self.labs[l].idle = keep,
+            None => self.root_idle = keep,
+        }
+    }
+    fn fill_root(&mut self, pc: usize, t: f64) {
+        while self.pcs[pc].used < self.s.inflight && self.pending > 1e-9 {
+            self.request(pc, t);
+        }
+        if self.pcs[pc].used < self.s.inflight && !self.pcs[pc].idle {
+            self.pcs[pc].idle = true;
+            self.root_idle.push(pc);
+        }
+    }
+    /// lab head asks the root for the next lease when its pool runs low
+    fn refill(&mut self, lab: usize, t: f64) {
+        let lb = &self.labs[lab];
+        if lb.alive && !lb.req_out && t >= lb.hold && self.finish.is_none() && lb.pool_u < self.s.refill * self.s.lease_s * lb.cap {
+            self.labs[lab].req_out = true;
+            let at = self.cutd(lab, t + self.s.wan);
+            self.push(at, HK::Req { lab });
+        }
+    }
+    fn arr(&mut self, t: f64, pc: usize, ep: u32, c: u64) {
+        if self.pcs[pc].ep != ep {
+            return; // the PC lost its lab head since it sent this
+        }
+        let s = self.s;
+        let srv = self.pcs[pc].srv;
+        self.pcs[pc].used -= 1;
+        let (len, lease) = if c != 0 { let (_, l, ls) = self.chunks.remove(&c).unwrap(); (l, ls) } else { (0.0, NONE) };
+        if srv == 0 {
+            let fin = self.serve(0, t, s.svc + s.svc_agent * self.root_conn as f64);
+            self.root_msgs += 1;
+            if c != 0 {
+                self.done += len;
+                self.tasks += 1;
+                if self.done >= s.n - 1e-6 {
+                    self.finish = Some(fin);
+                    return;
+                }
+            }
+            if self.pending > 1e-9 {
+                let l = self.pending.min(s.chunk_s);
+                self.pending -= l;
+                self.assign(pc, fin, l, NONE);
+            } else if !self.pcs[pc].idle {
+                self.pcs[pc].idle = true;
+                self.root_idle.push(pc);
+            }
+            return;
+        }
+        let lab = srv - 1;
+        let fin = self.serve(srv, t, s.svc + s.svc_agent * self.labs[lab].pcs.len() as f64 + if c != 0 { s.merge } else { 0.0 });
+        if c != 0 {
+            self.tasks += 1;
+            let ls = &mut self.leases[lease];
+            ls.done += len;
+            ls.nch += 1;
+            if ls.done >= ls.units - 1e-6 {
+                let at = self.cutd(lab, fin + s.wan); // one merged report for the whole lease
+                self.push(at, HK::Rep { lab, l: lease });
+            }
+        }
+        while let Some(&l) = self.labs[lab].pool.front() {
+            if self.leases[l].disp >= self.leases[l].units - 1e-9 {
+                self.labs[lab].pool.pop_front();
+            } else {
+                break;
+            }
+        }
+        if let Some(&l) = self.labs[lab].pool.front() {
+            let ls = &mut self.leases[l];
+            let len = (ls.units - ls.disp).min(s.chunk_s);
+            ls.disp += len;
+            self.labs[lab].pool_u -= len;
+            self.assign(pc, fin, len, l);
+        } else if !self.pcs[pc].idle {
+            self.pcs[pc].idle = true;
+            self.labs[lab].idle.push(pc);
+        }
+        self.refill(lab, fin);
+    }
+    fn root_free_cost(&self, extra: f64) -> f64 {
+        self.s.svc + self.s.svc_agent * self.root_conn as f64 + extra
+    }
+    fn on(&mut self, t: f64, k: HK) {
+        let s = self.s;
+        match k {
+            HK::Arr { pc, ep, c } => self.arr(t, pc, ep, c),
+            HK::Fin { pc, ep, c } => {
+                if self.pcs[pc].ep == ep {
+                    if let Some((l, p0, len)) = s.part {
+                        if self.pcs[pc].lab == l && t >= p0 && t < p0 + len {
+                            self.part_u += self.chunks[&c].1;
+                        }
+                    }
+                    self.send(pc, t, c);
+                }
+            }
+            HK::Req { lab } => {
+                if !self.labs[lab].alive {
+                    return;
+                }
+                let fin = self.serve(0, t, self.root_free_cost(0.0));
+                self.root_msgs += 1;
+                let reply = self.cutd(lab, fin + s.wan);
+                if self.pending > 1e-9 {
+                    // ASSUMPTION: guided lease size, never more than half the unleased work per live lab (keeps the tail short)
+                    let want = (s.lease_s * self.labs[lab].cap).min(self.pending / (2.0 * self.alive_labs.max(1) as f64)).max(s.chunk_s.min(self.pending));
+                    let units = want.min(self.pending);
+                    self.pending -= units;
+                    let l = self.leases.len();
+                    self.leases.push(Lease { lab, units, disp: 0.0, done: 0.0, nch: 0, closed: false, fenced: false });
+                    self.push(reply, HK::Grant { lab, l });
+                } else {
+                    self.push(reply, HK::Grant { lab, l: NONE });
+                }
+            }
+            HK::Grant { lab, l } => {
+                if !self.labs[lab].alive {
+                    return;
+                }
+                self.labs[lab].req_out = false;
+                if l == NONE {
+                    self.labs[lab].hold = t + 0.5;
+                    return self.push(t + 0.5, HK::Poll { lab });
+                }
+                let u = self.leases[l].units;
+                self.labs[lab].pool.push_back(l);
+                self.labs[lab].pool_u += u;
+                self.wake(t, Some(lab));
+                self.refill(lab, t);
+            }
+            HK::Poll { lab } => self.refill(lab, t),
+            HK::Rep { l, .. } => {
+                let fenced = self.leases[l].fenced;
+                self.leases[l].closed |= !fenced;
+                let fin = self.serve(0, t, self.root_free_cost(s.root_merge * self.leases[l].nch as f64));
+                self.root_msgs += 1;
+                let u = self.leases[l].units;
+                if fenced {
+                    self.wasted += u; // computed, but the root had already given the range away
+                } else {
+                    self.done += u;
+                    if self.done >= s.n - 1e-6 {
+                        self.finish = Some(fin);
+                    }
+                }
+            }
+            HK::Fence { lab } => {
+                if let Some((at, rec)) = s.root_kill.filter(|&(at, rec)| t >= at && t < at + rec) {
+                    return self.push(at + rec + 5.0, HK::Fence { lab }); // timers do not run while the root is down
+                }
+                for l in 0..self.leases.len() {
+                    let ls = &mut self.leases[l];
+                    if ls.lab == lab && !ls.closed && !ls.fenced {
+                        ls.fenced = true;
+                        self.pending += ls.units;
+                        self.redone += ls.units;
+                    }
+                }
+                self.wake(t, None);
+            }
+            HK::Kill { lab } => {
+                if !self.labs[lab].alive {
+                    return;
+                }
+                self.labs[lab].alive = false;
+                self.alive_labs -= 1;
+                self.root_conn -= 1;
+                for ls in self.leases.iter().filter(|ls| ls.lab == lab && ls.done < ls.units - 1e-6) {
+                    self.lost += ls.disp; // dispatched work of an unreported lease is gone with the lab head
+                }
+                self.push(t + s.ttl_s, HK::Fence { lab });
+                let members = self.labs[lab].pcs.clone();
+                for &pc in &members {
+                    let p = &mut self.pcs[pc];
+                    (p.ep, p.used, p.idle) = (p.ep + 1, 0, false);
+                    let ep = p.ep;
+                    let d = s.reconnect * (1.0 + 0.5 * self.back_u(pc));
+                    self.push(t + d, HK::Back { pc, ep });
+                }
+                let gone: Vec<u64> = self.chunks.iter().filter(|(_, v)| members.binary_search(&v.0).is_ok()).map(|(k, _)| *k).collect();
+                for c in gone {
+                    self.chunks.remove(&c); // chunks in flight at the dead head (counted in `lost`)
+                }
+            }
+            HK::Back { pc, ep } => {
+                if self.pcs[pc].ep == ep {
+                    self.pcs[pc].srv = 0;
+                    self.pcs[pc].busy_until = t;
+                    self.root_conn += 1;
+                    self.fill_root(pc, t);
+                }
+            }
+        }
+    }
+    /// deterministic per-PC value in [0,1) for reconnect jitter
+    fn back_u(&self, pc: usize) -> f64 {
+        Rng(self.s.seed ^ (pc as u64).wrapping_mul(0x9E37_79B9)).u()
+    }
+}
+
+pub fn hsim(s: &HScn) -> HOut {
+    let mut dr = Rng(s.seed ^ 0xA5A5_5A5A_1234_4321);
+    let lp = s.lab_pcs.max(1);
+    let nlabs = if s.two_level { s.pcs.div_ceil(lp) } else { 0 };
+    let pcs: Vec<HPc> = (0..s.pcs).map(|i| HPc { speed: dr.mult(s.speed_cv), lab: i / lp, srv: if s.two_level { 1 + i / lp } else { 0 }, ep: 0, used: 0, busy_until: 0.0, idle: false }).collect();
+    let fleet: f64 = pcs.iter().map(|p| p.speed).sum();
+    let labs: Vec<HLab> = (0..nlabs)
+        .map(|l| {
+            let m: Vec<usize> = (l * lp..((l + 1) * lp).min(s.pcs)).collect();
+            HLab { alive: true, cap: m.iter().map(|&i| pcs[i].speed).sum(), pcs: m, pool: VecDeque::new(), pool_u: 0.0, idle: vec![], req_out: false, hold: 0.0 }
+        })
+        .collect();
+    let mut m = HSim { s, root_conn: if s.two_level { nlabs } else { s.pcs }, alive_labs: nlabs, pcs, labs, leases: vec![], heap: BinaryHeap::new(), seq: 0, free: vec![0.0; 1 + nlabs], busy: vec![0.0; 1 + nlabs], pending: s.n, done: 0.0, chunks: HashMap::new(), next: 0, root_idle: vec![], tasks: 0, root_msgs: 0, redone: 0.0, wasted: 0.0, lost: 0.0, part_u: 0.0, finish: None };
+    if s.two_level {
+        for l in 0..nlabs {
+            for pc in m.labs[l].pcs.clone() {
+                m.pcs[pc].idle = true;
+                m.labs[l].idle.push(pc);
+            }
+            m.refill(l, 0.0);
+        }
+        if let Some((l, at, len)) = s.part.filter(|&(l, _, len)| l < nlabs && len > s.ttl_s) {
+            m.push(at + s.ttl_s, HK::Fence { lab: l }); // silent longer than the timeout: the root takes the leases back
+        }
+        if let Some((l, at)) = s.kill_lab.filter(|&(l, _)| l < nlabs) {
+            m.push(at, HK::Kill { lab: l });
+        }
+    } else {
+        for pc in 0..s.pcs {
+            m.fill_root(pc, 0.0);
+        }
+    }
+    let (mut snap, mut now) = (None, 0.0);
+    while let Some(ev) = m.heap.pop() {
+        if ev.t >= s.max_s {
+            now = s.max_s;
+            break;
+        }
+        if snap.is_none() && ev.t >= s.warm_s {
+            snap = Some((m.tasks, m.root_msgs, m.busy.clone()));
+        }
+        now = ev.t;
+        m.on(ev.t, ev.k);
+        if m.finish.is_some() {
+            break;
+        }
+    }
+    let end_s = m.finish.unwrap_or(now);
+    let (t0, r0, b0) = snap.unwrap_or((0, 0, vec![0.0; m.busy.len()]));
+    let w = (end_s - s.warm_s).max(1e-9);
+    let lab_cpu_max = (1..m.busy.len()).map(|i| (m.busy[i] - b0[i]) / w).fold(0.0, f64::max).min(1.0);
+    let hb = if s.two_level { m.alive_labs as f64 / s.hb_s } else { 0.0 }; // heartbeats: analytic add-on to the root load
+    HOut { finished: m.finish.is_some(), end_s, ideal_s: s.n / fleet, done: m.done, tasks_s: (m.tasks - t0) as f64 / w, root_cpu: ((m.busy[0] - b0[0]) / w + hb * m.root_free_cost(0.0)).min(1.0), root_msgs_s: (m.root_msgs - r0) as f64 / w + hb, lab_cpu_max, redone: m.redone, wasted: m.wasted, lost_with_lab: m.lost, part_units: m.part_u }
+}
+
+/// The four hierarchy studies (docs/sim/HIERARCHY.md). Writes hier_*.csv into `dir` and prints the tables.
+fn hier_study(dir: &str) {
+    let w = |name: &str, body: String| std::fs::write(format!("{dir}/{name}"), body).unwrap_or_else(|e| die(&e.to_string()));
+    let base = HScn::default();
+    // (1) saturation
+    let mut csv = String::from("pcs,chunk_s,arch,lab_pcs,tasks_per_s,demand_tasks_per_s,served_pct,root_cpu_pct,root_msgs_per_s,lab_cpu_max_pct\n");
+    println!("(1) saturation: tasks/s (root CPU %, busiest lab CPU %)");
+    println!("  PCs:                                  200 / 500 / 1000 / 2000 / 5000 / 10000");
+    for chunk in [0.1, 0.5, 1.0] {
+        for (arch, lp) in [("1-level", 0usize), ("2-level", 40), ("2-level", 100)] {
+            let mut line = format!("  chunk {chunk:>3} s {arch} {}", if lp > 0 { format!("labs of {lp:>3}") } else { "             ".into() });
+            for pcs in [200usize, 500, 1000, 2000, 5000, 10000] {
+                let o = hsim(&HScn { pcs, lab_pcs: lp.max(50), two_level: lp > 0, chunk_s: chunk, max_s: 12.0, warm_s: 3.0, ..base.clone() });
+                let demand = pcs as f64 / chunk;
+                csv += &format!("{pcs},{chunk},{arch},{lp},{:.0},{:.0},{:.1},{:.2},{:.0},{:.1}\n", o.tasks_s, demand, 100.0 * o.tasks_s / demand, 100.0 * o.root_cpu, o.root_msgs_s, 100.0 * o.lab_cpu_max);
+                line += &format!(" {:>6.0} ({:.1}%,{:.0}%)", o.tasks_s, 100.0 * o.root_cpu, 100.0 * o.lab_cpu_max);
+            }
+            println!("{line}");
+        }
+    }
+    w("hier_saturation.csv", csv);
+    // (2) faults in a 30-minute job on 1,000 PCs, labs of 50, 1 s chunks
+    let job = |two: bool| HScn { pcs: 1000, lab_pcs: 50, two_level: two, chunk_s: 1.0, n: 1000.0 * 1800.0, ..base.clone() };
+    let cases: Vec<(&str, HScn)> = vec![
+        ("1-level, no fault", job(false)),
+        ("1-level, root killed at 10 min, standby 5.7 s", HScn { root_kill: Some((600.0, 5.7)), ..job(false) }),
+        ("1-level, root killed at 10 min, manual restart 300 s", HScn { root_kill: Some((600.0, 300.0)), ..job(false) }),
+        ("2-level, no fault", job(true)),
+        ("2-level, lab head killed at 10 min", HScn { kill_lab: Some((3, 600.0)), ..job(true) }),
+        ("2-level, root killed at 10 min, standby 5.7 s", HScn { root_kill: Some((600.0, 5.7)), ..job(true) }),
+        ("2-level, root killed at 10 min, manual restart 300 s", HScn { root_kill: Some((600.0, 300.0)), ..job(true) }),
+    ];
+    let mut csv = String::from("case,makespan_s,delta_vs_same_arch_no_fault_s,delta_pct,recomputed_units,regranted_units,ideal_s\n");
+    println!("(2) 30-min job, 1,000 PCs");
+    let mut ref_end = 0.0;
+    for (name, sc) in &cases {
+        let o = hsim(sc);
+        if name.ends_with("no fault") {
+            ref_end = o.end_s;
+        }
+        let d = o.end_s - ref_end;
+        csv += &format!("\"{name}\",{:.2},{:.2},{:.3},{:.0},{:.0},{:.1}\n", o.end_s, d, 100.0 * d / ref_end, o.lost_with_lab, o.redone, o.ideal_s);
+        println!("  {name:<56} {:>8.1} s  {:>+8.1} s  recomputed {:>6.0}  re-granted {:>6.0}", o.end_s, d, o.lost_with_lab, o.redone);
+    }
+    w("hier_faults.csv", csv);
+    // (3) 60 s partition of lab 0 (50 PCs), averaged over 6 start times (the lease phase matters); 0.5 s chunks
+    let part = |two: bool, l: f64, ttl: f64, at: f64| HScn { pcs: 1000, lab_pcs: 50, two_level: two, chunk_s: 0.5, lease_s: l, ttl_s: ttl, part: Some((0, at, 60.0)), max_s: 300.0, ..base.clone() };
+    let pavg = |two: bool, l: f64, ttl: f64| {
+        let (mut pct, mut wasted) = (0.0, 0.0);
+        for k in 0..6 {
+            let sc = part(two, l, ttl, 100.0 + 9.7 * k as f64);
+            let o = hsim(&sc);
+            pct += 100.0 * o.part_units / (60.0 * lab_cap(&sc)) / 6.0;
+            wasted += o.wasted / 6.0;
+        }
+        (pct, wasted)
+    };
+    let mut csv = String::from("arch,lease_s,ttl_s,pct_of_full_speed_during_partition,wasted_units\n");
+    println!("(3) 60 s partition of one 50-PC lab: share of its full speed that its PCs still finish inside the window (mean of 6 start times)");
+    for (two, l) in [(false, 30.0), (true, 10.0), (true, 30.0), (true, 60.0), (true, 120.0)] {
+        let (pct, wasted) = pavg(two, l, 90.0);
+        let arch = if two { "2-level" } else { "1-level" };
+        csv += &format!("{arch},{},90,{pct:.1},{wasted:.0}\n", if two { l } else { 0.0 });
+        println!("  {arch} L={:>4}: {pct:>5.1} % of full speed, wasted {wasted:.0} units", if two { l } else { 0.0 });
+    }
+    w("hier_partition.csv", csv);
+    // (4) lease length
+    let mut csv = String::from("lease_s,root_cpu_pct,root_msgs_per_s,lab_kill_delta_s,lab_kill_recomputed_units,root_kill_5_7s_delta_s,root_kill_300s_delta_s,partition_window_pct\n");
+    println!("(4) lease length L: root CPU, root msgs/s | lab kill: delta s (recomputed units) | root kill 5.7 s, 300 s: delta s | partition share");
+    for l in [2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0] {
+        let sat = hsim(&HScn { lease_s: l, max_s: 60.0, warm_s: 10.0, n: 1e12, ..job(true) });
+        let lk = hsim(&HScn { lease_s: l, kill_lab: Some((3, 600.0)), ..job(true) });
+        let r5 = hsim(&HScn { lease_s: l, root_kill: Some((600.0, 5.7)), ..job(true) });
+        let r300 = hsim(&HScn { lease_s: l, root_kill: Some((600.0, 300.0)), ..job(true) });
+        let b = hsim(&HScn { lease_s: l, ..job(true) }).end_s;
+        let (pw, _) = pavg(true, l, 90.0);
+        csv += &format!("{l},{:.3},{:.1},{:.2},{:.0},{:.2},{:.2},{:.1}\n", 100.0 * sat.root_cpu, sat.root_msgs_s, lk.end_s - b, lk.lost_with_lab, r5.end_s - b, r300.end_s - b, pw);
+        println!("  L={l:>4}: root {:>5.2} % {:>6.1}/s | lab kill {:>+6.1} s ({:>6.0}) | root kill {:>+5.1} / {:>+6.1} s | partition {pw:>5.1} %", 100.0 * sat.root_cpu, sat.root_msgs_s, lk.end_s - b, lk.lost_with_lab, r5.end_s - b, r300.end_s - b);
+    }
+    w("hier_lease.csv", csv);
+    // (4b) silence timeout, L = 30 s
+    let mut csv = String::from("ttl_s,partition_window_pct,partition_wasted_units,lab_kill_delta_s\n");
+    println!("(4b) silence timeout ttl, L = 30 s: partition share, wasted units | lab kill delta s");
+    let b = hsim(&job(true)).end_s;
+    for ttl in [10.0, 30.0, 90.0, 300.0] {
+        let (pw, wa) = pavg(true, 30.0, ttl);
+        let lk = hsim(&HScn { ttl_s: ttl, kill_lab: Some((3, 600.0)), ..job(true) });
+        csv += &format!("{ttl},{pw:.1},{wa:.0},{:.2}\n", lk.end_s - b);
+        println!("  ttl={ttl:>4}: partition {pw:>5.1} %, wasted {wa:>6.0} | lab kill {:>+5.1} s", lk.end_s - b);
+    }
+    w("hier_ttl.csv", csv);
+}
+
+/// summed speed of lab 0's PCs in a scenario (same draw as hsim)
+fn lab_cap(s: &HScn) -> f64 {
+    let mut dr = Rng(s.seed ^ 0xA5A5_5A5A_1234_4321);
+    (0..s.pcs).map(|i| (i, dr.mult(s.speed_cv))).filter(|(i, _)| *i < s.lab_pcs).map(|(_, v)| v).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,6 +1515,69 @@ mod tests {
         let r = go(json!({"nodes": [{"count": 8, "rate": 1e5}, {"count": 2, "rate": 1e5, "fail_at_s": 40, "down_s": 1e9}], "job": {"n": 1e8}}));
         assert!(r.finished && r.done == r.n && r.failures == 2 && r.recovered > 0);
         assert!(r.end_s > r.ideal_s * 1.1, "{} {}", r.end_s, r.ideal_s); // 2 of 10 PCs lost at 40 % of the job
+    }
+
+    // ---- hierarchy mode ----
+    fn hs(two: bool) -> HScn {
+        HScn { pcs: 200, lab_pcs: 50, two_level: two, chunk_s: 1.0, n: 200.0 * 120.0, ..HScn::default() }
+    }
+
+    #[test]
+    fn hier_both_levels_finish_and_count_every_unit_once() {
+        for two in [false, true] {
+            let o = hsim(&hs(two));
+            assert!(o.finished && (o.done - 24000.0).abs() < 1e-3, "{two}: {} {}", o.done, o.end_s);
+            assert!(o.end_s > o.ideal_s && o.end_s < 1.06 * o.ideal_s, "{two}: {} vs ideal {}", o.end_s, o.ideal_s);
+            assert!(o.wasted == 0.0 && o.redone == 0.0 && o.lost_with_lab == 0.0);
+        }
+        let (a, b) = (hsim(&hs(true)).summary(), hsim(&hs(true)).summary());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hier_one_level_matches_the_calibrated_head_ceiling() {
+        // 500 PCs on 0.1 s chunks ask for 5,000 tasks/s; one head at 379 us + 0.199 us x 500 serves about 2,090
+        let o = hsim(&HScn { pcs: 500, chunk_s: 0.1, max_s: 6.0, warm_s: 2.0, ..HScn::default() });
+        assert!(o.tasks_s > 1900.0 && o.tasks_s < 2200.0 && o.root_cpu > 0.99, "{} {}", o.tasks_s, o.root_cpu);
+    }
+
+    #[test]
+    fn hier_labs_lift_the_ceiling_and_the_root_sees_only_leases() {
+        let sc = |two| HScn { pcs: 2000, lab_pcs: 100, two_level: two, chunk_s: 0.5, max_s: 6.0, warm_s: 2.0, ..HScn::default() };
+        let (one, two) = (hsim(&sc(false)), hsim(&sc(true)));
+        assert!(two.tasks_s > 2.5 * one.tasks_s && two.tasks_s > 3800.0, "{} {}", one.tasks_s, two.tasks_s);
+        assert!(two.root_cpu < 0.05 && two.lab_cpu_max < 0.3 && two.root_msgs_s < 100.0, "{} {} {}", two.root_cpu, two.lab_cpu_max, two.root_msgs_s);
+    }
+
+    #[test]
+    fn hier_lab_kill_regrants_the_lease_and_the_pcs_fall_back_to_the_root() {
+        let ok = hsim(&hs(true));
+        let o = hsim(&HScn { kill_lab: Some((1, 40.0)), ttl_s: 10.0, ..hs(true) }); // a short timeout: the 120 s job would otherwise wait for the fence at the tail
+        assert!(o.finished && (o.done - 24000.0).abs() < 1e-3, "{}", o.done);
+        assert!(o.lost_with_lab > 0.0 && o.redone >= o.lost_with_lab, "{} {}", o.lost_with_lab, o.redone);
+        // the lab's PCs kept working through the root: the cost is about the lost lease, not a quarter of the fleet
+        assert!(o.end_s > ok.end_s && o.end_s < ok.end_s + 10.0, "{} {}", o.end_s, ok.end_s);
+    }
+
+    #[test]
+    fn hier_root_outage_is_hidden_by_leases_only_when_they_are_long_enough() {
+        let kill = |two, l| HScn { root_kill: Some((40.0, 30.0)), lease_s: l, ..hs(two) };
+        let d = |sc: HScn| { let ok = HScn { root_kill: None, ..sc.clone() }; hsim(&sc).end_s - hsim(&ok).end_s };
+        let one = d(kill(false, 30.0));
+        let (long, short) = (d(kill(true, 60.0)), d(kill(true, 5.0)));
+        assert!(one > 25.0 && long < 3.0 && short > 15.0, "{one} {long} {short}");
+    }
+
+    #[test]
+    fn hier_partitioned_lab_keeps_computing_its_lease_and_uploads_at_heal() {
+        let p = |two| HScn { n: 1e12, chunk_s: 0.5, part: Some((0, 30.0, 40.0)), max_s: 100.0, lease_s: 60.0, ..hs(two) };
+        let (one, two) = (hsim(&p(false)), hsim(&p(true)));
+        let full = 40.0 * lab_cap(&p(true));
+        assert!(one.part_units < 0.05 * full && two.part_units > 0.5 * full, "{} {} of {full}", one.part_units, two.part_units);
+        assert!(two.wasted == 0.0 && two.redone == 0.0); // silent 40 s < ttl 90 s: the leases survive and are accepted
+        // silent longer than the timeout: the root gives the range away and the late report is thrown away
+        let late = hsim(&HScn { ttl_s: 10.0, ..p(true) });
+        assert!(late.redone > 0.0 && late.wasted > 0.0, "{} {}", late.redone, late.wasted);
     }
 
     // ---- day mode ----

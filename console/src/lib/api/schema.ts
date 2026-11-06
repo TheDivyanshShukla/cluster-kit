@@ -373,3 +373,79 @@ export const Net = z.object({
 });
 export type Net = z.infer<typeof Net>;
 export type NetNode = z.infer<typeof NetNode>;
+
+// Advisor (docs/ADVISOR.md): suggestions with options, apply/undo history, policy.
+export const AdviceMode = z.enum(['off', 'suggest', 'auto']);
+export const AdviceAction = z.looseObject({ type: z.string() });
+export const AdviceOption = z.object({
+	id: z.string(),
+	title: z.string(),
+	action: AdviceAction.nullable().default(null),
+	steps: z.array(z.string()).default([]),
+	expected_effect: z.string().default(''),
+	metric: z.string().nullable().default(null),
+	metric_from: z.number().default(0),
+	metric_to: z.number().default(0),
+	cost: z.string().default(''),
+	risk: z.enum(['low', 'med', 'high']).catch('low'),
+	reversible: z.boolean().default(true),
+	auto_safe: z.boolean().default(false),
+	time_to_effect: z.string().default(''),
+	confidence: z.string().default(''),
+	success_check: z.string().default(''),
+	recommended: z.boolean().default(false),
+	score: z.number().default(0)
+});
+export const Suggestion = z.object({
+	id: z.string(),
+	kind: z.string(),
+	severity: z.enum(['info', 'tip', 'warn']).catch('info'),
+	title: z.string(),
+	why: z.string().default(''),
+	options: z.array(AdviceOption).default([]),
+	effect: z.string().default(''),
+	action: AdviceAction.nullable().default(null),
+	since_ms: z.number().default(0),
+	policy: z.string().default('suggest'),
+	accuracy: z.number().nullable().optional()
+});
+export const AdviceOutcome = z.object({ observed: z.number().nullish(), predicted_gain: z.number().nullish(), observed_gain: z.number().nullish(), hit: z.boolean().nullish() });
+export const AdviceApplied = z.object({
+	id: z.string(),
+	kind: z.string(),
+	option: z.string(),
+	action: AdviceAction.nullable().default(null),
+	by: z.string().default(''),
+	auto: z.boolean().default(false),
+	ts_ms: z.number(),
+	metric: z.string().nullable().default(null),
+	before: z.number().nullish(),
+	predicted: z.number().nullish(),
+	follow_s: z.number().default(0),
+	undone: z.boolean().default(false),
+	outcome: AdviceOutcome.nullable().default(null)
+});
+const Accuracy = z.record(z.string(), z.number()).default({});
+export const AdviceList = z.object({
+	enabled: z.boolean(),
+	policy: z.record(z.string(), AdviceMode.catch('suggest')).default({}),
+	suggestions: z.array(Suggestion),
+	accuracy: Accuracy
+});
+export const AdviceSettingsReply = z.object({ enabled: z.boolean(), policy: z.record(z.string(), AdviceMode.catch('suggest')).default({}), suggestions: z.array(Suggestion).default([]) });
+export const AdviceHistory = z.object({ history: z.array(AdviceApplied), accuracy: Accuracy });
+export const AdviceReplyList = z.object({ suggestions: z.array(Suggestion) });
+export const AdviceApplyReply = z.object({ applied: AdviceApplied, suggestions: z.array(Suggestion).default([]) });
+export const AdviceChange = z.looseObject({ setting: z.string().optional(), node: z.string().optional(), from: z.unknown().optional(), to: z.unknown().optional() });
+export const AdvicePreviewReply = z.object({
+	id: z.string(),
+	option: AdviceOption,
+	preview: z.object({ would_change: z.array(AdviceChange).default([]), valid: z.boolean().default(true), error: z.string().nullish(), doc: z.string().optional() }).nullable(),
+	changes_nothing: z.boolean().default(true)
+});
+export const AdviceEvent = z.object({ suggestions: z.array(Suggestion) });
+export type AdviceMode = z.infer<typeof AdviceMode>;
+export type Suggestion = z.infer<typeof Suggestion>;
+export type AdviceOption = z.infer<typeof AdviceOption>;
+export type AdviceApplied = z.infer<typeof AdviceApplied>;
+export type AdvicePreviewReply = z.infer<typeof AdvicePreviewReply>;

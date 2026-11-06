@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { CircleAlert, ListChecks, Unplug } from '@lucide/svelte';
+	import { CircleAlert, Lightbulb, ListChecks, Unplug } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import LiveCanvas from '#lib/components/LiveCanvas.svelte';
 	import Page from '#lib/components/Page.svelte';
@@ -17,6 +17,8 @@
 	import { elapsedMs, etaMs, jobRate, mergeRows, progress, runningJobs } from '#lib/jobs.ts';
 	import { card } from '#lib/ui.ts';
 
+	import { openCount, suggestionsText } from '#lib/advisor.ts';
+	const nAdvice = $derived(openCount(live.advice));
 	const c = $derived(live.cluster);
 	const workers = $derived(c?.workers ?? []);
 	const cores = $derived(workers.reduce((a, w) => a + w.threads, 0));
@@ -52,6 +54,9 @@
 	tabs={[{ id: 'fleet', label: 'Fleet' }, { id: 'head', label: 'Head' }, { id: 'canvas', label: 'Canvas' }, { id: 'jobs', label: 'Jobs' }, { id: 'events', label: 'Events' }]}
 	class="sm:grid-cols-2 sm:grid-rows-[auto_minmax(0,1fr)_minmax(0,1fr)] lg:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)]"
 >
+	{#snippet actions()}
+		{#if nAdvice > 0}<a href="/advisor" class="text-primary inline-flex min-h-6 items-center gap-1.5 text-[13px] font-medium hover:underline"><Lightbulb class="size-3.5" aria-hidden="true" />{suggestionsText(nAdvice)}</a>{/if}
+	{/snippet}
 	{#if live.error && !c}
 		<Panel title="Fleet" tab="fleet" class="sm:col-span-2"><EmptyState icon={CircleAlert} title="The head is not answering" body={live.error} /></Panel>
 	{:else}

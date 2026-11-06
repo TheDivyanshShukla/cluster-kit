@@ -560,6 +560,10 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
             json_out(200, json!({"events": events, "next": next}))
         }
         ("GET", ["stream"]) => Out::Sse,
+        ("GET", ["advice"]) => advice_get(ctx),
+        ("GET", ["advice", "history"]) => advice_history(ctx),
+        ("PUT", ["advice", "settings"]) => advice_settings(ctx, r, who.as_ref(), me),
+        ("POST", ["advice", id, op]) => advice_post(ctx, r, who.as_ref(), id, op, me),
         ("GET", ["jobs", id, "breakdown"]) => match id.parse().ok().and_then(|id| head::breakdown(ctx, id)) {
             Some(b) => json_out(200, json!({"breakdown": b})),
             None => fail(404, "not_found", "no such job, or it ran before time accounting existed"),
@@ -2028,6 +2032,10 @@ pub fn serve(ctx: Arc<Ctx>) {
     if auth.open {
         eprintln!("CK_AUTH=off: the API is open, everyone is an anonymous admin");
     }
+    {
+        let c = ctx.clone();
+        thread::spawn(move || adv_loop(c));
+    }
     let hs: Vec<_> = (0..POOL)
         .map(|_| {
             let (server, ctx, auth) = (server.clone(), ctx.clone(), auth.clone());
@@ -2041,6 +2049,281 @@ pub fn serve(ctx: Arc<Ctx>) {
     for h in hs {
         let _ = h.join();
     }
+}
+
+// ---- advisor (docs/ADVISOR.md): gathers the observation, applies actions through the normal endpoints, keeps Persist
+
+use crate::advisor as adv;
+
+#[derive(Default)]
+struct AdvState {
+    eng: adv::Engine,
+    at: Option<Instant>,
+    list: Vec<adv::Suggestion>,
+    raw: Vec<adv::Suggestion>,
+    sig: String,
+}
+
+/// One lock for the engine, the cache and the stored Persist (load-modify-save happens under it).
+fn adv_state() -> std::sync::MutexGuard<'static, AdvState> {
+    static S: std::sync::OnceLock<std::sync::Mutex<AdvState>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn adv_load(ctx: &Ctx) -> adv::Persist {
+    ctx.store.meta("advisor").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+fn adv_save(ctx: &Ctx, p: &adv::Persist) {
+    let _ = ctx.store.set_meta("advisor", &serde_json::to_string(p).unwrap_or_default());
+}
+
+fn adv_bd(b: &Value) -> adv::Bd {
+    let f = |k: &str| b["pc_seconds"][k].as_f64().unwrap_or(0.0);
+    adv::Bd {
+        wall: b["wall_s"].as_f64().unwrap_or(0.0), compute: f("compute"), dispatch: f("dispatch_wait"), tail: f("tail_idle"), recompute: f("recompute"), failover: f("failover_pause"), other: f("other"),
+        chunk_p50: b["chunk_s"]["p50"].as_f64().unwrap_or(0.0), chunks: b["per_pc"].as_array().map_or(0, |a| a.iter().map(|p| p["chunks"].as_u64().unwrap_or(0)).sum()),
+        stragglers: b["stragglers"].as_array().map_or(vec![], |a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()),
+    }
+}
+
+/// (percent used, GB free) of the disk holding CK_DATA; None where `df` is missing.
+fn adv_disk() -> Option<(f64, f64)> {
+    let out = std::process::Command::new("df").arg("-Pk").arg(crate::blobs::data_dir()).output().ok()?;
+    let t = String::from_utf8_lossy(&out.stdout).into_owned();
+    let f: Vec<&str> = t.lines().nth(1)?.split_whitespace().collect();
+    Some((f.get(4)?.trim_end_matches('%').parse().ok()?, f.get(3)?.parse::<f64>().ok()? / 1048576.0))
+}
+
+fn adv_gather(ctx: &Ctx) -> adv::AdvObs {
+    let now = now_ms();
+    let mut o = adv::AdvObs::default();
+    for k in crate::tune::KNOBS {
+        o.tun.insert(k.key.into(), crate::tune::get(k.key));
+    }
+    let (mut losses, mut before) = (HashMap::<String, u32>::new(), None);
+    for _ in 0..20 {
+        let page = ctx.store.events(500, before);
+        let Some(last) = page.last() else { break };
+        before = Some(last.id);
+        for e in page.iter().filter(|e| e.ts_ms >= now - 86_400_000) {
+            match e.kind.as_str() {
+                "node.lost" => {
+                    if let Some(id) = e.detail.rsplit("(node ").next().and_then(|t| t.strip_suffix(')')) {
+                        *losses.entry(id.to_string()).or_default() += 1;
+                    }
+                }
+                "node.denied" | "task.timeout" if e.ts_ms >= now - 3_600_000 => *o.events.entry(e.kind.clone()).or_default() += 1,
+                _ => {}
+            }
+        }
+        if last.ts_ms < now - 86_400_000 {
+            break;
+        }
+    }
+    let live: HashMap<String, bool> = ctx.sh.0.lock().unwrap().workers.values().filter_map(|w| Some((w.hello.as_ref()?.node_id.clone(), !w.inflight.is_empty()))).collect();
+    o.nodes = ctx.store.nodes().into_iter().map(|n| adv::AdvNode { online: live.contains_key(&n.node_id), busy: live.get(&n.node_id).copied().unwrap_or(false), losses_24h: losses.get(&n.node_id).copied().unwrap_or(0), id: n.node_id, host: n.host, state: n.state }).collect();
+    o.alerts = ctx.store.alerts(true, 200).into_iter().map(|a| (a.kind, a.node_id, a.detail)).collect();
+    let running = head::running_jobs(ctx);
+    for r in ctx.store.jobs(60, None) {
+        let run = running.contains(&r.id);
+        let recent = r.finished_ms.is_some_and(|t| t >= now - 3_600_000);
+        let failed = r.state == crate::jobs::JobState::Failed && r.finished_ms.is_some_and(|t| t >= now - 86_400_000);
+        if !(run || recent || failed) {
+            continue;
+        }
+        let spec = ctx.store.spec(r.id);
+        o.jobs.push(adv::AdvJob {
+            id: r.id, running: run, user: r.submitter.clone(), wait: if run { head::wait_reason(ctx, r.id).map(String::from) } else { None }, failed, error: r.error.clone(), finished_ms: r.finished_ms.unwrap_or(0),
+            blobs: spec.as_ref().map_or(0, |s| s.blobs.len()), blob_mode: spec.map(|s| s.blob_mode).unwrap_or_default(), bd: if run || recent { head::breakdown(ctx, r.id).map(|b| adv_bd(&b)) } else { None },
+        });
+    }
+    let q = crate::log::Query { role: None, since_ms: now - 3_600_000, kind: None, level: crate::log::Level::Warn, limit: 2000 };
+    let mut warns: HashMap<String, (u32, String)> = HashMap::new();
+    for l in crate::log::query(&crate::log::logs_dir(), &q) {
+        if let Ok(v) = serde_json::from_str::<Value>(&l) {
+            let msg = v["msg"].as_str().or(v["fields"]["msg"].as_str()).or(v["detail"].as_str()).unwrap_or("").chars().take(160).collect::<String>();
+            let e = warns.entry(v["kind"].as_str().unwrap_or("").to_string()).or_default();
+            *e = (e.0 + 1, msg);
+        }
+    }
+    o.warns = warns.into_iter().map(|(k, (n, m))| (k, n, m)).collect();
+    o.standbys = ctx.repl.status.lock().unwrap().standbys.len();
+    o.target_standbys = ctx.store.meta("ha_settings").and_then(|s| serde_json::from_str::<crate::jobs::HaSettings>(&s).ok()).map_or(crate::tune::n("target_standbys") as usize, |h| h.target_standbys as usize);
+    o.best_head = head::candidates(ctx).into_iter().find(|c| c["role"] == "candidate" && c["eligible"] == true).and_then(|c| Some((c["node_id"].as_str()?.to_string(), c["host"].as_str()?.to_string(), c["score"].as_f64()?)));
+    o.disk = adv_disk();
+    let pw = power_settings(ctx);
+    (o.power_mode, o.keep_awake) = (pw.mode, pw.keep_awake);
+    o.blob_sent_gb = crate::blobs::SERVED.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
+    o
+}
+
+fn status_of(o: &Out) -> u16 {
+    match o { Out::Plain { status, .. } => *status, Out::Sse => 200 }
+}
+
+/// Run an action through the same handler the matching endpoint uses.
+fn adv_run(ctx: &Ctx, a: &adv::Action, actor: &str) -> Result<(), Out> {
+    use adv::Action::*;
+    let (method, path, body) = match a {
+        Tune { key, to, .. } => ("PUT", "/api/v1/tunables", Value::Object([(key.clone(), json!(to))].into_iter().collect())),
+        NodeState { node_ids, to, .. } => ("POST", "/api/v1/nodes/state", json!({"state": to, "node_ids": node_ids, "reason": "advisor"})),
+        HaTarget { to, .. } => ("PUT", "/api/v1/ha/settings", json!({"target_standbys": to})),
+        Power { to, .. } => ("PUT", "/api/v1/power", json!({"mode": to})),
+        Doc { .. } => return Err(bad("this option has no one-click action; follow its steps")),
+    };
+    let req = Req { method: method.into(), path: path.into(), query: HashMap::new(), cookie: None, bearer: None, body: body.to_string().into_bytes(), ip: [127, 0, 0, 1].into() };
+    let out = match a { Tune { .. } => put_tunables(ctx, &req, actor), NodeState { .. } => set_states(ctx, &req, actor), HaTarget { .. } => put_ha_settings(ctx, &req, actor), _ => put_power(ctx, &req, actor) };
+    if status_of(&out) < 300 { Ok(()) } else { Err(out) }
+}
+
+/// Apply `opt` of `s` and remember it for the follow-up check and for undo. The suggestion is snoozed for the follow-up window.
+fn adv_do(ctx: &Ctx, p: &mut adv::Persist, s: &adv::Suggestion, opt: &adv::Opt, actor: &str, auto: bool, m: &HashMap<String, f64>) -> Result<adv::Applied, Out> {
+    let now = now_ms();
+    let a = opt.action.clone().filter(adv::Action::changes).ok_or_else(|| bad("this option has no one-click action; follow its steps"))?;
+    if auto && !(opt.auto_safe && opt.reversible) {
+        return Err(bad("not auto-safe"));
+    }
+    adv_run(ctx, &a, actor)?;
+    let rec = adv::Applied {
+        id: s.id.clone(), kind: s.kind.clone(), option: opt.id.clone(), action: a.clone(), by: actor.into(), auto, ts_ms: now, metric: opt.metric.clone(),
+        before: opt.metric.as_ref().and_then(|k| m.get(k)).copied().unwrap_or(opt.metric_from), predicted: opt.metric_to, follow_s: adv::FOLLOW_S, undone: false, outcome: None,
+    };
+    audit(ctx, if auto { "advice.auto" } else { "advice.applied" }, actor, &format!("{} option {}: {}", s.id, opt.id, serde_json::to_string(&a).unwrap_or_default()));
+    p.dismissed.insert(s.id.clone(), now + adv::FOLLOW_S * 1000);
+    p.push(rec.clone());
+    Ok(rec)
+}
+
+fn adv_refresh_in(ctx: &Ctx, st: &mut AdvState) {
+    let now = now_ms();
+    let o = adv_gather(ctx);
+    let m = adv::metrics(&o);
+    let mut p = adv_load(ctx);
+    let before = serde_json::to_string(&p).unwrap_or_default();
+    for a in adv::track(&mut p, now, &m) {
+        let oc = a.outcome.as_ref().unwrap();
+        audit(ctx, "advice.outcome", "advisor", &format!("{} option {}: predicted {} {:.3} -> {:.3}, observed {}, {}", a.id, a.option, a.metric.as_deref().unwrap_or("-"), a.before, a.predicted, oc.observed.map_or("n/a".into(), |x| format!("{x:.3}")), if oc.hit { "held" } else { "missed" }));
+    }
+    st.raw = adv::advise(&o, now);
+    let list = st.eng.step(now, st.raw.clone(), &p);
+    for s in &list {
+        if let Some(opt) = adv::auto_pick(s, &p, now).cloned() {
+            let _ = adv_do(ctx, &mut p, s, &opt, "advisor", true, &m);
+        }
+    }
+    if serde_json::to_string(&p).unwrap_or_default() != before {
+        adv_save(ctx, &p);
+    }
+    let list = st.eng.step(now, st.raw.clone(), &p); // auto-applied ones are snoozed now
+    let sig = list.iter().map(|s| format!("{}:{}", s.id, s.severity)).collect::<Vec<_>>().join(",");
+    if sig != st.sig {
+        st.sig = sig;
+        ctx.bus.publish("advice", &json!({"suggestions": list}).to_string());
+    }
+    st.list = list;
+    st.at = Some(Instant::now());
+}
+
+fn adv_loop(ctx: Arc<Ctx>) {
+    loop {
+        thread::sleep(Duration::from_secs(10));
+        if ctx.repl.status.lock().unwrap().role != "standby" {
+            adv_refresh_in(&ctx, &mut adv_state());
+        }
+    }
+}
+
+fn adv_accuracy(p: &adv::Persist) -> Value {
+    let mut kinds: Vec<&str> = p.applied.iter().map(|a| a.kind.as_str()).collect();
+    kinds.sort();
+    kinds.dedup();
+    Value::Object(kinds.into_iter().filter_map(|k| Some((k.to_string(), json!(adv::accuracy(p, k)?)))).collect())
+}
+
+fn advice_get(ctx: &Ctx) -> Out {
+    let mut st = adv_state();
+    if st.at.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
+        adv_refresh_in(ctx, &mut st);
+    }
+    let p = adv_load(ctx);
+    json_out(200, json!({"enabled": p.enabled, "policy": p.policy, "suggestions": st.list, "accuracy": adv_accuracy(&p)}))
+}
+
+fn advice_history(ctx: &Ctx) -> Out {
+    let p = adv_load(ctx);
+    json_out(200, json!({"history": p.applied, "accuracy": adv_accuracy(&p)}))
+}
+
+fn advice_settings(ctx: &Ctx, r: &Req, who: Option<&Who>, actor: &str) -> Out {
+    if let Some(o) = adv_need(who, Role::Admin) { return o }
+    let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
+    let mut st = adv_state();
+    let mut p = adv_load(ctx);
+    if let Some(e) = v.get("enabled") {
+        match e.as_bool() { Some(b) => p.enabled = b, None => return bad("enabled must be true or false") }
+    }
+    for (k, m) in v.get("policy").and_then(Value::as_object).into_iter().flatten() {
+        match m {
+            Value::Null => { p.policy.remove(k); }
+            Value::String(s) if adv::MODES.contains(&s.as_str()) => { p.policy.insert(k.clone(), s.clone()); }
+            _ => return bad("policy values are off, suggest, auto or null"),
+        }
+    }
+    adv_save(ctx, &p);
+    audit(ctx, "advice.settings", actor, &format!("enabled {}, policy {}", p.enabled, serde_json::to_string(&p.policy).unwrap_or_default()));
+    adv_refresh_in(ctx, &mut st);
+    json_out(200, json!({"enabled": p.enabled, "policy": p.policy, "suggestions": st.list}))
+}
+
+fn adv_need(who: Option<&Who>, min: Role) -> Option<Out> {
+    if who.is_some_and(|w| w.role >= min) { None } else { Some(fail(403, "forbidden", &format!("needs the {} role", min.name()))) }
+}
+
+fn advice_post(ctx: &Ctx, r: &Req, who: Option<&Who>, id: &str, op: &str, actor: &str) -> Out {
+    let need = if matches!(op, "apply" | "undo") { Role::Admin } else if matches!(op, "preview" | "dismiss") { Role::Operator } else { return fail(404, "not_found", "no such advice action") };
+    if let Some(o) = adv_need(who, need) { return o }
+    let body = serde_json::from_slice::<Value>(&r.body).ok().filter(Value::is_object).unwrap_or(json!({}));
+    let mut st = adv_state();
+    let mut p = adv_load(ctx);
+    let now = now_ms();
+    match op {
+        "dismiss" => {
+            let h = body.get("snooze_h").and_then(Value::as_f64).unwrap_or(24.0).clamp(0.0, 720.0);
+            p.dismissed.insert(id.into(), now + (h * 3_600_000.0) as i64);
+            adv_save(ctx, &p);
+            audit(ctx, "advice.dismissed", actor, &format!("{id} for {h} h"));
+        }
+        "undo" => {
+            let Some(rec) = p.applied.iter_mut().find(|a| a.id == id && !a.undone) else { return fail(404, "not_found", "nothing applied for this suggestion, or it was already undone") };
+            let Some(inv) = rec.action.inverse() else { return bad("nothing to undo") };
+            if let Err(o) = adv_run(ctx, &inv, actor) { return o }
+            rec.undone = true;
+            audit(ctx, "advice.undone", actor, &format!("{id} option {}: {}", rec.option, serde_json::to_string(&inv).unwrap_or_default()));
+            p.dismissed.insert(id.into(), now + 3_600_000);
+            adv_save(ctx, &p);
+        }
+        _ => {
+            adv_refresh_in(ctx, &mut st); // re-check against fresh data
+            let Some(s) = st.raw.iter().find(|s| s.id == id).cloned() else { return fail(409, "conflict", "this suggestion no longer applies") };
+            let want = body.get("option").and_then(Value::as_str);
+            let Some(opt) = s.options.iter().find(|o| want.map_or(o.recommended, |w| o.id == w)).cloned() else { return bad("no such option") };
+            if op == "preview" {
+                let pv = opt.action.as_ref().map(|a| adv::preview(a, |k| crate::tune::knob(k).map(|_| crate::tune::get(k))));
+                return json_out(200, json!({"id": id, "option": opt, "preview": pv, "changes_nothing": true}));
+            }
+            if p.snoozed(id, now) && p.applied.iter().any(|a| a.id == id && !a.undone && now - a.ts_ms < adv::FOLLOW_S * 1000) {
+                return fail(409, "conflict", "already applied; undo it first or wait for the follow-up window");
+            }
+            let m = adv::metrics(&adv_gather(ctx));
+            let rec = match adv_do(ctx, &mut p, &s, &opt, actor, false, &m) { Ok(r) => r, Err(o) => return o };
+            adv_save(ctx, &p);
+            adv_refresh_in(ctx, &mut st);
+            return json_out(200, json!({"applied": rec, "suggestions": st.list}));
+        }
+    }
+    adv_refresh_in(ctx, &mut st);
+    json_out(200, json!({"suggestions": st.list}))
 }
 
 #[cfg(test)]

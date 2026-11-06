@@ -4,7 +4,7 @@
 import { api, ApiError } from './api/client';
 import { runningJobs } from './jobs';
 import { failoverStep, noFailover, primaryAddr, type Failover } from './ha';
-import { Alert, Changed, Cluster, LogBatch, WHAT, type What, EventRow, HaStatus, JobRow, NodeRow, type HaSettings, type LabPower, type LabRow, type PowerSettings } from './api/schema';
+import { AdviceEvent, type Suggestion, Alert, Changed, Cluster, LogBatch, WHAT, type What, EventRow, HaStatus, JobRow, NodeRow, type HaSettings, type LabPower, type LabRow, type PowerSettings } from './api/schema';
 
 export const live = $state({
 	cluster: null as Cluster | null,
@@ -36,6 +36,8 @@ export const live = $state({
 	powerCfg: null as PowerSettings | null,
 	/** every alert seen: read at start, then `alert` events (merged by id). Active ones have `active` set. */
 	alerts: [] as Alert[],
+	/** advisor: open suggestions (GET /advice, then `advice` events); null until the first read */
+	advice: null as Suggestion[] | null,
 	/** SSE `changed`: a counter per list that goes up after each write of it; panels refetch when theirs moves */
 	rev: Object.fromEntries(WHAT.map((w) => [w, 0])) as Record<What, number>,
 	/** SSE `log`: newest log lines first, bounded; the Logs view merges them over its fetched page */
@@ -152,6 +154,7 @@ async function probe() {
 	}
 	void loadHa();
 	api.alerts().then((r) => r.alerts.forEach(putAlert)).catch(() => {});
+	api.advice().then((r) => (live.advice = r.suggestions)).catch(() => {});
 }
 
 function connect() {
@@ -186,6 +189,7 @@ function connect() {
 		live.logRev++;
 	});
 	listen('alert', (v) => Alert.safeParse(v), putAlert);
+	listen('advice', (v) => AdviceEvent.safeParse(v), (e) => (live.advice = e.suggestions));
 	listen('event', (v) => EventRow.safeParse(v), (ev) => {
 		live.events = [ev, ...live.events.filter((x) => x.id !== ev.id)].slice(0, 100);
 		if (ev.kind.startsWith('power.') && live.powerCfg) void loadPowerCfg();
