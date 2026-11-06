@@ -403,6 +403,57 @@ fn group_rss(pgid: u32) -> u64 {
     }).sum::<u64>() * 1024
 }
 
+/// (pid, resident bytes) of every process of this user whose environment carries `CK_RUN_ID=<tag>`: the program, its
+/// children, and also ones that left the process group (setsid) or double-forked and reparented to init.
+/// Linux: /proc/<pid>/environ; elsewhere `ps -E` (appends the environment to the command).
+/// ponytail: a program that clears its own environment escapes (and a daemon that execs with env -i); no cgroup yet.
+fn tagged(tag: &str) -> Vec<(u32, u64)> {
+    let needle = format!("CK_RUN_ID={tag}");
+    let mut v = Vec::new();
+    if let Ok(rd) = fs::read_dir("/proc") {
+        for e in rd.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|x| x.parse::<u32>().ok()) else { continue };
+            let Ok(env) = fs::read(e.path().join("environ")) else { continue }; // other users: not readable
+            if !env.split(|&b| b == 0).any(|kv| kv == needle.as_bytes()) { continue }
+            let rss = fs::read_to_string(e.path().join("stat")).ok().and_then(|st| {
+                st.rsplit_once(')')?.1.split_whitespace().nth(21)?.parse::<u64>().ok()
+            }).unwrap_or(0);
+            v.push((pid, rss * 4096));
+        }
+        return v;
+    }
+    let Ok(o) = Command::new("ps").args(["-axEww", "-o", "pid=,rss=,command="]).output() else { return v };
+    for l in String::from_utf8_lossy(&o.stdout).lines() {
+        if !l.split_whitespace().any(|w| w == needle) { continue }
+        let mut w = l.split_whitespace();
+        if let (Some(p), Some(r)) = (w.next().and_then(|x| x.parse::<u32>().ok()), w.next().and_then(|x| x.parse::<u64>().ok())) {
+            v.push((p, r * 1024));
+        }
+    }
+    v
+}
+
+/// SIGKILL every tagged process, rescanning (a few rounds) so a program forking while it dies is caught.
+fn kill_tagged(tag: &str) {
+    #[cfg(unix)]
+    for _ in 0..5 {
+        let v = tagged(tag);
+        if v.is_empty() { return }
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        for (pid, _) in v {
+            // SAFETY: plain libc call on a pid we just saw carrying our unique tag.
+            unsafe { kill(pid as i32, 9) };
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    #[cfg(not(unix))]
+    let _ = tag;
+}
+
+static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// What the watchdog enforces while a program runs (0 / None = off).
 #[derive(Default, Clone, Copy)]
 struct Limits<'a> {
@@ -464,13 +515,17 @@ fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, chunk_a: u64, s
 /// chunk cancelled), the whole group is killed (a program printing 1 GB never sits in RAM; a hung one frees the PC).
 /// Children the program left behind are killed when it exits. Returns (exit code, stdout, last 64 KiB of stderr, over-cap);
 /// a stopped run returns code None.
-/// ponytail: a child that leaves the group (setsid) is not reached; unix only (Windows: no process groups, only the shell is killed on over-cap).
+/// Every program carries env CK_RUN_ID=<unique>; processes that left the group (setsid, double fork) are found by that tag
+/// (scanned at most every 1 s while it runs, and at stop / exit) and killed / counted in the memory cap.
+/// ponytail: a program that clears its own environment still escapes; unix only (Windows: no process groups, only the shell is killed on over-cap).
 fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn() -> bool, lim: Limits) -> std::io::Result<(Option<i32>, Vec<u8>, Vec<u8>, bool, Option<String>)> {
     use std::io::Read;
     use std::sync::mpsc::{channel, RecvTimeoutError};
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(c, 0);
     c.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let tag = format!("{:x}-{:x}-{:x}", std::process::id(), RUN_SEQ.fetch_add(1, Relaxed), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    c.env("CK_RUN_ID", &tag);
     let mut ch = c.spawn()?;
     let pid = ch.id();
     let killgrp = move || {
@@ -518,7 +573,7 @@ fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn()
     // that exited while a child it left behind still holds the pipe (killing the group closes it).
     // The same tick is the memory / CK_OUT watchdog: sampled every 300 / 500 ms, and only once the program has run 250 ms,
     // so a short piece never pays for it.
-    let (born, mut mem_at, mut out_at) = (Instant::now(), Instant::now(), Instant::now());
+    let (born, mut mem_at, mut out_at, mut tag_at, mut exited) = (Instant::now(), Instant::now(), Instant::now(), Instant::now(), false);
     let (mut stopped, mut why) = (false, None::<String>);
     let (out, over) = loop {
         match out_rx.recv_timeout(Duration::from_millis(20)) {
@@ -526,6 +581,7 @@ fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn()
             Err(RecvTimeoutError::Timeout) if !stopped && stop() => {
                 stopped = true;
                 killgrp();
+                kill_tagged(&tag);
                 let _ = ch.kill(); // off unix there is no group: at least the program itself
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -533,6 +589,12 @@ fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn()
                     if lim.mem_bytes > 0 && mem_at.elapsed() >= Duration::from_millis(300) {
                         mem_at = Instant::now();
                         if group_rss(pid) > lim.mem_bytes {
+                            why = Some(format!("memory over the {} MB limit (job_mem_pct), program stopped", lim.mem_bytes >> 20));
+                        }
+                    }
+                    if why.is_none() && lim.mem_bytes > 0 && tag_at.elapsed() >= Duration::from_secs(1) {
+                        tag_at = Instant::now();
+                        if tagged(&tag).iter().map(|x| x.1).sum::<u64>() > lim.mem_bytes {
                             why = Some(format!("memory over the {} MB limit (job_mem_pct), program stopped", lim.mem_bytes >> 20));
                         }
                     }
@@ -545,16 +607,22 @@ fn run_capped(c: &mut Command, stdin: Option<&[u8]>, cap: usize, stop: &dyn Fn()
                     if why.is_some() {
                         stopped = true;
                         killgrp();
+                        kill_tagged(&tag);
                         let _ = ch.kill();
                     }
                 }
-                if ch.try_wait()?.is_some() { killgrp(); }
+                if ch.try_wait()?.is_some() {
+                    killgrp();
+                    // a leftover that left the group may still hold stdout: kill it at once, then rescan at most every 1 s
+                    if !exited || tag_at.elapsed() >= Duration::from_secs(1) { exited = true; tag_at = Instant::now(); kill_tagged(&tag); }
+                }
             }
             Err(_) => break (Vec::new(), false),
         }
     };
     let status = ch.wait()?;
     killgrp(); // background children of a finished chunk
+    kill_tagged(&tag); // and the ones that left the group
     if over {
         return Ok((None, Vec::new(), Vec::new(), true, None));
     }
@@ -631,6 +699,48 @@ mod tests {
         c.args(["-c", "sleep 0.6; echo ok"]);
         let (code, out, _, _, why) = run_capped(&mut c, None, 1 << 20, &|| false, Limits { mem_bytes: 1 << 30, out: Some((&d.0, 1 << 40)) }).unwrap();
         assert_eq!((code, out, why), (Some(0), b"ok\n".to_vec(), None));
+    }
+
+    /// Runs `sh -c "python3 -c $PY & <tail>"`: the python forks, setsid's, forks again (the grandchild reparents to init)
+    /// and allocates `mb` MB; returns the run result and the pids still carrying the test marker.
+    #[cfg(unix)]
+    fn run_daemon(marker: &str, mb: u32, tail: &str, stop: &dyn Fn() -> bool, mem: u64) -> (Option<i32>, Option<String>, Instant) {
+        let py = format!("import os,time\nif os.fork()==0:\n os.setsid()\n if os.fork()==0:\n  b=bytearray({mb}*1024*1024); b[::4096]=b'x'*len(b[::4096]); time.sleep(300)\n os._exit(0)\ntime.sleep(300)\n");
+        let mut c = Command::new("sh");
+        c.env("CK_TEST_MARK", marker).env("PY", py).args(["-c", &format!("python3 -c \"$PY\" & {tail}")]);
+        let t = Instant::now();
+        let (code, _, _, _, why) = run_capped(&mut c, None, 1 << 20, stop, Limits { mem_bytes: mem, out: None }).unwrap();
+        (code, why, t)
+    }
+
+    #[cfg(unix)]
+    fn left(marker: &str) -> Vec<String> {
+        let o = Command::new("ps").args(["-axEww", "-o", "pid=,command="]).output().unwrap();
+        let m = format!("CK_TEST_MARK={marker}");
+        String::from_utf8_lossy(&o.stdout).lines().filter(|l| l.split_whitespace().any(|w| w == m) && l.contains("python")).map(String::from).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setsid_daemons_die_on_cancel_exit_and_memory_cap() {
+        let marker = format!("m{}", std::process::id());
+        // exit: the program ends, the setsid grandchild must be gone
+        let (code, _, t) = run_daemon(&marker, 0, "sleep 1.2; echo hi", &|| false, 0);
+        assert_eq!(code, Some(0));
+        assert!(t.elapsed().as_secs() < 8);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(left(&marker).is_empty(), "after exit: {:?}", left(&marker));
+        // cancel
+        let t0 = Instant::now();
+        let (code, _, _) = run_daemon(&marker, 0, "sleep 100", &|| t0.elapsed() > Duration::from_millis(1500), 0);
+        assert!(code.is_none());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(left(&marker).is_empty(), "after cancel: {:?}", left(&marker));
+        // memory: only the setsid grandchild holds 300 MB; the cap is 100 MB
+        let (code, why, t) = run_daemon(&marker, 300, "sleep 100", &|| false, 100 << 20);
+        assert!(code.is_none() && why.as_deref().is_some_and(|w| w.contains("memory over the 100 MB")) && t.elapsed().as_secs() < 15, "{why:?} {:?}", t.elapsed());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(left(&marker).is_empty(), "after memory kill: {:?}", left(&marker));
     }
 
     #[test]

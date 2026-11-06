@@ -93,7 +93,7 @@ The console Advisor page (and `ck admin advice`) lists what the head thinks you 
 
 ## 5d. Limits that stop a program, and the staged-chunk timeout
 
-- **Memory.** `job_mem_pct` (80): a command program and all its processes are stopped when together they use more than 80 % of the PC's RAM. The chunk fails with a message naming `job_mem_pct` (it is a plain failure, not an exit-75 retry request). Lower it on PCs that people use, 0 turns it off. A program that leaves its process group escapes the check.
+- **Memory.** `job_mem_pct` (80): a command program and all its processes are stopped when together they use more than 80 % of the PC's RAM. The chunk fails with a message naming `job_mem_pct` (it is a plain failure, not an exit-75 retry request). Lower it on PCs that people use, 0 turns it off. Processes that leave the group (`setsid`, daemons) are found by the `CK_RUN_ID` env tag and counted too; only a program that clears its own environment escapes.
 - **Output.** `out_max_mb` (64) caps stdout per chunk and `out_files_mb` (256) caps the `$CK_OUT` files per chunk; both are enforced while the program runs, which then stops. The advisor offers `out_max_mb` x2 when a job fails on it.
 - **Blobs that do not arrive.** `stage_timeout_s` (120): if a chunk is reserved for a PC (or a lab head) and its files have not arrived after this long plus 1 s per 2 MB missing, the head sends them itself; after the same time again it gives the chunk to another PC and avoids the slow one for that job. If a file is gone from the head the job fails and says which.
 

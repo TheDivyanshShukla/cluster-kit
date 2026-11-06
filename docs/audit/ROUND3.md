@@ -60,7 +60,7 @@ nested `CK_OUT` files.
 - A 0-byte `head.db` with no WAL looks like a fresh install.
 - `CK_DATA` deleted under a running head: results since then are lost at restart; the head warns every minute (`store.missing`).
 - A blob cache file corrupted while the agent runs is only caught at the agent's next start.
-- A program that leaves its process group (`setsid`) escapes cancel and the memory cap.
+- Closed: every program carries env `CK_RUN_ID=<unique>`; processes that left the group (`setsid`, double fork) are found by that tag (Linux /proc/*/environ, macOS `ps -E`, same user, scanned at most every 1 s while a program runs) and killed on cancel, timeout, over-cap and exit, and counted in the memory cap. Remaining limit: a program that clears its own environment (`env -i`) escapes.
 - One thread per connection: with 2,000 idle connections open, the background job's worst time was 10.8 s (baseline 4.0 s).
 - A standby-only partition (agents still reach the primary) causes a full failover (~5 s pause, no data loss).
 - On a full disk the `store_write` alert itself cannot be stored; only the `store.backoff` / `store.recovered` log lines appear.
