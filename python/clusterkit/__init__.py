@@ -395,13 +395,28 @@ def _profile(fn: Callable[..., Any], mode: str, items: list[Any], limit: float =
     first = time.perf_counter() - t0
     scale = 1 if sys.platform == "darwin" else 1024
     rss = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss0) * scale
-    t0, done = time.perf_counter(), 0
-    if first <= 2.0:
-        for x in items[1:k]:
-            _runner.apply(mode, fn, x)
-            done += 1
-            if time.perf_counter() - t0 > 2.0 - first:
-                break
+    t0, rest = time.perf_counter(), {"done": 0}
+
+    def more_items() -> None:  # untraced timing of a few more items, also in a thread: any one of them may hang
+        try:
+            for x in items[1:k]:
+                _runner.apply(mode, fn, x)
+                rest["done"] += 1
+                if time.perf_counter() - t0 > 2.0 - first:
+                    break
+        except BaseException as e:  # noqa: BLE001 - re-raised in the caller
+            rest["err"] = e
+
+    if first <= 2.0 and n > 1:
+        th = threading.Thread(target=more_items, daemon=True)
+        th.start()
+        th.join(min(limit, 2.0 - first + 1.0))
+        if th.is_alive():  # an item far slower than item 0: plan with what it has taken so far
+            log.warning("a sample item is still running locally after %.1f s; planning the items as slow", time.perf_counter() - t0)
+            return max(first, time.perf_counter() - t0), max(peak, rss) / 1048576
+        if "err" in rest:
+            raise rest["err"]
+    done = rest["done"]
     per = (time.perf_counter() - t0) / done if done else first
     return per, max(peak, rss) / 1048576
 

@@ -524,10 +524,53 @@ pub fn quotas_changed(ctx: &Ctx) {
     ctx.sh.1.notify_all();
 }
 
+// Round 4: a result whose store write fails is requeued (t2), so a full disk made PCs recompute forever. After STORE_FAIL_N
+// failures in a row dispatch pauses for 2 s, doubling to 60 s (all jobs: the disk is shared), an alert opens, and the first
+// write that works again resumes it. ponytail: one global counter; per-job pausing would need a per-job disk, there is none.
+const STORE_FAIL_N: u32 = 3;
+static STORE_FAILS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static STORE_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+static STORE_ALERT: Mutex<Option<u64>> = Mutex::new(None);
+
+fn store_paused() -> bool {
+    let u = STORE_PAUSE_MS.load(Relaxed);
+    u != 0 && (now_ms() as u64) < u
+}
+
+fn store_write_failed(ctx: &Ctx, why: &str) {
+    let n = STORE_FAILS.fetch_add(1, Relaxed) + 1;
+    if n < STORE_FAIL_N {
+        return;
+    }
+    let secs = (2u64 << (n - STORE_FAIL_N).min(5)).min(60);
+    STORE_PAUSE_MS.store(now_ms() as u64 + secs * 1000, Relaxed);
+    let d = format!("{n} result writes in a row failed ({why}): dispatch pauses, retrying with longer waits until a write works");
+    if n == STORE_FAIL_N {
+        crate::warnl!("store.backoff", "{d}");
+        event(ctx, "store.backoff", "head", &d);
+    }
+    // the alert lives in the same database, so on a full disk it may need a retry on each failure until one write fits
+    let mut al = STORE_ALERT.lock().unwrap();
+    if al.is_none() {
+        *al = ctx.store.alert_open("store_write", "bad", None, &d, now_ms()).ok().map(|a| a.id);
+    }
+}
+
+fn store_write_ok(ctx: &Ctx) {
+    if STORE_FAILS.swap(0, Relaxed) >= STORE_FAIL_N {
+        STORE_PAUSE_MS.store(0, Relaxed);
+        crate::say!("store.recovered", "result writes work again: dispatch resumes");
+        event(ctx, "store.recovered", "head", "result writes work again, dispatch resumes");
+        if let Some(id) = STORE_ALERT.lock().unwrap().take() {
+            let _ = ctx.store.alert_close(id, now_ms());
+        }
+    }
+}
+
 /// Next chunk for `wid`: sched::pick_job chooses the job, sched::chunk_len the length, then the range comes from the job's list.
 /// ponytail: views are rebuilt per chunk, O(workers); cache them if a fleet of thousands shows it.
 fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
-    if st.halted || st.gated {
+    if st.halted || st.gated || store_paused() {
         return None;
     }
     if let Some((sj, a, b)) = st.workers.get(&wid)?.staged {
@@ -638,7 +681,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
 /// drops the other holders' copies and the later duplicate result) and sends them CANCEL_RANGE (job, a, b), which stops
 /// that one chunk only; the job-wide CANCEL is sticky for the job id and is never used for this.
 fn speculate_take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
-    if st.halted || st.gated {
+    if st.halted || st.gated || store_paused() {
         return None;
     }
     let w = st.workers.get(&wid)?;
@@ -1142,6 +1185,27 @@ fn higher_epoch(text: &str, name: &str, own: &str, mine: u64) -> Option<u64> {
     (n.trim() == name && addr != own && e > mine).then_some(e)
 }
 
+static CLUSTER: OnceLock<String> = OnceLock::new();
+
+/// Round 4: CTRL for an agent: this head's epoch with a signed proof. The agent repeats the newest proof in its HELLO to any
+/// head, so a stale head learns it was replaced without UDP beacons (watch_epoch).
+fn proof_ctrl(ctx: &Ctx) -> Option<serde_json::Value> {
+    let (ip, k, name, e) = (local_ip()?, crate::repl::fence_key(&ctx.store)?, CLUSTER.get()?, crate::repl::epoch(ctx));
+    Some(serde_json::json!({"epoch": e, "proof": crate::repl::fence_msg(&k, name, &format!("{ip}:{}", port()), e)}))
+}
+
+/// A HELLO carries a proof of a higher epoch than ours (checked with the cluster's fence key): fence this head, same path as a beacon.
+fn fence_by_proof(ctx: &Ctx, proof: &str) {
+    let Some((_, addr, e)) = crate::repl::fence_key(&ctx.store).and_then(|k| crate::repl::fence_check(&k, proof)) else { return };
+    if e <= crate::repl::epoch(ctx) {
+        return;
+    }
+    halt(ctx);
+    crate::say!("ha.fence", "! FENCED: an agent proved the head at {addr} has epoch {e} (mine is {}). Dispatching stopped, agents closed; restarting as its standby", crate::repl::epoch(ctx));
+    thread::sleep(Duration::from_millis(300));
+    rejoin_as_standby(&addr);
+}
+
 /// Listen for beacons; a higher epoch than ours fences this head: stop, close agents, restart as its standby.
 fn watch_epoch(ctx: Arc<Ctx>, name: String) {
     let s = match UdpSocket::bind(("0.0.0.0", disc_port())) {
@@ -1217,13 +1281,118 @@ fn rejoin_as_standby(addr: &str) -> ! {
 }
 
 fn deny(s: &mut TcpStream, ctx: &Ctx, h: &Hello, addr: &str, why: &str) -> io::Result<()> {
+    if why.starts_with(THROTTLED) {
+        return send(s, DENIED, why.as_bytes()); // already logged once when the block started
+    }
     event(ctx, "node.denied", "head", &format!("{} at {addr} (node {}): {why}", h.host, h.node_id));
     crate::say!("admission.denied", "! denied {addr} node {}: {why}", h.node_id);
     send(s, DENIED, why.as_bytes())
 }
 
+// Round 4: guessing join codes or keys over TCP. Failed attempts are counted per (source IP, claimed node id): 5 in a minute block that
+// pair for 10 s, doubling per repeat up to 15 min. Join-code attempts (a PC with no key) are also counted per IP (30/min, 30 s doubling)
+// and globally (200/min, 30 s doubling), because an attacker can claim a new node id on every try. A PC that already has a key is
+// only ever held back by its own pair, so a real PC is never locked out by someone else's guesses, even from the same IP (one Mac).
+// The global tier is the guard against a botnet of IPs: it caps guessing at 200 codes a minute fleet-wide, and during an attack
+// a new PC may have to wait a few seconds for its first join. ponytail: in-memory only (a head restart forgets blocks).
+const THROTTLED: &str = "too many failed attempts";
+
+#[derive(Default)]
+struct Bucket {
+    start: Option<Instant>,
+    fails: u32,
+    strikes: u32,
+    until: Option<Instant>,
+}
+
+impl Bucket {
+    fn wait(&self, now: Instant) -> Option<u64> {
+        self.until.filter(|u| *u > now).map(|u| (u - now).as_secs() + 1)
+    }
+    /// One failure; true when this one starts a block.
+    fn fail(&mut self, now: Instant, limit: u32, base_s: u64) -> bool {
+        if self.until.is_some_and(|u| now > u + Duration::from_secs(3600)) {
+            self.strikes = 0;
+        }
+        if self.start.is_none_or(|s| now.duration_since(s) > Duration::from_secs(60)) {
+            (self.start, self.fails) = (Some(now), 0);
+        }
+        self.fails += 1;
+        if self.fails < limit {
+            return false;
+        }
+        self.strikes += 1;
+        self.until = Some(now + Duration::from_secs((base_s << (self.strikes - 1).min(10)).min(900)));
+        (self.start, self.fails) = (None, 0);
+        true
+    }
+}
+
+#[derive(Default)]
+struct Throttle {
+    keys: HashMap<(String, String), Bucket>,
+    ips: HashMap<String, Bucket>,
+    global: Bucket,
+}
+
+static THROTTLE: OnceLock<Mutex<Throttle>> = OnceLock::new();
+
+fn throttle() -> std::sync::MutexGuard<'static, Throttle> {
+    THROTTLE.get_or_init(Default::default).lock().unwrap()
+}
+
+impl Throttle {
+    /// Seconds to wait if this attempt must be refused now.
+    fn check(&self, ip: &str, node: &str, join: bool, now: Instant) -> Option<u64> {
+        let k = self.keys.get(&(ip.to_string(), node.to_string())).and_then(|b| b.wait(now));
+        let rest = if join { self.ips.get(ip).and_then(|b| b.wait(now)).max(self.global.wait(now)) } else { None };
+        k.max(rest)
+    }
+    /// Count a failed attempt; Some(text) when it started a block (the caller logs it once).
+    fn failed(&mut self, ip: &str, node: &str, join: bool, now: Instant) -> Option<String> {
+        if self.keys.len() > 10_000 {
+            self.keys.retain(|_, b| b.until.is_some_and(|u| u > now)); // ponytail: forgets slow guessers when 10k pairs are tracked
+            self.ips.retain(|_, b| b.until.is_some_and(|u| u > now));
+        }
+        let mut what = vec![];
+        if self.keys.entry((ip.into(), node.into())).or_default().fail(now, 5, 10) {
+            what.push(format!("5 failed attempts in a minute as node {node}"));
+        }
+        if join {
+            if self.ips.entry(ip.into()).or_default().fail(now, 30, 30) {
+                what.push("30 failed join codes in a minute from this address".to_string());
+            }
+            if self.global.fail(now, 200, 30) {
+                what.push("200 failed join codes in a minute in the fleet: join codes refused fleet-wide".to_string());
+            }
+        }
+        (!what.is_empty()).then(|| what.join("; "))
+    }
+}
+
 /// Secured fleet: returns the node key when the PC is admitted (after CHALLENGE/PROOF or a join code), else the reason.
 fn admit(s: &mut TcpStream, ctx: &Ctx, h: &Hello, addr: &str) -> io::Result<Result<Vec<u8>, String>> {
+    let join = ctx.store.node_key(&h.node_id).is_none();
+    if let Some(w) = throttle().check(addr, &h.node_id, join, Instant::now()) {
+        return Ok(Err(format!("{THROTTLED}, try again in {w}s")));
+    }
+    let r = admit_inner(s, ctx, h, addr)?;
+    match &r {
+        Ok(_) => {
+            throttle().keys.remove(&(addr.to_string(), h.node_id.clone()));
+        }
+        Err(why) if why != "join code required" => {
+            let blocked = throttle().failed(addr, &h.node_id, join, Instant::now());
+            if let Some(b) = blocked {
+                event(ctx, "node.denied", "head", &format!("{addr} (node {}): {b}: refused for a while", h.node_id));
+            }
+        }
+        Err(_) => {}
+    }
+    Ok(r)
+}
+
+fn admit_inner(s: &mut TcpStream, ctx: &Ctx, h: &Hello, addr: &str) -> io::Result<Result<Vec<u8>, String>> {
     match plan(ctx.store.node_key(&h.node_id), h.join_code.as_deref()) {
         Plan::Deny(r) => Ok(Err(r.into())),
         Plan::Challenge(key) => {
@@ -1361,12 +1530,14 @@ fn finish_inner(ctx: &Ctx, wid: u64, p: &[u8]) -> io::Result<(Sends, bool)> {
         Err(e) => {
             // t2: a failed write (disk full, read-only, I/O error) is NOT a stored result: no ACK, no progress, run the chunk again.
             crate::warnl!("job.error", "job {job}: result {a}..{b} not stored ({e}); queued again");
+            store_write_failed(ctx, &e.to_string());
             acct_waste(&mut st, job, wid, secs, None);
             requeue_missing(&mut st, job, vec![(a, b)]);
             sh.1.notify_all();
             return Ok((vec![], credit));
         }
     };
+    store_write_ok(ctx);
     if !stored {
         acct_waste(&mut st, job, wid, secs, None);
         return Ok((ack_now(&st), credit)); // already stored (re-run, speculative copy, or an agent resending after a failover, HA-04): ACK at once
@@ -1464,6 +1635,9 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
             Err(why) => return deny(&mut s, &ctx, h, &addr, &why),
         }
     }
+    if let Some(p) = hello.as_ref().and_then(|h| h.seen_proof.as_deref()) {
+        fence_by_proof(&ctx, p);
+    }
     let node = hello.as_ref().map(|h| (h.node_id.clone(), h.host.clone()));
     if let Some(h) = &hello {
         let _ = ctx.store.upsert_node(&h.node_id, &h.host, &addr, &serde_json::to_string(&h.inv).unwrap_or_default(), now_ms());
@@ -1492,6 +1666,9 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     let w = Arc::new(Mutex::new(Out { s: w, mac: out_mac }));
     sh.0.lock().unwrap().workers.get_mut(&wid).unwrap().out = Some(w.clone());
     ctrl_to(&w, tune_msg());
+    if let Some(m) = proof_ctrl(&ctx) {
+        ctrl_to(&w, m);
+    }
     refresh_soon(&ctx); // attributes and thread cap: coalesced, so a join storm is not O(W^2)
     let (credit, credits) = mpsc::channel();
     let ctx2 = ctx.clone();
@@ -1575,7 +1752,7 @@ fn note_files(f: &serde_json::Value) {
     let (Some(j), Some(a), Some(b)) = (f["job"].as_u64(), f["a"].as_u64(), f["b"].as_u64()) else { return };
     let v: Vec<(String, String, u64)> = f["files"].as_array().into_iter().flatten().filter_map(|x| {
         let (n, s) = (x["name"].as_str()?, x["sha"].as_str()?);
-        (crate::blobs::valid_sha(s) && !n.is_empty() && n.len() <= 200 && !n.starts_with('.') && !n.contains(['/', '\\'])).then(|| (n.to_string(), s.to_string(), x["size"].as_u64().unwrap_or(0)))
+        (crate::blobs::valid_sha(s) && !n.is_empty() && n.len() <= 200 && !n.starts_with('/') && !n.contains('\\') && n.split('/').all(|c| !c.is_empty() && !c.starts_with('.'))).then(|| (n.to_string(), s.to_string(), x["size"].as_u64().unwrap_or(0)))
     }).take(1000).collect();
     let mut g = FILES.lock().unwrap();
     if g.len() >= 10_000 {
@@ -1985,6 +2162,7 @@ pub fn run(o: &Opts) {
         unsafe { listen(l.as_raw_fd(), 4096) };
     }
     let name = o.name.clone();
+    let _ = CLUSTER.set(name.clone());
     let (cb, cw, n2) = (ctx.clone(), ctx.clone(), o.name.clone());
     thread::spawn(move || beacon(&cb, &name));
     thread::spawn(move || watch_epoch(cw, n2));
@@ -2613,6 +2791,24 @@ mod power_tests {
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    #[test]
+    fn join_guessing_is_throttled() {
+        let (mut t, now) = (Throttle::default(), Instant::now());
+        for i in 0..4 {
+            assert!(t.failed("1.1.1.1", "n", true, now).is_none(), "{i}");
+        }
+        assert!(t.failed("1.1.1.1", "n", true, now).is_some(), "5th failure blocks the pair");
+        assert!(t.check("1.1.1.1", "n", true, now).is_some());
+        assert!(t.check("1.1.1.1", "n", true, now + Duration::from_secs(11)).is_none(), "10 s later it is free");
+        assert!(t.check("1.1.1.1", "other", false, now).is_none(), "a PC with a key and another id is not held back");
+        assert!(t.check("2.2.2.2", "n", true, now).is_none(), "another address is not held back");
+        for i in 0..30 {
+            t.failed("3.3.3.3", &format!("n{i}"), true, now); // a new node id every try
+        }
+        assert!(t.check("3.3.3.3", "fresh", true, now).is_some(), "per-address tier stops id hopping");
+        assert!(t.check("3.3.3.3", "fresh", false, now).is_none(), "but a PC with its key still gets in");
+    }
 
     #[test]
     fn range_math_and_order() {

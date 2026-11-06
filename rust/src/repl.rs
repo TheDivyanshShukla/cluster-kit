@@ -798,7 +798,7 @@ fn session(store: &mut Store, path: &Path, mut s: TcpStream, sb: &mut Sb) -> io:
     s.set_nodelay(true)?;
     s.set_read_timeout(Some(proto::lost_after() + crate::tune::secs("standby_step_s").mul_f64(sb.priority as f64)))?;
     let node = crate::identity::node_id();
-    let hello = Hello { node_id: node.clone(), host: crate::identity::host(), virtual_node: false, inv: crate::identity::inventory(), join_code: std::env::var("CK_JOIN_CODE").ok() };
+    let hello = Hello { node_id: node.clone(), host: crate::identity::host(), virtual_node: false, inv: crate::identity::inventory(), join_code: std::env::var("CK_JOIN_CODE").ok(), seen_proof: None };
     let mut applied = num(store.meta("last_seq"));
     send(&mut s, proto::HELLO_S, &hello_s_payload(&hello, applied, num(store.meta("epoch"))))?;
     let mut r = io::BufReader::new(s.try_clone()?);
@@ -953,6 +953,8 @@ pub fn run_standby(o: &crate::Opts) {
         Store::open(&path)
     }).unwrap_or_else(|e| crate::die(&format!("database: {e}")));
     sb_fence(&store);
+    crate::store::STANDBY.store(true, SeqCst);
+    crate::store::maintenance_thread(); // round 4: retention on the standby too
     let epoch = Arc::new(AtomicU64::new(num(store.meta("epoch"))));
     let head = Arc::new(Mutex::new(first));
     let (cur, switch): (Arc<Mutex<Option<TcpStream>>>, Arc<Mutex<Option<String>>>) = Default::default();
@@ -973,6 +975,7 @@ pub fn run_standby(o: &crate::Opts) {
         let synced = store.meta("synced").as_deref() == Some("1");
         let refused = sb.refused_since.is_some_and(|t| refused_promote(sb.priority, t.elapsed().as_secs_f64()));
         if synced && (sb.handover || refused || should_promote(sb.priority, sb.last_heard.elapsed().as_secs_f64())) {
+            crate::store::STANDBY.store(false, SeqCst); // head::run loads the tunables itself from now on
             let e = num(store.meta("epoch")).max(epoch.load(SeqCst)) + 1;
             let _ = store.set_meta("epoch", &e.to_string());
             let _ = store.set_meta("candidate", "1");

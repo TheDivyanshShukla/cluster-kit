@@ -133,6 +133,10 @@ pub struct Hello {
     /// Only on a PC's first join (or after its key was lost): the code an operator created.
     #[serde(default)]
     pub join_code: Option<String>,
+    /// Round 4: the newest signed head proof ("ck/f ... e=<epoch> m=<mac>", repl::fence_msg) this agent got from any head.
+    /// A head with a lower epoch that verifies it fences itself (no UDP beacons needed). Old heads ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_proof: Option<String>,
 }
 
 pub fn hello_payload(threads: u32, h: &Hello) -> Vec<u8> {
@@ -284,7 +288,7 @@ mod tests {
 
     #[test]
     fn hello_round_trip_and_v1() {
-        let h = Hello { node_id: "abc/v3".into(), host: "lab-a-07".into(), virtual_node: true, inv: Inventory { cores_logical: 12, ..Default::default() }, join_code: None };
+        let h = Hello { node_id: "abc/v3".into(), host: "lab-a-07".into(), virtual_node: true, inv: Inventory { cores_logical: 12, ..Default::default() }, join_code: None, seen_proof: None };
         assert_eq!(parse_hello(&hello_payload(12, &h)), (12, PROTO_VERSION, Some(h)));
         assert_eq!(parse_hello(&8u32.to_le_bytes()), (8, 1, None), "v1 worker");
         let mut buf = vec![];

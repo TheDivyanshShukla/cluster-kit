@@ -387,13 +387,25 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
     });
     let mut first = true;
     let unacked = Arc::new(Mutex::new(Unacked::new(0, 0))); // survives reconnects, even to another head
+    // Round 4: CK_HEADS="ip:port,ip:port" lists more heads to try in turn when no beacons can be heard (one Mac, routed VLANs).
+    let heads: Vec<String> = {
+        let mut v: Vec<String> = head.iter().cloned().collect();
+        for h in std::env::var("CK_HEADS").unwrap_or_default().split(',').map(str::trim).filter(|h| !h.is_empty()) {
+            if !v.iter().any(|x| x == h) {
+                v.push(h.to_string());
+            }
+        }
+        if v.len() > 1 { v } else { vec![] }
+    };
+    let mut hi = 0usize;
     let mut fails = 0u32; // consecutive short or failed sessions: see reconnect_delay (0..1 s, then 0.25 s doubling to 4 s)
     loop {
         let began = Instant::now();
         // after a restart try the head we knew before waiting for a beacon
         let remembered = if first { std::fs::read_to_string(last_head_path()).ok().and_then(|t| parse_last_head(&t)) } else { None };
         first = false;
-        let (ip, epoch) = match (&head, remembered) {
+        let cur = if heads.is_empty() { head.clone() } else { Some(heads[hi % heads.len()].clone()) };
+        let (ip, epoch) = match (&cur, remembered) {
             (Some(h), _) => (h.clone(), 0),
             (None, Some(r)) => r,
             (None, None) => discover(name),
@@ -420,6 +432,7 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
             }
             Err(e) => crate::warnl!("agent.unreachable", "cannot reach head {ip}: {e}"),
         }
+        hi += 1; // next head in CK_HEADS (a good session ends only when the head is gone or fenced)
         fails = if began.elapsed() > Duration::from_secs(20) { 0 } else { (fails + 1).min(5) };
         thread::sleep(reconnect_delay(fails));
     }
@@ -555,6 +568,34 @@ fn upload_outputs(job: u64, a: u64, b: u64, d: &crate::kernels::OutDir) -> Resul
     Ok(Some(serde_json::json!({"files": {"job": job, "a": a, "b": b, "files": v}}).to_string().into_bytes()))
 }
 
+/// Round 4: newest signed head proof (epoch, text) any head sent us; sent back in HELLO so a stale head can fence itself.
+static HEAD_PROOF: Mutex<(u64, String)> = Mutex::new((0, String::new()));
+
+fn proof_path() -> std::path::PathBuf {
+    last_head_path().with_file_name("last_proof")
+}
+
+fn seen_proof() -> Option<String> {
+    let mut g = HEAD_PROOF.lock().unwrap();
+    if g.0 == 0 {
+        // after a restart: the file ("<epoch> <proof>")
+        if let Some((e, p)) = std::fs::read_to_string(proof_path()).ok().and_then(|t| t.split_once(' ').map(|(e, p)| (e.parse().unwrap_or(0), p.trim().to_string()))) {
+            *g = (e, p);
+        }
+    }
+    (g.0 > 0).then(|| g.1.clone())
+}
+
+/// CTRL {"epoch": E, "proof": text} from a head: keep the highest.
+fn note_proof(v: &serde_json::Value) {
+    let (Some(e), Some(p)) = (v["epoch"].as_u64(), v["proof"].as_str()) else { return };
+    let mut g = HEAD_PROOF.lock().unwrap();
+    if e > g.0 && p.len() < 400 {
+        *g = (e, p.to_string());
+        let _ = std::fs::write(proof_path(), format!("{e} {p}"));
+    }
+}
+
 fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<Unacked>>, follow: Option<(String, String, u64)>) -> io::Result<()> {
     // HA-01: a head silent for LOST_AFTER (frozen, cable pulled) errors the reader out.
     // ponytail: with --spin the socket is non-blocking and there is no timeout.
@@ -573,7 +614,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
     let secure = !fleet_open();
     let kp = crate::identity::key_path(&node_id);
     let join_code = if secure && !kp.exists() { join_code() } else { None };
-    let hello = Hello { node_id: node_id.clone(), host: crate::identity::host(), virtual_node: virt.is_some(), inv: crate::identity::inventory(), join_code };
+    let hello = Hello { node_id: node_id.clone(), host: crate::identity::host(), virtual_node: virt.is_some(), inv: crate::identity::inventory(), join_code, seen_proof: seen_proof() };
     send(&mut s, HELLO_W, &hello_payload(threads, &hello))?;
     let (mac_w, mut mac_r) = if secure { let (w, r) = admit(&mut s, &node_id, &kp)?; (Some(w), Some(r)) } else { (None, None) };
     let sock = s.try_clone()?;
@@ -671,6 +712,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
                     identify(secs);
                 }
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&p) {
+                    note_proof(&v);
                     crate::blobs::agent_ctrl(&v, &w_r); // virtual agents too (shared cache; fetch() serialises per sha)
                 }
                 if let Some(c) = parse_cap(&p) {

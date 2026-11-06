@@ -94,8 +94,23 @@ pub fn scheduled_backup(path: &Path, dir: &Path, every_h: u64, keep: usize, now_
     Ok(Some(dest))
 }
 
+/// Round 4: a standby prunes its own copy too (repl::run_standby sets STANDBY and starts the thread; it clears STANDBY on promotion).
+/// Safe for replication: events are not in the change log and parts are pruned only for jobs finished long ago, so replay never
+/// touches what was deleted; a SNAPSHOT replaces the file anyway. The standby has no head.rs to load the tunables, so it reads meta "tune".
+pub static STANDBY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn standby_tune(path: &Path) {
+    let t = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+        .and_then(|c| c.query_row("SELECT value FROM meta WHERE key='tune'", [], |r| r.get::<_, String>(0)).optional().ok().flatten());
+    crate::tune::load(t.as_deref());
+}
+
 /// Background thread of a running head: retention every 10 minutes, backups when `backup_every_h` > 0.
 pub fn maintenance_thread() {
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return; // a standby started it already and kept it when it promoted
+    }
     std::thread::spawn(|| {
         let path = default_path();
         let mut last_prune = std::time::Instant::now() - std::time::Duration::from_secs(3600);
@@ -105,6 +120,10 @@ pub fn maintenance_thread() {
                 crate::warnl!("store.missing", "{} was deleted while the head runs: new results are going to an unlinked file and are lost at restart; restore a backup and restart", path.display());
             }
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+            let sb = STANDBY.load(std::sync::atomic::Ordering::SeqCst);
+            if sb {
+                standby_tune(&path);
+            }
             if last_prune.elapsed().as_secs() >= 600 {
                 last_prune = std::time::Instant::now();
                 match prune(&path, crate::tune::n("events_keep_days"), crate::tune::n("parts_keep_days"), now) {
@@ -114,7 +133,7 @@ pub fn maintenance_thread() {
                 }
             }
             let h = crate::tune::n("backup_every_h");
-            if h > 0 {
+            if h > 0 && !sb {
                 let dir = path.parent().map(|d| d.join("backups")).unwrap_or_else(|| PathBuf::from("backups"));
                 match scheduled_backup(&path, &dir, h, crate::tune::n("backup_keep") as usize, (now / 1000) as u64) {
                     Ok(Some(f)) => crate::say!("store.backup", "backup written: {}", f.display()),

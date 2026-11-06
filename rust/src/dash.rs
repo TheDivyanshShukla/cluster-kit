@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn stats_reports_hello() {
         let sh: Shared = Default::default();
-        let hello = Hello { node_id: "n1/v2".into(), host: "lab-07".into(), virtual_node: true, inv: Inventory { cores_logical: 8, ..Default::default() }, join_code: None };
+        let hello = Hello { node_id: "n1/v2".into(), host: "lab-07".into(), virtual_node: true, inv: Inventory { cores_logical: 8, ..Default::default() }, join_code: None, seen_proof: None };
         sh.0.lock().unwrap().workers.insert(1, Worker { addr: "10.0.0.7".into(), version: 2, hello: Some(hello), ..Default::default() });
         sh.0.lock().unwrap().workers.insert(2, Worker { addr: "10.0.0.8".into(), version: 1, ..Default::default() }); // v1: no hello
         let v: serde_json::Value = serde_json::from_str(&stats(&sh, false)).unwrap();

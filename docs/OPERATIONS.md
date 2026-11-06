@@ -45,6 +45,20 @@ A student using a PC (keyboard or mouse in the last 5 minutes) makes it "in use"
 
 Test the failover on one machine any time with `scripts/chaos.sh`. It prints PASS or FAIL for 5 scenarios, including killing the head while a standby is running.
 
+## 3b. Round 4 safeguards (what you will see)
+
+- **Old head comes back without UDP beacons** (VLANs, one-PC tests): every head sends its epoch with a signed proof to agents; an agent
+  repeats the newest proof in its HELLO. A head with a lower epoch that verifies it fences itself ("! FENCED: an agent proved ...") and
+  restarts as a standby, within seconds of the first agent that knows the new head reconnecting. A brand-new PC that never met the new
+  head cannot warn the old one. When beacons cannot be heard, give agents all heads: `CK_HEADS=ip:port,ip:port` (tried in turn).
+- **Disk full**: after 3 failed result writes in a row, dispatch pauses (2 s, doubling to 60 s) so PCs do not recompute forever; log
+  `store.backoff`, and `store.recovered` when a write works again. The alert row needs a writable database, so on a truly full disk
+  rely on the log line (alert `store_write` is opened if any write fits).
+- **Join-code guessing**: 5 failed attempts in a minute from one source address for one node id refuse that pair for 10 s, doubling up to
+  15 min; 30 failed codes from one address, or 200 fleet-wide, refuse join codes for 30 s, doubling. PCs that already hold a key are only
+  held back by their own failures. One `node.denied` event is logged when a block starts. Blocks are forgotten at head restart.
+- **Standbys prune** events/parts with the same `events_keep_days` / `parts_keep_days` as the head (first run about 30 s after start).
+
 ## 4. The full-capacity day (proof of work)
 
 `python3 scripts/soak.py --head http://<head>:7702,http://<standby1>:7702,http://<standby2>:7702 --hours 24 --out soak-<date>`
