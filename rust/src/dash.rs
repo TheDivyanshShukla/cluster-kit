@@ -29,7 +29,7 @@ pub fn worker_json(id: u64, w: &Worker) -> serde_json::Value {
     });
     if crate::head::lab_of(w).is_some() {
         // a lab head stands for its PCs: the SDK plans over them, not over one big worker
-        v["lab_pcs"] = serde_json::json!(w.lab_stat["pcs"].as_array().into_iter().flatten().take(5000).map(|p| serde_json::json!({"node_id": p["id"], "threads": p["threads"]})).collect::<Vec<_>>());
+        v["lab_pcs"] = serde_json::json!(w.lab_stat["pcs"].as_array().into_iter().flatten().take(5000).map(|p| serde_json::json!({"node_id": p["id"], "threads": p["threads"], "busy": p["busy"], "cpu": p["cpu"]})).collect::<Vec<_>>());
     }
     v
 }

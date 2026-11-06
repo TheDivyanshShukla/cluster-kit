@@ -15,7 +15,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock, Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -674,24 +674,56 @@ pub fn put_for(job: u64) -> Put {
     JOB_BLOBS.lock().unwrap().iter().find(|x| x.0 == job).and_then(|x| x.2.clone())
 }
 
-/// Shas in the cache (complete files only).
-pub fn cached() -> Vec<String> {
-    // t2: the head trusts this list, so a file whose bytes no longer hash to its name (bit rot, torn write, wrong length) must
-    // not be in it. Hashed once per process per (name, length); a bad one is deleted so the head fetches it again.
-    // ponytail: later rot in a file already verified by this process is not seen until restart.
-    static OK: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-    let ok = OK.get_or_init(Default::default);
+type Stamp = (u64, std::time::SystemTime);
+/// name -> (length, mtime) at the moment this process last hashed the file and found it good.
+fn verified() -> &'static Mutex<HashMap<String, Stamp>> {
+    static OK: OnceLock<Mutex<HashMap<String, Stamp>>> = OnceLock::new();
+    OK.get_or_init(Default::default)
+}
+static RESYNC: AtomicBool = AtomicBool::new(false);
+/// True once after a cached blob was found corrupt and deleted: the agent then tells the head what it really has.
+pub fn take_resync() -> bool {
+    RESYNC.swap(false, Relaxed)
+}
+
+/// Does the cached file `dir/n` still hash to its name? Hashed again only when its length or mtime differs from the last good hash
+/// (a write, a truncation or a replaced file changes them; env_for re-records its own touch). A bad one is deleted so the head fetches it again.
+/// ponytail: rot that changes bytes without changing size or mtime is not seen until restart.
+fn verify(dir: &Path, n: &str, len: u64, mtime: std::time::SystemTime) -> bool {
+    if verified().lock().unwrap().get(n) == Some(&(len, mtime)) { return true; }
+    let good = File::open(dir.join(n)).and_then(|mut f| hash_stream(&mut f, None, 4 << 20, u64::MAX)).is_ok_and(|h| h.0 == n);
+    if good { verified().lock().unwrap().insert(n.to_string(), (len, mtime)); } else {
+        crate::warnl!("blob.corrupt", "cached blob {} does not match its hash; deleted, will be fetched again", &n[..12]);
+        verified().lock().unwrap().remove(n);
+        let _ = fs::remove_file(dir.join(n));
+        let _ = fs::remove_file(dir.join(format!("{n}.idx")));
+        RESYNC.store(true, Relaxed);
+    }
+    good
+}
+
+/// Before a job uses its blobs: re-check each one whose length or mtime changed since it was last hashed (a stat, no read, otherwise).
+/// Err names the first bad blob (now deleted); the chunk is retried once the head has fetched it again.
+pub fn check_job(job: u64) -> Result<(), String> {
+    let Some(l) = JOB_BLOBS.lock().unwrap().iter().find(|x| x.0 == job).map(|x| x.1.clone()) else { return Ok(()) };
     let dir = cache_dir();
-    scan(&dir).into_iter().filter(|(n, len, _)| {
-        if ok.lock().unwrap().get(n) == Some(len) { return true; }
-        let good = File::open(dir.join(n)).and_then(|mut f| hash_stream(&mut f, None, 4 << 20, u64::MAX)).is_ok_and(|h| h.0 == *n);
-        if good { ok.lock().unwrap().insert(n.clone(), *len); } else {
-            crate::warnl!("blob.corrupt", "cached blob {} does not match its hash; deleted, will be fetched again", &n[..12]);
-            let _ = fs::remove_file(dir.join(n));
-            let _ = fs::remove_file(dir.join(format!("{n}.idx")));
+    for sha in l.iter().filter(|s| valid_sha(s)) {
+        let m = fs::metadata(dir.join(sha)).ok().filter(|m| m.is_file());
+        if !m.is_some_and(|m| m.modified().is_ok_and(|t| verify(&dir, sha, m.len(), t))) {
+            // gone (the sweep above may have deleted it a moment ago) or bad: the head must learn this PC no longer has it
+            RESYNC.store(true, Relaxed);
+            thread::sleep(crate::tune::secs("heartbeat_s") * 3 / 2); // the heartbeat thread reports it; the retry must reach the head after that
+            return Err(format!("blob {} is missing or was corrupt on this PC; the head will send it again", &sha[..12]));
         }
-        good
-    }).map(|x| x.0).collect()
+    }
+    Ok(())
+}
+
+/// Shas in the cache (complete files only). The head trusts this list, so a file whose bytes no longer hash to its name
+/// (bit rot, torn write, wrong length) must not be in it.
+pub fn cached() -> Vec<String> {
+    let dir = cache_dir();
+    scan(&dir).into_iter().filter(|(n, len, t)| verify(&dir, n, *len, *t)).map(|x| x.0).collect()
 }
 
 pub fn report_have(w: &Mutex<Out>, extra: Value) {
@@ -806,6 +838,11 @@ pub fn env_for(job: u64) -> Vec<(String, String)> {
     for (i, sha) in l.iter().enumerate() {
         let p = dir.join(sha);
         touch(&p);
+        if let Some(t) = fs::metadata(&p).ok().and_then(|m| m.modified().ok().map(|t| (m.len(), t))) {
+            // touch() changed the mtime: keep a verified blob verified under its new stamp
+            let mut ok = verified().lock().unwrap();
+            if ok.contains_key(sha) { ok.insert(sha.clone(), t); }
+        }
         e.push((format!("CK_BLOB_{i}"), p.display().to_string()));
     }
     e
@@ -1764,5 +1801,30 @@ mod tests {
         assert!(r.ends_with(&sha) && !r.contains('\t'));
         assert_eq!(resolve_item(b"@blob:nothex"), b"@blob:nothex", "not a sha: left alone");
         assert!(env_for(987_654).is_empty());
+    }
+
+    #[test]
+    fn rot_while_running_is_caught_on_use() {
+        let d = std::env::temp_dir().join(format!("ck-verify-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let data = vec![7u8; 100_000];
+        let sha = hex(&Sha256::digest(&data));
+        let p = d.join(&sha);
+        fs::write(&p, &data).unwrap();
+        let stamp = |p: &Path| { let m = fs::metadata(p).unwrap(); (m.len(), m.modified().unwrap()) };
+        let (l, t) = stamp(&p);
+        assert!(verify(&d, &sha, l, t), "good file");
+        // same length, bytes flipped, mtime moved on: caught
+        let mut bad = data.clone();
+        bad[500] ^= 1;
+        fs::write(&p, &bad).unwrap();
+        let f = OpenOptions::new().append(true).open(&p).unwrap();
+        f.set_modified(t + Duration::from_secs(5)).unwrap();
+        let (l2, t2) = stamp(&p);
+        assert!(!verify(&d, &sha, l2, t2), "flipped byte");
+        assert!(!p.exists(), "bad blob deleted");
+        assert!(take_resync() && !take_resync());
+        let _ = fs::remove_dir_all(&d);
     }
 }

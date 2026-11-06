@@ -14,6 +14,9 @@ pub struct Store {
     conn: Mutex<rusqlite::Connection>,
 }
 
+/// When this process began (forced first thing in main): log files last written before it are from an earlier run.
+pub static PROC_START: std::sync::LazyLock<std::time::SystemTime> = std::sync::LazyLock::new(std::time::SystemTime::now);
+
 /// `CK_DATA` dir (default `./ck-data`) + `head.db`.
 pub fn default_path() -> PathBuf {
     PathBuf::from(std::env::var("CK_DATA").unwrap_or_else(|_| "ck-data".into())).join("head.db")
@@ -319,13 +322,33 @@ impl Store {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Create the directory if needed, open, set WAL + synchronous=NORMAL + foreign keys, run migrations.
+    /// An empty `head.db` (0 bytes, or no tables) next to signs of a past life (backups, a node key, a WAL or old logs) is a
+/// wiped or truncated database, not a fresh install: starting would silently begin with no jobs, nodes or keys.
+/// `CK_IGNORE_CORRUPT=1` starts anyway.
+    fn refuse_empty_with_history(path: &Path) -> Result<(), String> {
+    if !path.exists() || std::env::var("CK_IGNORE_CORRUPT").is_ok() { return Ok(()); }
+    let tables = || Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).and_then(|c| c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))).unwrap_or(1);
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > 0) && tables() > 0 { return Ok(()); }
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let files = |d: &Path| std::fs::read_dir(d).map(|r| r.flatten().filter(|f| f.path().is_file()).map(|f| f.path()).collect::<Vec<_>>()).unwrap_or_default();
+    let backups = files(&dir.join("backups"));
+    let old_logs = files(&dir.join("logs")).iter().any(|p| std::fs::metadata(p).ok().and_then(|m| m.created().or(m.modified()).ok()).is_some_and(|t| t < *PROC_START)); // created before this process: this run's own logs are newer
+    let wal = ["db-wal", "db-shm"].iter().any(|x| std::fs::metadata(path.with_extension(x)).is_ok_and(|m| m.len() > 0));
+    let why = [(!backups.is_empty(), "backups"), (dir.join("node.key").exists(), "a node key"), (wal, "a WAL"), (old_logs, "old logs")].iter().filter(|x| x.0).map(|x| x.1).collect::<Vec<_>>();
+    if why.is_empty() { return Ok(()); }
+    let newest = backups.iter().max_by_key(|p| mtime(p)).map_or(String::new(), |p| format!(" Newest backup: {}.", p.display()));
+    Err(format!("{}: the database is empty but this directory shows an earlier life ({}); not starting as a fresh install.{newest} Restore it (docs/OPERATIONS.md section 6), or set CK_IGNORE_CORRUPT=1 to start empty", path.display(), why.join(", ")))
+}
+
+/// Create the directory if needed, open, set WAL + synchronous=NORMAL + foreign keys, run migrations.
     pub fn open(path: &Path) -> Result<Store, String> {
         if let Some(d) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(d).map_err(|x| format!("create {}: {x}", d.display()))?;
         }
         let had_data = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
         let had_wal = std::fs::metadata(path.with_extension("db-wal")).is_ok_and(|m| m.len() > 0);
+        Self::refuse_empty_with_history(path)?;
         let s = setup(Connection::open(path).map_err(e)?)?;
         // A damaged file or WAL opens on whatever SQLite can recover; say so loudly instead of starting silently.
         let check: String = s.db().query_row("PRAGMA quick_check", [], |r| r.get(0)).unwrap_or_else(|x| x.to_string());
@@ -1872,5 +1895,22 @@ mod wave12_tests {
         assert_eq!(v as usize, MIGRATIONS.len());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_db_with_history_is_refused() {
+        let d = std::env::temp_dir().join(format!("ck-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("backups")).unwrap();
+        let p = d.join("head.db");
+        std::fs::write(&p, b"").unwrap();
+        assert!(super::Store::open(&p).is_ok(), "empty file, no history: fresh install");
+        std::fs::remove_file(&p).unwrap();
+        std::fs::write(&p, b"").unwrap();
+        std::fs::write(d.join("backups").join("head-1.db"), b"x").unwrap();
+        let err = super::Store::open(&p).err().expect("refused");
+        assert!(err.contains("head-1.db") && err.contains("backups"), "{err}");
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 0, "left untouched");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

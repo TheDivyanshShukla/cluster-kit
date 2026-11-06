@@ -331,11 +331,17 @@ fn start_standby(head: &str, w: &Mutex<Out>) {
 /// After a session on it ends, the agent uses its normal way (beacon, --head, CK_HEADS: the root) for 30 s; the root sends
 /// move_to again once the lab head is back. Virtual agents of one process share it.
 static PREFER: Mutex<Option<(String, Option<Instant>)>> = Mutex::new(None);
+/// The lab's standby lab head (CTRL `alt` in move_to, or `alt_to`): where to go first when the lab head in PREFER ends, instead of the root.
+static ALT: Mutex<Option<String>> = Mutex::new(None);
 
 /// CTRL {"move_to": "ip:port" | null} and {"start_lab_head": {...}} (docs/HIERARCHY.md). `cur` is the address of this session.
 fn hier_ctrl(p: &[u8], cur: &str, on_prefer: bool, sock: &TcpStream, w: &Mutex<Out>) {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(p) else { return };
+    if let Some(a) = v.get("alt_to") {
+        *ALT.lock().unwrap() = a.as_str().map(hostport);
+    }
     if let Some(m) = v.get("move_to") {
+        *ALT.lock().unwrap() = v["alt"].as_str().map(hostport);
         match m.as_str() {
             Some(addr) => {
                 let addr = hostport(addr);
@@ -501,7 +507,11 @@ fn worker_as(head: Option<String>, name: &str, threads: usize, use_gpu: bool, vi
             // the lab head is gone (or refused): use the normal way for 30 s, and reconnect at once
             let mut g = PREFER.lock().unwrap();
             if g.as_ref().is_some_and(|g| &g.0 == p) {
-                *g = Some((p.clone(), Some(Instant::now() + Duration::from_secs(30))));
+                // the lab's standby lab head first (it takes over the lab); only then the normal way
+                *g = match ALT.lock().unwrap().take().filter(|a| a != p) {
+                    Some(a) => Some((a, None)),
+                    None => Some((p.clone(), Some(Instant::now() + Duration::from_secs(30)))),
+                };
             }
             fails = 0;
             thread::sleep(Duration::from_millis(50));
@@ -741,6 +751,7 @@ fn work(mut s: TcpStream, threads: u32, virt: Option<usize>, unacked: Arc<Mutex<
         // ends when work() shuts the socket down and the send fails
         while {
             thread::sleep(heartbeat_every());
+            if crate::blobs::take_resync() { crate::blobs::report_have(&w2, serde_json::json!({})); }
             w2.lock().unwrap().put(HEARTBEAT, &[]).is_ok()
         } {}
     });

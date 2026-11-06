@@ -482,6 +482,12 @@ fn ctrl(ctx: &Arc<Ctx>, p: &[u8], up: &Arc<Mutex<Out>>) -> io::Result<()> {
             }
         }
     }
+    if let Some(a) = v.get("lab_alt") {
+        crate::head::alt_all(ctx, a.as_str()); // the lab's standby lab head: the PCs try it first when this one dies
+    }
+    if let (Some(n), Some(c)) = (v["relay"]["node"].as_str(), v["relay"].get("ctrl")) {
+        crate::head::relay_ctrl(ctx, n, c);
+    }
     if v["lab_adopt"].as_bool() == Some(true) {
         let mut g = lab();
         (g.released, g.drain) = (false, false);
@@ -665,7 +671,8 @@ pub fn status(ctx: &Ctx) -> serde_json::Value {
         let st = ctx.sh.0.lock().unwrap();
         let pcs: Vec<serde_json::Value> = st.workers.values().take(5000).map(|w| serde_json::json!({
             "id": w.hello.as_ref().map(|h| h.node_id.as_str()).unwrap_or(&w.addr), "host": w.hello.as_ref().map(|h| h.host.as_str()).unwrap_or(""),
-            "threads": w.threads, "busy": !w.inflight.is_empty(), "virtual": w.hello.as_ref().is_some_and(|h| h.virtual_node)})).collect();
+            "threads": w.threads, "busy": !w.inflight.is_empty(), "virtual": w.hello.as_ref().is_some_and(|h| h.virtual_node),
+            "cpu": (w.cpu * 10.0).round() / 10.0, "mem_used": w.mem_used, "mem_total": w.mem_total})).collect();
         (pcs, st.workers.values().map(|w| w.threads as u64).sum::<u64>(), st.workers.values().map(|w| w.calib).sum::<f64>(), st.workers.values().map(|w| w.inflight.len()).sum::<usize>())
     };
     let g = lab();

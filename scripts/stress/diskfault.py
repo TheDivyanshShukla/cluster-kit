@@ -247,6 +247,8 @@ def diskfull() -> None:
     errs = log_tail("head", "job.error") + log_tail("head", "rror")
     say("logs during:", [x[:160] for x in errs[-3:]], "alive", p.poll() is None)
     jb_full = http("GET", f"/api/v1/jobs/{jid}", token=tok, timeout=8)[1]["job"]
+    al = [a for a in http("GET", "/api/v1/alerts?active=1", token=tok, timeout=8)[1].get("alerts", []) if a["kind"] == "store_write"]
+    result("diskfull/alert_visible", "PASS" if al else "BUG", f"store_write alerts while full: {len(al)}")
     os.remove(ball)
     jb = wait_job(tok, jid, 240)
     con = sqlite3.connect(os.path.join(data, "head.db"))

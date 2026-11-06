@@ -85,7 +85,7 @@ Test the failover on one machine any time with `scripts/chaos.sh`. It prints PAS
 
 ## 5b. Lab heads (hundreds of PCs)
 
-One root head saturates at about 500 PCs on 0.1 s chunks and 1,000 on 0.5 s (simulated; [sim/HIERARCHY.md](sim/HIERARCHY.md)). Past that, start one lab head per lab: `ck head --parent ROOT_IP:7700 --lab A` on a PC of the lab, `ck agent --head LABHEAD_IP:PORT` for the lab's PCs, and `ck admin hier settings mode=manual`. Or `mode=auto` and the root picks the best PC of each lab with at least `lab_head_min_pcs` PCs and starts it. `ck admin hier` shows who serves whom; `ck admin hier drain LAB` and `unpin` take a lab head out; `mode=off` returns everything to the root in the middle of a job. A dead lab head costs about 2 s and the chunks in flight; a frozen root is ridden out for one to two leases (`lease_s`, 30 s). Full guide: [HIERARCHY.md](HIERARCHY.md).
+One root head saturates at about 500 PCs on 0.1 s chunks and 1,000 on 0.5 s (simulated; [sim/HIERARCHY.md](sim/HIERARCHY.md)). Past that, start one lab head per lab: `ck head --parent ROOT_IP:7700 --lab A` on a PC of the lab, `ck agent --head LABHEAD_IP:PORT` for the lab's PCs, and `ck admin hier settings mode=manual`. Or `mode=auto` and the root picks the best PC of each lab with at least `lab_head_min_pcs` PCs and starts it. `ck admin hier` shows who serves whom; `ck admin hier drain LAB` and `unpin` take a lab head out; `mode=off` returns everything to the root in the middle of a job. A dead lab head costs about 2 s and the chunks in flight (`ck admin hier settings lab_head_standby=true` keeps a standby lab head on a second PC per lab: the PCs move to it and the root does not take the lab back); a frozen root is ridden out for one to two leases (`lease_s`, 30 s). Full guide: [HIERARCHY.md](HIERARCHY.md).
 
 ## 5c. The advisor
 
@@ -99,7 +99,7 @@ The console Advisor page (and `ck admin advice`) lists what the head thinks you 
 
 ## 5e. Checking a new cluster with real workloads
 
-`scripts/stress/workloads.py` runs five real Python jobs (`examples/real/`: CNN training, SVM sweep, 5-million-row ETL, image pipeline, 1 GB text) locally and on a fleet and compares an exact digest; add `--fault agent9|agentstop|head9|cancel|multi` to hurt it on purpose. `scripts/stress/hier_bench.py` does the same for lab heads (`scale`, `labkill`, `rootstop`, `rootkill`, `switch`, `auto`). What was measured is in [audit/ROUND4.md](audit/ROUND4.md). On a real lab, run `workloads.py` against your head after an upgrade; a mismatch in a digest is a bug, a slower-than-local time is not (small jobs do not pay for the network).
+`scripts/stress/workloads.py` runs five real Python jobs (`examples/real/`: CNN training, SVM sweep, 5-million-row ETL, image pipeline, 1 GB text) locally and on a fleet and compares an exact digest; add `--fault agent9|agentstop|head9|cancel|multi` to hurt it on purpose. `scripts/stress/hier_bench.py` does the same for lab heads (`scale`, `labkill`, `rootstop`, `rootkill`, `switch`, `auto`, `standby`). What was measured is in [audit/ROUND4.md](audit/ROUND4.md). On a real lab, run `workloads.py` against your head after an upgrade; a mismatch in a digest is a bug, a slower-than-local time is not (small jobs do not pay for the network).
 
 ## 6. Backups and moving the head
 
@@ -107,10 +107,13 @@ The console Advisor page (and `ck admin advice`) lists what the head thinks you 
 - **Saving the setup:** `ck admin config-export > setup.json` saves labs, the map, labels, pools, caps and reserves, but not users or jobs. `ck admin config-import setup.json` restores it, and `CK_DRY_RUN=1` shows the changes first.
 - **Backup now:** `ck admin backup [PATH]` writes a consistent copy of `head.db` (SQLite `VACUUM INTO`, safe while the head runs; run it on the head PC with the same `CK_DATA`). With no PATH it writes `ck-data/backups/head-<unix-seconds>.db`.
 - **Scheduled backups:** set `backup_every_h` (default 0 = off) and `backup_keep` (default 7); the head writes `ck-data/backups/head-<unix-seconds>.db` on that schedule and deletes the oldest beyond `backup_keep`. Copy that folder off the PC (another disk or share) yourself; a backup next to the database does not survive a dead disk.
-- **A damaged database stops the head:** at start the head runs an integrity check. If it fails, the head refuses to start and says so; restore a backup (below). `CK_IGNORE_CORRUPT=1` starts it anyway on whatever is readable, for rescuing data only. A read-only `ck-data/` also stops it at start. A standby with a damaged copy moves it aside (`head.db.bad-<time>`) and takes a fresh copy from the head by itself.
+- **A damaged database stops the head:** at start the head runs an integrity check. If it fails, the head refuses to start and says so; restore a backup (below). `CK_IGNORE_CORRUPT=1` starts it anyway on whatever is readable, for rescuing data only. A `head.db` that is empty (0 bytes or no tables) while the folder shows an earlier life (a `backups/` folder with files, a `node.key`, a WAL, logs from an earlier run) also stops the head; the message names the newest backup. A truly fresh folder starts normally. A read-only `ck-data/` also stops it at start. A standby with a damaged copy moves it aside (`head.db.bad-<time>`) and takes a fresh copy from the head by itself.
 - **Restore:** stop the head, replace `ck-data/head.db` with the backup (delete `head.db-wal` and `head.db-shm` next to it), start the head. Standbys with a newer copy will resync from it; if one refuses, delete its `ck-data/head.db` so it takes a full copy.
 - **Retention:** a background thread on the head deletes events older than `events_keep_days` (default 30) and, if `parts_keep_days` > 0, result parts of jobs finished longer ago than that (the job row and its summary stay; default 0 = keep parts forever). Deletes run in batches of 2,000 rows every 10 minutes. Standbys are not pruned by the head; they keep their copy until pruned themselves when promoted.
 - **Moving the head on purpose:** on Settings, an admin clicks Make head on a standby, or runs `ck admin switchover <node-id>`. The head waits until that standby has every change, hands over, and becomes its standby. Work pauses for about 4 s, and nothing is lost.
+
+- **Cached blobs are re-checked while the agent runs:** before a program starts, each blob it names is compared with the length and modification time recorded when the agent last hashed it (a stat call, no read). If they changed, the blob is hashed again; a bad one is deleted, the chunk is retried, and the head sends the blob again. Corruption that changes bytes without changing length or time is still only found at the agent's next start.
+- **Full disk:** the `store_write` alert is also kept in memory, so `GET /api/v1/alerts` (and `ck admin alerts`) shows it (id 0, cannot be acknowledged) while the database cannot take writes.
 
 ## 7. Rolling upgrade
 
@@ -180,6 +183,8 @@ Every adjustable value (generated from `rust/src/tune.rs`). Set one with `ck adm
 | Alerts | `alert_standby_lag` | 5,000 | 1 | 100,000,000 | changes | head | standby_behind: replication lag above this for 30 s. |
 | Alerts | `alert_no_standby_s` | 60 | 5 | 86,400 | s | head | no_standby: fewer standbys than the target for this long. |
 | Network | `blob_store_gb` | 50 | 0.1 | 100,000 | GB | head | Blob store on the head; above this the least recently used blobs no job names are deleted. |
+| Network | `pending_conn_ip` | 100 | 1 | 100,000 | connections | head | Connections from one address that have not yet sent their hello (a PC, client or standby is never counted after that). Extra ones are closed at once. |
+| Network | `pending_conn_all` | 400 | 1 | 1,000,000 | connections | head | Same limit for all addresses together. |
 | Network | `blob_cache_gb` | 20 | 0.1 | 100,000 | GB | agent | Blob cache on each PC; above this the least recently used blobs are deleted. |
 | Network | `blob_peer_fanout` | 4 | 1 | 64 | PCs | both | How many PCs one PC serves a blob to at once (peer distribution). |
 | Network | `blob_piece_mb` | 4 | 0.25 | 256 | MB | both | Blob transfer piece size; each piece has its own sha256 so a broken transfer resumes. |
@@ -201,7 +206,7 @@ Every adjustable value (generated from `rust/src/tune.rs`). Set one with `ck adm
 | Hierarchy | `lease_s` | 30 | 1 | 3,600 | s | head | Length of one lease: seconds of a lab's work the root hands a lab head at once. Short leases lose less when a lab head dies; long ones ride out a root outage or partition. |
 | Hierarchy | `lab_head_min_pcs` | 8 | 2 | 100,000 | PCs | head | Auto mode: a lab gets a lab head when it has at least this many PCs connected. |
 | Hierarchy | `lab_silence_s` | 90 | 5 | 3,600 | s | head | A lab head that is silent (not gone) this long loses its leases to the root. Long enough to ride out a partition, short enough not to stall the end of a job. |
-| Hierarchy | `lab_head_standby` | 0 | 0 | 1 | 0/1 | head | Reserved: keep a standby for each lab head (not built yet; a lost lab head's PCs fall back to the root instead). |
+| Hierarchy | `lab_head_standby` | 0 | 0 | 1 | 0/1 | head | 1 = keep a standby lab head per lab on a second PC of the lab; if the lab head dies its PCs move to it and the root keeps leasing through it. 0 = they fall back to the root. |
 | Hierarchy | `lab_head_port` | 7,710 | 1,024 | 65,000 | port | head | First TCP port for lab heads the root starts; each lab takes the next 10 (the API is +2). |
 | Hierarchy | `lab_part_s` | 0.5 | 0.05 | 30 | s | head | A lab head sends finished pieces of a lease upward at this interval (batched, so one message covers many chunks). |
 | Network | `stage_timeout_s` | 120 | 10 | 86,400 | s | head | A chunk reserved for a PC (or lab head) while its blobs download is re-staged from the head after this long (plus 1 s per 2 MB of missing blobs), then given to another PC after the same time again. |

@@ -586,6 +586,7 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
             let mut a = ctx.store.alerts(r.query.get("active").is_some_and(|v| v == "1"), limit + 1);
             let truncated = a.len() > limit;
             a.truncate(limit);
+            if let Some(m) = head::MEM_ALERT.lock().unwrap().clone() { a.insert(0, m); } // disk full: the alert could not be stored
             json_out(200, json!({"alerts": a, "truncated": truncated}))
         }
         ("POST", ["alerts", id, "ack"]) => match id.parse().ok().and_then(|id| ctx.store.alert_ack(id, me)) {
@@ -637,6 +638,7 @@ pub struct Org {
     pools: HashMap<String, Vec<String>>,
     labs: HashMap<u64, String>,
     presence: HashMap<String, String>,
+    via: HashMap<String, (String, Value)>, // PC behind a lab head -> (lab, what the lab head reports about it)
 }
 
 impl Org {
@@ -652,7 +654,19 @@ impl Org {
             }
         }
         let presence = ctx.sh.0.lock().unwrap().workers.values().filter_map(|w| Some((w.hello.as_ref()?.node_id.clone(), if w.presence.is_empty() { "idle".into() } else { w.presence.clone() }))).collect();
-        Org { labels, pools, labs: ctx.store.labs().into_iter().map(|l| (l.id, l.name)).collect(), presence }
+        let mut via = HashMap::new();
+        for w in ctx.sh.0.lock().unwrap().workers.values() {
+            let Some(l) = crate::head::lab_of(w) else { continue };
+            for p in w.lab_stat["pcs"].as_array().into_iter().flatten().take(5000) {
+                if let Some(id) = p["id"].as_str() {
+                    via.insert(id.to_string(), (l.lab.clone(), p.clone()));
+                }
+            }
+            for id in &w.lab_pcs {
+                via.entry(id.clone()).or_insert_with(|| (l.lab.clone(), Value::Null));
+            }
+        }
+        Org { labels, pools, labs: ctx.store.labs().into_iter().map(|l| (l.id, l.name)).collect(), presence, via }
     }
     fn attrs(&self, n: &NodeRow, live: Option<(u32, f64)>) -> select::Attrs {
         let (l, p) = (self.labels.get(&n.node_id).map_or(&[][..], |v| v), self.pools.get(&n.node_id).map_or(&[][..], |v| v));
@@ -682,7 +696,13 @@ fn node_json(ctx: &Ctx, n: &NodeRow, online: bool, org: &Org) -> Value {
     v["inventory"] = serde_json::from_str(&n.inventory).unwrap_or(json!({}));
     v["online"] = json!(online);
     // the lab head this PC works under, if any (it never connected to this head directly)
-    v["via_lab"] = json!(ctx.sh.0.lock().unwrap().workers.values().find(|w| w.lab_pcs.contains(&n.node_id)).and_then(|w| crate::head::lab_of(w).map(|l| l.lab.clone())));
+    // `live` is what the lab head reports about it (threads, busy, virtual, cpu %, memory); null for a PC the root serves itself
+    let via = org.via.get(&n.node_id);
+    v["via_lab"] = json!(via.map(|x| &x.0));
+    v["live"] = via.map_or(Value::Null, |(_, p)| json!({
+        "threads": p["threads"], "busy": p["busy"], "virtual": p["virtual"], "host": p["host"], "cpu": p["cpu"],
+        "mem_pct": p["mem_total"].as_u64().filter(|t| *t > 0).map(|t| (p["mem_used"].as_u64().unwrap_or(0) as f64 / t as f64 * 1000.0).round() / 10.0),
+    }));
     v["presence"] = json!(org.presence.get(&n.node_id).map_or("idle", String::as_str));
     v["labels"] = json!(org.labels.get(&n.node_id).map(|l| l.iter().cloned().collect::<std::collections::BTreeMap<_, _>>()).unwrap_or_default());
     v["pools"] = json!(org.pools.get(&n.node_id).cloned().unwrap_or_default());

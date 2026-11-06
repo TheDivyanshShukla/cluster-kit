@@ -308,7 +308,7 @@ pub(crate) fn lab_ok(w: &Worker, j: &Job) -> bool {
     if lab_of(w).is_none() {
         return !w.shunned.get(&j.id).is_some_and(|t| t.elapsed() < crate::tune::secs("stage_timeout_s"));
     }
-    j.lease_ok && !w.drain && crate::hier::on() && !w.declined.contains(&j.id)
+    j.lease_ok && !w.drain && crate::hier::on() && !w.declined.contains(&j.id) && !crate::hier::is_standby(w)
 }
 
 /// Range handed to a lab head: `lease_s` seconds of its measured speed, at most half of what each live lab could still take.
@@ -631,17 +631,29 @@ fn store_write_failed(ctx: &Ctx, why: &str) {
         event(ctx, "store.backoff", "head", &d);
     }
     // the alert lives in the same database, so on a full disk it may need a retry on each failure until one write fits
+    // If it cannot be stored at all (full disk), keep it in memory so GET /alerts still shows it.
     let mut al = STORE_ALERT.lock().unwrap();
     if al.is_none() {
-        *al = ctx.store.alert_open("store_write", "bad", None, &d, now_ms()).ok().map(|a| a.id);
+        let mut mem = MEM_ALERT.lock().unwrap();
+        match ctx.store.alert_open("store_write", "bad", None, &d, now_ms()) {
+            Ok(a) => { *al = Some(a.id); *mem = None; }
+            Err(_) => {
+                let since = mem.as_ref().map_or(now_ms(), |a| a.since_ms);
+                *mem = Some(crate::store::AlertRow { id: 0, kind: "store_write".into(), severity: "bad".into(), node_id: None, detail: d, since_ms: since, last_ms: now_ms(), active: true, acked_by: None });
+            }
+        }
     }
 }
+
+/// The `store_write` alert while it could not be written to the database (id 0), for GET /alerts.
+pub static MEM_ALERT: Mutex<Option<crate::store::AlertRow>> = Mutex::new(None);
 
 fn store_write_ok(ctx: &Ctx) {
     if STORE_FAILS.swap(0, Relaxed) >= STORE_FAIL_N {
         STORE_PAUSE_MS.store(0, Relaxed);
         crate::say!("store.recovered", "result writes work again: dispatch resumes");
         event(ctx, "store.recovered", "head", "result writes work again, dispatch resumes");
+        *MEM_ALERT.lock().unwrap() = None;
         if let Some(id) = STORE_ALERT.lock().unwrap().take() {
             let _ = ctx.store.alert_close(id, now_ms());
         }
@@ -1819,6 +1831,7 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     // connection is gone: its leases go back at once.
     let silent = err.as_ref().is_some_and(|e| matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock));
     if let (Some(w), Some(n)) = (gw.as_ref().filter(|w| lab_of(w).is_some()), &node) {
+        crate::hier::lab_head_gone(lab_of(w).map_or("", |l| l.lab.as_str())); // a standby lab head takes over from here
         if silent && !gone.is_empty() && crate::hier::on() {
             st.orphans.insert(n.0.clone(), Orphan { since: Instant::now(), lab: lab_of(w).map(|l| l.lab.clone()).unwrap_or_default(), addr: addr.clone(), leases: std::mem::take(&mut gone) });
             event(&ctx, "labhead.partition", "head", &format!("lab head {} of lab {} is silent: its leases are kept for {} s", n.1, lab_of(w).map_or("", |l| l.lab.as_str()), crate::tune::get("lab_silence_s")));
@@ -2385,6 +2398,9 @@ pub fn run(o: &Opts) {
             thread::sleep(Duration::from_millis(100)); // EMFILE and friends: do not spin at 100% CPU
             continue;
         };
+        // One thread per connection: connections that never say hello (a flood, a port scan) are capped per address and overall,
+        // and the excess is closed at once. A PC or client holds a slot only until its hello arrives.
+        let Some(slot) = Pending::take(s.peer_addr().map(|a| a.ip()).ok()) else { continue };
         next_conn += 1;
         let (ctx, wid) = (ctx.clone(), next_conn);
         let _ = thread::Builder::new().stack_size(2 << 20).spawn(move || {
@@ -2393,6 +2409,7 @@ pub fn run(o: &Opts) {
             // nobody has vouched for this connection yet: a hello is small and must arrive soon. Without the limits a
             // silent TCP connect held a thread forever and a 256 MiB "hello" was allocated before it was read.
             let first = crate::proto::recv_by(&mut s, 1 << 20, Duration::from_secs(10));
+            drop(slot);
             let _ = s.set_read_timeout(None);
             let _ = match first { // hello is read unbuffered so nothing is left in a buffer
                 Ok((HELLO_W, p)) => serve_worker(s, ctx, &p, wid),
@@ -2401,6 +2418,35 @@ pub fn run(o: &Opts) {
                 _ => Ok(()),
             };
         });
+    }
+}
+
+/// A connection that has not sent its hello yet. `take` refuses (None) when too many from one address or in all are waiting.
+struct Pending(Option<IpAddr>);
+static PENDING: Mutex<(usize, Vec<(IpAddr, usize)>)> = Mutex::new((0, Vec::new()));
+impl Pending {
+    fn take(ip: Option<IpAddr>) -> Option<Pending> {
+        let ip = ip?;
+        let (per, all) = (crate::tune::n("pending_conn_ip") as usize, crate::tune::n("pending_conn_all") as usize);
+        let mut p = PENDING.lock().unwrap();
+        let i = p.1.iter().position(|x| x.0 == ip);
+        if p.0 >= all || i.is_some_and(|i| p.1[i].1 >= per) {
+            return None;
+        }
+        p.0 += 1;
+        match i { Some(i) => p.1[i].1 += 1, None => p.1.push((ip, 1)) }
+        Some(Pending(Some(ip)))
+    }
+}
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let Some(ip) = self.0 else { return };
+        let mut p = PENDING.lock().unwrap();
+        p.0 -= 1;
+        if let Some(i) = p.1.iter().position(|x| x.0 == ip) {
+            p.1[i].1 -= 1;
+            if p.1[i].1 == 0 { p.1.swap_remove(i); }
+        }
     }
 }
 
@@ -2566,6 +2612,22 @@ pub(crate) fn move_all(ctx: &Ctx, addr: Option<&str>) {
     let outs: Vec<_> = ctx.sh.0.lock().unwrap().workers.values().filter(|w| lab_of(w).is_none()).filter_map(|w| w.out.clone()).collect();
     for o in outs {
         ctrl_to(&o, serde_json::json!({ "move_to": addr }));
+    }
+}
+
+/// CTRL {"alt_to": addr} (null = none): where the PCs go first when this lab head dies (the lab's standby lab head).
+pub(crate) fn alt_all(ctx: &Ctx, addr: Option<&str>) {
+    let outs: Vec<_> = ctx.sh.0.lock().unwrap().workers.values().filter(|w| lab_of(w).is_none()).filter_map(|w| w.out.clone()).collect();
+    for o in outs {
+        ctrl_to(&o, serde_json::json!({ "alt_to": addr }));
+    }
+}
+
+/// Pass a root CTRL on to one of this head's PCs (the root cannot reach PCs behind a lab head).
+pub(crate) fn relay_ctrl(ctx: &Ctx, node: &str, v: &serde_json::Value) {
+    let out = ctx.sh.0.lock().unwrap().workers.values().find(|w| w.hello.as_ref().is_some_and(|h| h.node_id == node)).and_then(|w| w.out.clone());
+    if let Some(o) = out {
+        ctrl_to(&o, v.clone());
     }
 }
 

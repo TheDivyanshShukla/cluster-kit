@@ -98,6 +98,8 @@ pub const KNOBS: &[Knob] = &[
     k("alert_standby_lag", "Alerts", 5000.0, 1.0, 100_000_000.0, "changes", Head, "standby_behind: replication lag above this for 30 s."),
     k("alert_no_standby_s", "Alerts", 60.0, 5.0, 86_400.0, "s", Head, "no_standby: fewer standbys than the target for this long."),
     // network (src/blobs.rs, docs/BULK.md)
+    k("pending_conn_ip", "Network", 100.0, 1.0, 100_000.0, "connections", Head, "Connections from one address that have not yet sent their hello (a PC, client or standby is never counted after that). Extra ones are closed at once."),
+    k("pending_conn_all", "Network", 400.0, 1.0, 1_000_000.0, "connections", Head, "Same limit for all addresses together."),
     k("blob_store_gb", "Network", 50.0, 0.1, 100_000.0, "GB", Head, "Blob store on the head; above this the least recently used blobs no job names are deleted."),
     k("blob_cache_gb", "Network", 20.0, 0.1, 100_000.0, "GB", Agent, "Blob cache on each PC; above this the least recently used blobs are deleted."),
     k("blob_peer_fanout", "Network", 4.0, 1.0, 64.0, "PCs", Both, "How many PCs one PC serves a blob to at once (peer distribution)."),
@@ -122,7 +124,7 @@ pub const KNOBS: &[Knob] = &[
     k("lease_s", "Hierarchy", 30.0, 1.0, 3600.0, "s", Head, "Length of one lease: seconds of a lab's work the root hands a lab head at once. Short leases lose less when a lab head dies; long ones ride out a root outage or partition."),
     k("lab_head_min_pcs", "Hierarchy", 8.0, 2.0, 100_000.0, "PCs", Head, "Auto mode: a lab gets a lab head when it has at least this many PCs connected."),
     k("lab_silence_s", "Hierarchy", 90.0, 5.0, 3600.0, "s", Head, "A lab head that is silent (not gone) this long loses its leases to the root. Long enough to ride out a partition, short enough not to stall the end of a job."),
-    k("lab_head_standby", "Hierarchy", 0.0, 0.0, 1.0, "0/1", Head, "Reserved: keep a standby for each lab head (not built yet; a lost lab head's PCs fall back to the root instead)."),
+    k("lab_head_standby", "Hierarchy", 0.0, 0.0, 1.0, "0/1", Head, "1 = keep a standby lab head for each lab on a second PC of the lab; if the lab head dies the lab's PCs move to it and the root keeps serving leases through it. 0 = a lost lab head's PCs fall back to the root."),
     k("lab_head_port", "Hierarchy", 7710.0, 1024.0, 65_000.0, "port", Head, "First TCP port for lab heads the root starts; each lab takes the next 10 (the API is +2)."),
     k("lab_part_s", "Hierarchy", 0.5, 0.05, 30.0, "s", Head, "A lab head sends finished pieces of a lease upward at this interval (batched, so one message covers many chunks)."),
     k("stage_timeout_s", "Network", 120.0, 10.0, 86_400.0, "s", Head, "A chunk reserved for a PC (or lab head) while its blobs download is re-staged from the head after this long (plus 1 s per 2 MB of missing blobs), then given to another PC after the same time again."),

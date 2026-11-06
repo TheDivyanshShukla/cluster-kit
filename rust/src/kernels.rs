@@ -475,6 +475,7 @@ fn run_cmd(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, chunk_a: u64, out:
 /// `stdin` = Some(items): a list job piece. The command gets no START END arguments, only the env vars and the items.
 /// `chunk_a` = start of the whole chunk (a piece's `a` differs): a cancel of the job or of that chunk kills the program.
 fn run_cmd_in(cmd: &[u8], job: u64, pieces: u64, a: u64, b: u64, chunk_a: u64, stdin: Option<&[u8]>, out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
+    crate::blobs::check_job(job).map_err(|e| (true, e))?;
     let scratch = env::temp_dir().join(format!("ck-scratch-{}-{}", std::process::id(), SCRATCH_SEQ.fetch_add(1, Relaxed)));
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch).map_err(|e| (false, format!("scratch dir: {e}")))?;

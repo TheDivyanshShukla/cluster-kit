@@ -28,6 +28,8 @@ struct H {
     keys: HashMap<String, usize>,      // lab head node id -> node keys sent
     paused: Option<String>,
     mode_seen: u8,
+    standby: HashMap<String, (String, Instant)>, // lab -> (host node id of its chosen standby lab head, when chosen)
+    alt_sent: HashMap<String, (String, Instant)>, // lab -> last lab_alt sent to its lab head (key, when)
 }
 
 fn h() -> MutexGuard<'static, H> {
@@ -47,6 +49,22 @@ pub fn mode_name(m: u8) -> &'static str {
 /// Lab heads get leases now: the mode is not off and no job that lab heads cannot serve is waiting for PCs.
 pub fn on() -> bool {
     mode() > 0 && h().paused.is_none()
+}
+
+/// The PC behind a node id: a lab head's id is "<PC>/lab-<lab>", a virtual PC's is "<PC>/v<i>".
+fn base(n: &str) -> &str {
+    n.split('/').next().unwrap_or(n)
+}
+
+/// Is this lab head the standby of its lab? A standby gets no leases (head.rs `lab_ok`) and no PCs until the lab head is gone.
+pub(crate) fn is_standby(w: &Worker) -> bool {
+    lab_of(w).is_some_and(|l| h().standby.get(&l.lab).is_some_and(|s| s.0 == base(&nkey(w))))
+}
+
+/// A lab head of `lab` left the root. Forgetting the standby entry is the takeover: the standby lab head (if connected) is
+/// now the lab's head and gets its leases at once; if the standby itself left, the controller picks another.
+pub(crate) fn lab_head_gone(lab: &str) {
+    h().standby.remove(lab);
 }
 
 pub fn start(ctx: Arc<Ctx>) {
@@ -344,6 +362,8 @@ struct LabHead {
     out: Option<Arc<Mutex<Out>>>,
     drain: bool,
     inflight: usize,
+    standby: bool,
+    pcs: usize,
 }
 
 fn fnv(s: &str) -> u64 {
@@ -370,7 +390,7 @@ fn tick(ctx: &Arc<Ctx>) {
         let st = ctx.sh.0.lock().unwrap();
         let labs = st.workers.iter().filter_map(|(wid, w)| {
             let l = lab_of(w)?;
-            Some(LabHead { wid: *wid, node: node_of(w), lab: l.lab.clone(), addr: w.addr.clone(), port: l.port, out: w.out.clone(), drain: w.drain, inflight: w.inflight.len() })
+            Some(LabHead { wid: *wid, node: node_of(w), lab: l.lab.clone(), addr: w.addr.clone(), port: l.port, out: w.out.clone(), drain: w.drain, inflight: w.inflight.len(), standby: is_standby(w), pcs: w.lab_pcs.len() })
         });
         let direct = st.workers.values().filter(|w| lab_of(w).is_none() && w.hello.is_some()).map(|w| (node_of(w), w.addr.clone(), w.out.clone(), w.hello.as_ref().is_some_and(|h| h.virtual_node)));
         (labs.collect(), direct.collect())
@@ -453,7 +473,30 @@ fn tick(ctx: &Arc<Ctx>) {
     names.extend(labs.iter().map(|l| l.lab.clone()));
     let min_pcs = crate::tune::n("lab_head_min_pcs") as usize;
     for lab in names {
-        let head = labs.iter().find(|l| l.lab == lab && !h().released.contains(&l.node));
+        // the lab head is the one serving the most PCs (after a takeover that is the new one), not the standby on a tie, then the oldest connection
+        let head = labs.iter().filter(|l| l.lab == lab && !h().released.contains(&l.node)).max_by_key(|l| (l.pcs, !l.standby, std::cmp::Reverse(l.wid)));
+        if head.is_some_and(|hd| hd.standby) {
+            // the "standby" is serving the lab: it is the head now, a new standby is chosen next tick
+            h().standby.remove(&lab);
+            event(ctx, "hier.takeover", "head", &format!("lab {lab}: {} serves the lab's PCs and is its lab head", head.map_or("", |hd| hd.node.as_str())));
+            continue;
+        }
+        // a standby holds no leases: any it got while it served the lab go back to the root
+        for sb in labs.iter().filter(|l| l.lab == lab && l.standby && l.inflight > 0) {
+            recall(ctx, sb.wid);
+            event(ctx, "hier.recall", "head", &format!("lab {lab}: standby {} held {} lease(s), returned to the root", sb.node, sb.inflight));
+        }
+        // two lab heads for one lab (an old one came back after its standby took over): the other one leaves
+        for extra in labs.iter().filter(|l| l.lab == lab && !l.standby && head.is_some_and(|hd| hd.wid != l.wid) && !h().released.contains(&l.node)) {
+            let due = h().exiting.get(&extra.node).is_none_or(|t| t.elapsed() > Duration::from_secs(30)); // own statement: an `if let` would hold h() over the body
+            if let (Some(o), true) = (&extra.out, due) {
+                recall(ctx, extra.wid);
+                ctrl_to(o, json!({"lab_release": root}));
+                ctrl_to(o, json!({"lab_exit": true}));
+                h().exiting.insert(extra.node.clone(), Instant::now());
+                event(ctx, "hier.dup", "head", &format!("lab {lab}: second lab head {} leaves, {} stays", extra.node, head.map_or("", |hd| hd.node.as_str())));
+            }
+        }
         let members: Vec<&(String, String, Option<Arc<Mutex<Out>>>, bool)> = direct.iter().filter(|d| lab_of_node.get(&d.0) == Some(&lab)).collect();
         let pinned = c.pins.get(&lab);
         // a pinned lab head on the wrong PC: ask it to leave
@@ -470,12 +513,13 @@ fn tick(ctx: &Arc<Ctx>) {
         }
         match head {
             Some(hd) if !c.drain.contains(&lab) => {
-                // send the lab's PCs that sit at the root to the lab head
+                // send the lab's PCs that sit at the root to the lab head (and tell them where the standby is)
                 let target = format!("{}:{}", hd.addr, hd.port);
+                let sb = standby_tick(ctx, &lab, hd, &labs, &lab_of_node);
                 for (id, _, out, _) in &members {
                     let due = h().moved.get(id).is_none_or(|t| t.elapsed() > Duration::from_secs(8));
                     if let (true, Some(o)) = (due, out) {
-                        ctrl_to(o, json!({"move_to": target}));
+                        ctrl_to(o, json!({"move_to": target, "alt": sb}));
                         h().moved.insert(id.clone(), Instant::now());
                     }
                 }
@@ -483,17 +527,13 @@ fn tick(ctx: &Arc<Ctx>) {
             Some(_) => {}
             None => {
                 // no lab head for this lab: pick one when the mode and the lab size call for it
-                let want = pinned.cloned().or_else(|| (mode == 2 && members.len() >= min_pcs).then(|| best_pc(ctx, &lab, &members)).flatten());
+                let want = pinned.cloned().or_else(|| (mode == 2 && members.len() >= min_pcs).then(|| best_pc(ctx, &members)).flatten());
                 let Some(node) = want else { continue };
                 if h().started.get(&lab).is_some_and(|t| t.elapsed() < Duration::from_secs(20)) || h().tried.get(&node).is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
                     continue;
                 }
                 let Some(out) = direct.iter().find(|d| d.0 == node).and_then(|d| d.2.clone()) else { continue };
-                let code = (!fleet_open()).then(|| {
-                    let code: String = crate::auth::nonce()[..8].iter().map(|b| format!("{b:02X}")).collect();
-                    let _ = ctx.store.add_join_code(&crate::users::sha256_hex(code.as_bytes()), 1, now_ms() + 120_000, true, "head", now_ms());
-                    code
-                });
+                let code = (!fleet_open()).then(|| join_code(ctx));
                 let parents = parent_list(ctx);
                 ctrl_to(&out, json!({"start_lab_head": {"lab": lab, "parent": parents, "port": lab_port(&lab), "join_code": code}}));
                 h().started.insert(lab.clone(), Instant::now());
@@ -502,6 +542,72 @@ fn tick(ctx: &Arc<Ctx>) {
             }
         }
     }
+}
+
+/// Standby of a lab (setting `lab_head_standby`): keep one second lab head on another PC of the lab, idle until the first is gone.
+/// Returns the standby's "ip:port" for the lab's PCs (they try it before the root when their lab head dies), None when there is none.
+fn standby_tick(ctx: &Ctx, lab: &str, hd: &LabHead, labs: &[LabHead], lab_of_node: &HashMap<String, String>) -> Option<String> {
+    let sb_w = labs.iter().find(|l| l.lab == lab && l.standby);
+    if crate::tune::get("lab_head_standby") <= 0.0 {
+        // switched off: the standby leaves; its entry is dropped when its connection is
+        if let Some((s, o)) = sb_w.and_then(|s| Some((s, s.out.as_ref()?))) {
+            if h().exiting.get(&s.node).is_none_or(|t| t.elapsed() > Duration::from_secs(30)) {
+                ctrl_to(o, json!({"lab_exit": true}));
+                h().exiting.insert(s.node.clone(), Instant::now());
+            }
+        } else {
+            h().standby.remove(lab);
+        }
+        return None;
+    }
+    let alt = sb_w.map(|s| format!("{}:{}", s.addr, s.port));
+    // the PCs of the lab hear about the standby through their lab head (and again every 15 s: PCs that joined later)
+    let key = format!("{}|{}", hd.node, alt.as_deref().unwrap_or(""));
+    if h().alt_sent.get(lab).is_none_or(|(k, t)| *k != key || t.elapsed() > Duration::from_secs(15)) {
+        if let Some(o) = &hd.out {
+            ctrl_to(o, json!({"lab_alt": alt}));
+            h().alt_sent.insert(lab.into(), (key, Instant::now()));
+        }
+    }
+    if sb_w.is_some() {
+        return alt;
+    }
+    // chosen but never came up: choose again
+    if h().standby.get(lab).is_some_and(|s| s.1.elapsed() > Duration::from_secs(40)) {
+        h().standby.remove(lab);
+    }
+    if h().standby.contains_key(lab) || h().started.get(&format!("{lab}#standby")).is_some_and(|t| t.elapsed() < Duration::from_secs(20)) {
+        return None;
+    }
+    let ids: Vec<&str> = lab_of_node.iter().filter(|(_, l)| l.as_str() == lab).map(|(n, _)| n.as_str()).collect();
+    let allow_virtual = std::env::var("CK_HIER_ALLOW_VIRTUAL").is_ok_and(|v| v == "1");
+    let tried = |id: &str| h().tried.get(id).is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+    let node = pick(cand_list(ctx, &crate::select::Selector::default()), &ids, Some(base(&hd.node)), tried, allow_virtual)?;
+    let o = hd.out.as_ref()?;
+    // the PC sits behind the lab head, so the start order is relayed through it; the standby listens 5 ports above the lab head's
+    let code = (!fleet_open()).then(|| join_code(ctx));
+    let start = json!({"start_lab_head": {"lab": lab, "parent": parent_list(ctx), "port": lab_port(lab) + 5, "join_code": code}});
+    ctrl_to(o, json!({"relay": {"node": node, "ctrl": start}}));
+    h().standby.insert(lab.into(), (base(&node).into(), Instant::now()));
+    h().started.insert(format!("{lab}#standby"), Instant::now());
+    h().tried.insert(node.clone(), Instant::now());
+    event(ctx, "hier.recruit", "head", &format!("asked node {node} to start the standby lab head of lab {lab}"));
+    None
+}
+
+/// A one-use join code for a secured fleet (the lab head the root starts needs one to be admitted).
+fn join_code(ctx: &Ctx) -> String {
+    let code: String = crate::auth::nonce()[..8].iter().map(|b| format!("{b:02X}")).collect();
+    let _ = ctx.store.add_join_code(&crate::users::sha256_hex(code.as_bytes()), 1, now_ms() + 120_000, true, "head", now_ms());
+    code
+}
+
+/// Best candidate among `ids` (a lab's PCs): eligible, not on the PC `not_base`, not tried lately; highest head score first.
+/// Lab head choice: `not_base` None. Standby choice: the primary's PC, so it is the second best.
+fn pick(mut c: Vec<Cand>, ids: &[&str], not_base: Option<&str>, tried: impl Fn(&str) -> bool, allow_virtual: bool) -> Option<String> {
+    c.retain(|c| ids.contains(&c.id.as_str()) && (c.why.is_empty() || (allow_virtual && c.why == "virtual PC")) && c.role == "candidate" && !tried(&c.id) && not_base.is_none_or(|b| base(&c.id) != b));
+    c.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    c.first().map(|c| c.id.clone())
 }
 
 /// Root address first, then the standbys (they answer there after a takeover).
@@ -518,15 +624,10 @@ fn parent_list(ctx: &Ctx) -> String {
 }
 
 /// The best PC of a lab as a lab head: the existing head-suitability ranking over the lab's PCs.
-fn best_pc(ctx: &Ctx, lab: &str, members: &[&(String, String, Option<Arc<Mutex<Out>>>, bool)]) -> Option<String> {
+fn best_pc(ctx: &Ctx, members: &[&(String, String, Option<Arc<Mutex<Out>>>, bool)]) -> Option<String> {
     let allow_virtual = std::env::var("CK_HIER_ALLOW_VIRTUAL").is_ok_and(|v| v == "1");
-    let sel = crate::select::Selector::default();
-    let mut c: Vec<Cand> = cand_list(ctx, &sel).into_iter().filter(|c| members.iter().any(|m| m.0 == c.id)).collect();
-    let tried_recent = |id: &str| h().tried.get(id).is_some_and(|t| t.elapsed() < Duration::from_secs(60));
-    c.retain(|c| (c.why.is_empty() || (allow_virtual && c.why == "virtual PC")) && c.role == "candidate" && !tried_recent(&c.id));
-    c.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
-    let _ = lab;
-    c.first().map(|c| c.id.clone())
+    let ids: Vec<&str> = members.iter().map(|m| m.0.as_str()).collect();
+    pick(cand_list(ctx, &crate::select::Selector::default()), &ids, None, |id| h().tried.get(id).is_some_and(|t| t.elapsed() < Duration::from_secs(60)), allow_virtual)
 }
 
 /// Take a lab head's leases back: they go to the queue, the lab is told to drop them.
@@ -570,7 +671,13 @@ pub fn json(ctx: &Ctx) -> Value {
     let released = h().released.clone();
     let now = now_ms();
     let labs: Vec<Value> = names.iter().map(|lab| {
-        let hw = st.workers.values().find(|w| lab_of(w).is_some_and(|l| &l.lab == lab));
+        let hw = st.workers.values().find(|w| lab_of(w).is_some_and(|l| &l.lab == lab) && !is_standby(w));
+        let sb = h().standby.get(lab).cloned();
+        let sbw = st.workers.values().find(|w| lab_of(w).is_some_and(|l| &l.lab == lab) && is_standby(w));
+        let standby = sb.map(|(n, since)| json!({
+            "node_id": sbw.map_or_else(|| n.clone(), nkey), "pc": n, "ready": sbw.is_some(), "host": sbw.and_then(|w| w.hello.as_ref()).map(|h| h.host.as_str()),
+            "addr": sbw.map(|w| format!("{}:{}", w.addr, lab_of(w).map_or(0, |l| l.port))), "chosen_s": since.elapsed().as_secs_f64(),
+        }));
         let orphan = st.orphans.iter().find(|(_, o)| &o.lab == lab);
         let head = hw.map(|w| {
             let s = &w.lab_stat;
@@ -598,7 +705,7 @@ pub fn json(ctx: &Ctx) -> Value {
             (None, _) if c.pins.contains_key(lab) || mode == 2 => "absent",
             _ => "none",
         };
-        json!({"lab": lab, "pinned": c.pins.get(lab), "drain": c.drain.contains(lab), "state": state, "head": head, "pcs": pcs, "pcs_at_root": at_root,
+        json!({"lab": lab, "pinned": c.pins.get(lab), "drain": c.drain.contains(lab), "state": state, "head": head, "pcs": pcs, "pcs_at_root": at_root, "standby": standby,
                "silent_s": orphan.map(|(_, o)| o.since.elapsed().as_secs_f64()), "orphaned_leases": orphan.map(|(_, o)| o.leases.len())})
     }).collect();
     let rs = crate::repl::status(ctx);
@@ -776,6 +883,42 @@ mod tests {
             let p = lab_port(l) as u32;
             assert!((7710..7710 + 500).contains(&p), "{l}: {p}");
         }
+    }
+
+    fn cand(id: &str, score: f64, why: &str) -> Cand {
+        Cand { id: id.into(), host: id.into(), lab: "L".into(), score, parts: [0.0; 4], role: "candidate", why: why.into() }
+    }
+
+    #[test]
+    fn standby_is_the_second_best_pc_of_the_lab() {
+        let c = || vec![cand("pcA", 0.9, ""), cand("pcB", 0.8, ""), cand("pcC", 0.7, "asleep"), cand("pcD/v1", 0.6, "virtual PC"), cand("other", 0.99, "")];
+        let ids = ["pcA", "pcB", "pcC", "pcD/v1"];
+        assert_eq!(pick(c(), &ids, None, |_| false, false).as_deref(), Some("pcA"), "lab head: the best of the lab, not of the fleet");
+        assert_eq!(pick(c(), &ids, Some("pcA"), |_| false, false).as_deref(), Some("pcB"), "standby: best PC that is not the lab head's");
+        assert_eq!(pick(c(), &ids, Some(base("pcA/lab-X")), |_| false, false).as_deref(), Some("pcB"), "base() strips the lab head suffix");
+        assert_eq!(pick(c(), &ids, Some("pcA"), |id| id == "pcB", false), None, "tried lately, asleep and virtual PCs are skipped");
+        assert_eq!(pick(c(), &ids, Some("pcA"), |id| id == "pcB", true).as_deref(), Some("pcD/v1"), "virtual PCs only when allowed");
+        assert_eq!(pick(c(), &ids, Some("pcD"), |id| id == "pcA", true).as_deref(), Some("pcB"), "the lab head's own PC is excluded for all its virtual agents");
+    }
+
+    fn lab_head(lab: &str, node: &str) -> Worker {
+        let h = Hello { node_id: node.into(), lab_head: Some(LabHello { lab: lab.into(), port: 1, api: 3, pcs: 0 }), ..Default::default() };
+        Worker { hello: Some(h), state: "active".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn standby_takes_over_when_the_lab_head_leaves() {
+        let (lab, other) = ("sbLabT", "sbLabU");
+        let (primary, standby) = (lab_head(lab, "pcA/lab-sbLabT"), lab_head(lab, "pcB/lab-sbLabT"));
+        h().standby.insert(lab.into(), ("pcB".into(), Instant::now()));
+        h().standby.insert(other.into(), ("pcB".into(), Instant::now()));
+        assert!(is_standby(&standby), "the chosen PC's lab head is the standby: no leases (head.rs lab_ok)");
+        assert!(!is_standby(&primary));
+        assert!(!is_standby(&lab_head(other, "pcA/lab-sbLabU")) && is_standby(&lab_head(other, "pcB/lab-sbLabU")), "per lab");
+        lab_head_gone(lab); // the primary's connection closed
+        assert!(!is_standby(&standby), "promoted at once: it is the lab's head and gets leases");
+        assert!(is_standby(&lab_head(other, "pcB/lab-sbLabU")), "other labs keep their standby");
+        h().standby.remove(other);
     }
 
     #[test]

@@ -138,6 +138,7 @@ fn num(s: Option<String>) -> u64 {
 }
 
 fn main() {
+    std::sync::LazyLock::force(&store::PROC_START);
     let mut args = env::args().skip(1);
     let cmd = args.next().unwrap_or_default();
     let mut o = Opts {
