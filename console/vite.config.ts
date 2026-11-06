@@ -14,7 +14,9 @@ export default defineConfig({
 			compilerOptions: {
 				runes: ({ filename }) => (filename.split(/[/\\]/).includes('node_modules') ? undefined : true)
 			},
-			adapter: adapter({ pages: 'build', assets: 'build', fallback: 'index.html', strict: true })
+			adapter: adapter({ pages: 'build', assets: 'build', fallback: 'index.html', strict: true }),
+			// one JS and one CSS file instead of ~70 chunks: lab PCs fetch the console over a busy LAN, round trips cost more than bytes
+			output: { bundleStrategy: 'single' }
 		})
 	],
 	server: { proxy: { '/api': head, '/stats': head } }

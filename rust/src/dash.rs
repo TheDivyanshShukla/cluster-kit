@@ -11,6 +11,10 @@ mod ui {
     include!(concat!(env!("OUT_DIR"), "/ui_files.rs"));
 }
 
+pub fn ui_file_exact(path: &str) -> Option<&'static (&'static str, &'static str, &'static [u8])> {
+    ui::FILES.iter().find(|f| f.0 == path)
+}
+
 /// The console file for a request path: an exact file, else index.html (SPA routes), else None (not built).
 pub fn ui_file(path: &str) -> Option<&'static (&'static str, &'static str, &'static [u8])> {
     ui::FILES.iter().find(|f| f.0 == path).or_else(|| ui::FILES.iter().find(|f| f.0 == "/index.html"))

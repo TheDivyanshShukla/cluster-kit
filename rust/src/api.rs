@@ -30,6 +30,8 @@ pub struct Req {
     pub bearer: Option<String>,
     pub body: Vec<u8>,
     pub ip: IpAddr,
+    /// the client sent Accept-Encoding: gzip (console files are embedded pre-compressed too)
+    pub gz: bool,
 }
 
 pub enum Out {
@@ -327,7 +329,13 @@ fn route_in(ctx: &Arc<Ctx>, auth: &Auth, r: &Req) -> Out {
         return match dash::ui_file(&r.path) {
             Some(f) => {
                 let cache = if f.0.starts_with("/_app/immutable/") { "public, max-age=31536000, immutable" } else { "no-cache" };
-                Out::Plain { status: 200, ctype: f.1, headers: vec![("Cache-Control", cache.into())], body: f.2.to_vec() }
+                let mut headers = vec![("Cache-Control", cache.into()), ("Vary", "Accept-Encoding".into())];
+                // the same file pre-compressed at console build time (console/scripts/gzip.ts): ~4x fewer bytes on the lab LAN
+                let body = match dash::ui_file_exact(&format!("{}.gz", f.0)).filter(|_| r.gz) {
+                    Some(z) => (headers.push(("Content-Encoding", "gzip".into())), z.2.to_vec()).1,
+                    None => f.2.to_vec(),
+                };
+                Out::Plain { status: 200, ctype: f.1, headers, body }
             }
             None => Out::Plain { status: 200, ctype: "text/html; charset=utf-8", headers: vec![("Cache-Control", "no-store".into())], body: dash::LEGACY.as_bytes().to_vec() },
         };
@@ -2067,7 +2075,8 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
         };
         let _ = rq.as_reader().take(max as u64 + 1).read_to_end(&mut body);
     }
-    let req = Req { method: rq.method().as_str().to_string(), path: path.to_string(), query, cookie, bearer, body, ip };
+    let gz = rq.headers().iter().any(|h| h.field.equiv("Accept-Encoding") && h.value.as_str().contains("gzip"));
+    let req = Req { method: rq.method().as_str().to_string(), path: path.to_string(), query, cookie, bearer, body, ip, gz };
     let out = if req.body.len() > mb("max_body_mb") && !(req.method == "POST" && matches!(req.path.as_str(), "/api/v1/jobs" | "/api/v1/experiments")) { bad(&format!("body is over {} MB", crate::tune::get("max_body_mb"))) } else { route(ctx, auth, &req) };
     let _ = match out {
         Out::Plain { status, ctype, headers, body } => {
@@ -2304,7 +2313,7 @@ fn adv_run(ctx: &Ctx, a: &adv::Action, actor: &str) -> Result<(), Out> {
         Power { to, .. } => ("PUT", "/api/v1/power", json!({"mode": to})),
         Doc { .. } => return Err(bad("this option has no one-click action; follow its steps")),
     };
-    let req = Req { method: method.into(), path: path.into(), query: HashMap::new(), cookie: None, bearer: None, body: body.to_string().into_bytes(), ip: [127, 0, 0, 1].into() };
+    let req = Req { method: method.into(), path: path.into(), query: HashMap::new(), cookie: None, bearer: None, body: body.to_string().into_bytes(), ip: [127, 0, 0, 1].into(), gz: false };
     let out = match a { Tune { .. } => put_tunables(ctx, &req, actor), NodeState { .. } => set_states(ctx, &req, actor), HaTarget { .. } => put_ha_settings(ctx, &req, actor), _ => put_power(ctx, &req, actor) };
     if status_of(&out) < 300 { Ok(()) } else { Err(out) }
 }
@@ -2469,7 +2478,7 @@ mod tests {
     }
 
     fn req(m: &str, path: &str, body: &str) -> Req {
-        Req { method: m.into(), path: path.into(), query: HashMap::new(), cookie: None, bearer: None, body: body.as_bytes().to_vec(), ip: [127, 0, 0, 1].into() }
+        Req { method: m.into(), path: path.into(), query: HashMap::new(), cookie: None, bearer: None, body: body.as_bytes().to_vec(), ip: [127, 0, 0, 1].into(), gz: false }
     }
 
     fn status(o: &Out) -> u16 {

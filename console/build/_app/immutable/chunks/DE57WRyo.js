@@ -1,1 +1,0 @@
-import{_ as e,v as t}from"./Cdxv086n.js";import{w as n}from"./CarwWTB4.js";var r={name:`arrow-right-left`,size:24,node:[[`path`,{d:`m16 3 4 4-4 4`}],[`path`,{d:`M20 7H4`}],[`path`,{d:`m8 21-4-4 4-4`}],[`path`,{d:`M4 17h16`}]]};r.node;var i=new Set([`$$slots`,`$$events`,`$$legacy`]);function a(a,o){let s=e(o,i);n(a,t(()=>s,{get icon(){return r}}))}export{a as t};
