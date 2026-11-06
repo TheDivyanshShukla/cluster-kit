@@ -190,6 +190,13 @@ def _facts(fn: Callable[..., Any], items: list[Any], sample: int, ck: Any, o: di
     F["ran"], F["res"] = len(wall), res
     F["per"] = statistics.median(wall) if wall else 0.0
     F["cpu_ratio"] = sum(cpu) / sum(wall) if wall and sum(wall) > 0 else 1.0
+    # On a busy PC the wall time also holds waiting for a CPU: with load L on C cores a CPU-bound call gets about C/L of it.
+    # Judge the share against that, so a busy box does not make computing look like waiting. (Context switches cannot tell
+    # the two apart portably: macOS counts a sleep as an involuntary switch.)
+    share = _cpu_share()
+    if share < 1.0:
+        F["cpu_share_avail"], F["cpu_ratio_raw"] = share, F["cpu_ratio"]
+        F["cpu_ratio"] = min(1.0, F["cpu_ratio"] / share)
     after = _fingerprint(mod) if mod else {}
     F["globals_changed"] = sorted(k_ for k_ in after if before.get(k_) != after[k_] and k_ in before)
     F["res_bytes"] = [len(ck._runner.enc(r)) for r in res if _picklable(r)]
@@ -208,11 +215,18 @@ def _facts(fn: Callable[..., Any], items: list[Any], sample: int, ck: Any, o: di
         F["differs"] = [i for i, r in enumerate(again) if not _same(r, res[i])]
         F["rerun"] = len(again)
         if F["per"] * len(xs) < 1.5 and len(xs) >= 4:  # does a thread pool help? (no: GIL-bound; yes: waiting on I/O or C code that lets go)
-            t0 = time.perf_counter()
             try:
+                t0 = time.perf_counter()
+                for x in xs:  # sequential again, right before the pool: both runs see the same busy PC
+                    fn(x)
+                seq = time.perf_counter() - t0
+                t0, c0 = time.perf_counter(), time.process_time()
                 with ThreadPoolExecutor(4) as ex:
                     list(ex.map(fn, xs))
-                F["thread_speedup"] = sum(wall) / (time.perf_counter() - t0)
+                dt = time.perf_counter() - t0
+                F["thread_speedup"] = seq / dt
+                # cores busy at once in the same window: unlike the speed-up it does not compare two moments of a busy PC
+                F["thread_par"] = (time.process_time() - c0) / dt
             except Exception:
                 pass
         F["prof"] = _hot(fn, xs[:5], ck)
@@ -330,8 +344,17 @@ def gil_enabled() -> bool:
     return getattr(sys, "_is_gil_enabled", lambda: True)()
 
 
+def _cpu_share() -> float:
+    """Share of one core a busy loop can expect right now (1.0 on an idle PC): cores / 1-minute load, at most 1."""
+    try:
+        load = os.getloadavg()[0]
+    except (AttributeError, OSError):  # Windows
+        return 1.0
+    return min(1.0, (os.cpu_count() or 1) / load) if load > 0 else 1.0
+
+
 def _threads(F: dict[str, Any]) -> Suggestion | None:
-    r, sp = F["cpu_ratio"], F.get("thread_speedup")
+    r, sp, par = F["cpu_ratio"], F.get("thread_speedup"), F.get("thread_par")
     if not F["ran"] or F["per"] < 0.001:
         return None
     if not gil_enabled() and r >= 0.5 and sp and sp >= 1.8:  # free-threaded Python: Python threads run in parallel
@@ -342,7 +365,8 @@ def _threads(F: dict[str, Any]) -> Suggestion | None:
                           "from concurrent.futures import ThreadPoolExecutor   # inside fn, over its own sub-items\n"
                           "ck.map(fn, items, mem_mb=...)   # or leave it: the cluster runs one process per slot, which also scales",
                           "info", f"up to {sp:.1f}x per slot on threads (estimate)", total * (1 - 1 / sp), {"cpu_ratio": r, "thread_speedup": sp, "gil": False})
-    if r < 0.5 or (sp and sp >= 2.5):
+    # waiting overlaps on threads (sleep, I/O): a low CPU share alone may just be a busy PC; C code that lets go of the GIL runs in parallel
+    if (r < 0.5 and (sp is None or sp >= 2)) or (sp and sp >= 2.5 and (par is None or par >= 2)):  # threads overlap waits, or C code that lets go of the GIL runs in parallel
         total = F["n"] * F["per"]
         return Suggestion("io_bound", f"Mostly waiting, not computing (CPU {r:.0%} of wall time" + (f", 4 threads give {sp:.1f}x" if sp else "") + ")",
                           "the function sleeps or waits on disk/network; a PC can overlap many such calls, so slots should not be limited to its cores",
@@ -350,7 +374,7 @@ def _threads(F: dict[str, Any]) -> Suggestion | None:
                           "ck.map(fn, items, mem_mb=50)   # small mem_mb lets each PC run more copies at once",
                           "gain", f"up to 4x per slot on threads: saves about {_t(total * 0.75)} of {_t(total)} (estimate)", total * 0.75,
                           {"cpu_ratio": r, "thread_speedup": sp})
-    if sp is not None and sp < 1.3 and r > 0.8 and gil_enabled():  # with no GIL a flat speed-up is not the GIL's doing
+    if sp is not None and sp < 2 and (par if par is not None else sp) < 1.3 and r > 0.3 and gil_enabled():  # computing, and threads do not overlap it  # with no GIL a flat speed-up is not the GIL's doing
         return Suggestion("gil_bound", f"CPU-bound and GIL-bound (4 threads give only {sp:.1f}x)",
                           "threads share one interpreter lock, so they cannot speed this up; separate processes can, and that is what the cluster uses",
                           "ck.map(fn, items)               # one process per slot on each PC (no threads)\n"
@@ -489,5 +513,5 @@ def advise(fn: Callable[..., Any], items: list[Any], sample: int, o: dict[str, A
     out += _big(F)
     out.sort(key=lambda s: (_SEV[s.severity], -(s.gain_s or 0)))
     a = Advice(out)
-    a.facts = {k: F.get(k) for k in ("n", "per", "cpu_ratio", "thread_speedup", "peak_mb", "prof")}
+    a.facts = {k: F.get(k) for k in ("n", "per", "cpu_ratio", "thread_speedup", "thread_par", "peak_mb", "prof")}
     return a
