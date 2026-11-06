@@ -357,7 +357,7 @@ impl Store {
         drop(c);
         self.set_job_blobs(id as u64, spec);
         if !spec.items.is_empty() {
-            if let Err(x) = self.put_items(id as u64, &spec.items) {
+            if let Err(x) = self.put_items(id as u64, &spec.items, spec.item_base) {
                 let _ = self.db().execute("DELETE FROM jobs WHERE id=?", [id]);
                 return Err(x);
             }
@@ -1228,8 +1228,8 @@ impl Store {
         .map(|m| m.flatten().collect())
         .unwrap_or_default()
     }
-    /// List job items (JOB-01), index 0.. in order. Replaces any stored items of the job.
-    pub fn put_items(&self, job: u64, items: &[String]) -> Result<(), String> {
+    /// List job items (JOB-01), index `base`.. in order (base is 0 except for a lab head's leased ranges). Replaces any stored items of the job.
+    pub fn put_items(&self, job: u64, items: &[String], base: u64) -> Result<(), String> {
         if items.len() > max_items() {
             return Err(format!("at most {} items", max_items()));
         }
@@ -1242,7 +1242,7 @@ impl Store {
         {
             let mut st = tx.prepare("INSERT INTO items (job_id,idx,item) VALUES (?,?,?)").map_err(e)?;
             for (i, it) in items.iter().enumerate() {
-                st.execute(params![job as i64, i as i64, it]).map_err(e)?;
+                st.execute(params![job as i64, (base + i as u64) as i64, it]).map_err(e)?;
             }
         }
         tx.commit().map_err(e)
@@ -1317,13 +1317,13 @@ mod tests5 {
         assert_eq!(s.items(j.id, 0, 10), vec!["a", "b b", ""]);
         assert_eq!(s.items(j.id, 1, 2), vec!["b b"]);
         assert!(s.items(j.id, 5, 9).is_empty() && s.items(j.id, 2, 1).is_empty());
-        s.put_items(j.id, &["z".into()]).unwrap();
+        s.put_items(j.id, &["z".into()], 0).unwrap();
         assert_eq!(s.items(j.id, 0, 10), vec!["z"]);
         // too-long item rejected, nothing created
         let bad = JobSpec { items: vec!["x".repeat(4097)], ..sp.clone() };
         assert!(s.create_job(&bad, 1).is_err());
         assert_eq!(s.jobs(10, None).len(), 1);
-        assert!(s.put_items(j.id, &["x".repeat(4096)]).is_ok());
+        assert!(s.put_items(j.id, &["x".repeat(4096)], 0).is_ok());
         assert_eq!(s.items(j.id, 0, 1)[0].len(), 4096);
     }
 
@@ -1372,10 +1372,10 @@ mod tests5 {
     fn items_cascade_and_limits() {
         let s = Store::memory();
         let j = s.create_job(&JobSpec { name: "n".into(), end: 1, chunk: 1, ..Default::default() }, 1).unwrap();
-        s.put_items(j.id, &["a".into()]).unwrap();
+        s.put_items(j.id, &["a".into()], 0).unwrap();
         s.db().execute("DELETE FROM jobs WHERE id=?", [j.id as i64]).unwrap();
         assert!(s.items(j.id, 0, 5).is_empty());
-        assert!(s.put_items(1, &vec![String::new(); max_items() + 1]).is_err());
+        assert!(s.put_items(1, &vec![String::new(); max_items() + 1], 0).is_err());
     }
 
     #[test]
@@ -1491,7 +1491,7 @@ impl Store {
         }
         self.set_job_blobs(id, spec);
         if !spec.items.is_empty() {
-            if let Err(x) = self.put_items(id, &spec.items) {
+            if let Err(x) = self.put_items(id, &spec.items, spec.item_base) {
                 let _ = self.db().execute("DELETE FROM jobs WHERE id=?", [id as i64]);
                 return Err(x);
             }

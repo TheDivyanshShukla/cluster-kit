@@ -125,6 +125,7 @@ pub const KNOBS: &[Knob] = &[
     k("lab_head_standby", "Hierarchy", 0.0, 0.0, 1.0, "0/1", Head, "Reserved: keep a standby for each lab head (not built yet; a lost lab head's PCs fall back to the root instead)."),
     k("lab_head_port", "Hierarchy", 7710.0, 1024.0, 65_000.0, "port", Head, "First TCP port for lab heads the root starts; each lab takes the next 10 (the API is +2)."),
     k("lab_part_s", "Hierarchy", 0.5, 0.05, 30.0, "s", Head, "A lab head sends finished pieces of a lease upward at this interval (batched, so one message covers many chunks)."),
+    k("stage_timeout_s", "Network", 120.0, 10.0, 86_400.0, "s", Head, "A chunk reserved for a PC (or lab head) while its blobs download is re-staged from the head after this long (plus 1 s per 2 MB of missing blobs), then given to another PC after the same time again."),
     k("job_mem_pct", "Agent limits", 80.0, 0.0, 100.0, "%", Agent, "A command program (all its processes together) is stopped when it uses more than this share of the PC's RAM; 0 = no limit."),
     k("log_batch", "Logging", 200.0, 10.0, 10_000.0, "lines", Head, "Most log lines sent to the console in one live batch."),
     k("cand_recheck_s", "Dynamic heads", 5.0, 1.0, 600.0, "s", Head, "Live head ranking is recomputed at most this often for the console."),

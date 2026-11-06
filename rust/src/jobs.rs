@@ -90,6 +90,14 @@ pub struct JobSpec {
     /// Wave 14 (SCH-09): at submission, take back the outstanding chunks of lower-priority jobs at once (requeued).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub preempt: bool,
+    /// Lab heads only (docs/HIERARCHY.md): the items of a leased list range are stored from this index, so the shadow job keeps the
+    /// root's item numbers (CK_START / CK_END, result ranges). 0 for every ordinary job.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub item_base: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 pub const PLACEMENTS: &[&str] = &["spread", "pack", "fastest", "efficient"];
@@ -120,6 +128,7 @@ impl Default for JobSpec {
             blobs: vec![],
             blob_mode: String::new(),
             preempt: false,
+            item_base: 0,
         }
     }
 }

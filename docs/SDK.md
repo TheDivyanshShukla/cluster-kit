@@ -209,3 +209,8 @@ The first task of a job on a PC leaves a per-user warm Python worker that has al
 - Key = hash of the shipped code + `sys.executable` + Python version. Idle exit after 120 s (`CK_WARM_IDLE_S`; the `warm_idle_s` tunable is for the lead to wire). `CK_WARM=off` disables it. Windows: off.
 - Any error (no socket, refused, worker died mid-task) falls back to the plain path for the results not yet delivered.
 - Measured, 4 virtual agents, `examples/sdk/ml_torch.py` (8 rounds, 6 shards, torch CPU, 3.12): 24-25 s plain, 16 s then 11 s warm; same held-out MSE.
+
+
+## Blobs per chunk (lab heads and shards)
+
+Items that hold `ck.shard` / `ck.put` handles inside a tuple, a dict or a batch are sent as `@refs:<sha>,..|<line>`: the head reads the shas to send each shard only to the PCs whose chunk uses it (before, only items that were a bare handle were placed per chunk; any other item made every PC fetch every shard). The runner drops the prefix. `ck.plan` therefore counts a blob used by one item as data for one PC (`blob_per_chunk`, now true by default; set `ck.config(blob_per_chunk=False)` against a head from before this change). Jobs through lab heads: see HIERARCHY.md section 7.

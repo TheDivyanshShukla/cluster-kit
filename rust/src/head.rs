@@ -40,8 +40,10 @@ pub struct Job {
     pub blobs: Vec<String>, // wave 13: every blob of the job, in env order (CK_BLOB_<i>)
     pub blob_mode: String,
     pub shared: Vec<String>, // job-wide blobs (code): every PC that takes a chunk needs them
-    pub shards: Vec<String>, // blobs named by @blob: items; item_sha[i] = 0 or 1 + index into shards
-    pub item_sha: Vec<u32>,
+    pub shards: Vec<String>, // blobs named by items (@blob: / @refs:); item_sha[i - item_base] = 1 + index into shards, for each blob item i names
+    pub item_sha: Vec<Vec<u32>>,
+    pub item_base: u64,      // index of the first stored item (a lab head's leased range; 0 otherwise)
+    pub selector_src: String, // the selector as submitted (a lab head filters its own PCs with it)
     /// May a lab head take leases of it (docs/HIERARCHY.md): any PC may run it, no blobs, built-in kernel.
     pub lease_ok: bool,
     pub chunk_set: u64, // the chunk length the submitter asked for (0 = automatic); lab heads cut leases the same way
@@ -110,6 +112,10 @@ pub struct Worker {
     pub probe_burst: bool, // this probe only teaches the head its uplink: all PCs at once share it, so the per-PC speed is not stored
     pub blob_rep: bool,                        // the agent has reported its cache at least once
     pub staged: Option<(u64, u64, u64)>,       // a chunk reserved for this PC until its blobs have arrived (also in inflight)
+    pub staged_at: Option<Instant>,            // when it was reserved / last re-staged (stage_timeout_s)
+    pub staged_strikes: u8,                    // re-stages of this reservation
+    pub shunned: HashMap<u64, Instant>,        // jobs whose staging timed out on this PC: it takes no chunk of them for a while
+    pub declined: BTreeSet<u64>,               // lab head: jobs it cannot serve (no PC of its lab matches the selector)
     // lab heads (src/lab.rs, src/hier.rs)
     pub lab_pcs: Vec<String>,        // node ids of the PCs under this lab head (counted as connected for quorum)
     pub lab_stat: serde_json::Value, // its last lab_status
@@ -299,7 +305,10 @@ pub(crate) fn lab_of(w: &Worker) -> Option<&LabHello> {
 
 /// May this worker take a chunk of this job? A PC always may; a lab head only gets leases of leasable jobs while the hierarchy is on.
 pub(crate) fn lab_ok(w: &Worker, j: &Job) -> bool {
-    lab_of(w).is_none() || (j.lease_ok && !w.drain && crate::hier::on())
+    if lab_of(w).is_none() {
+        return !w.shunned.get(&j.id).is_some_and(|t| t.elapsed() < crate::tune::secs("stage_timeout_s"));
+    }
+    j.lease_ok && !w.drain && crate::hier::on() && !w.declined.contains(&j.id)
 }
 
 /// Range handed to a lab head: `lease_s` seconds of its measured speed, at most half of what each live lab could still take.
@@ -312,6 +321,29 @@ pub(crate) fn lease_len(st: &State, w: &Worker, kind: u8, remaining: u64, dflt: 
     if rate > 0.0 { ((rate * crate::tune::get("lease_s")) as u64).clamp(floor, cap) } else { (dflt * w.threads.max(1) as u64 * 4).min(cap).max(1) } // speed unknown: a few chunks per thread
 }
 
+/// `max_pcs` split between the PCs at the root (`direct` of them) and the labs: with lab heads connected each side gets its share of
+/// the PCs (at least one), so the job holds about max_pcs PCs in all. No lab head: max_pcs unchanged.
+pub(crate) fn lab_share(st: &State, max_pcs: u32, direct: usize) -> u32 {
+    if max_pcs == 0 {
+        return 0;
+    }
+    let behind: usize = st.workers.values().filter(|w| lab_of(w).is_some()).map(|w| w.lab_pcs.len()).sum();
+    if behind == 0 {
+        return max_pcs;
+    }
+    ((max_pcs as usize * direct).div_ceil(direct + behind)).max(1).min(max_pcs as usize) as u32
+}
+
+/// A lab head's share of `max_pcs` for its lab of `pcs` PCs (see lab_share).
+fn lab_head_share(st: &State, max_pcs: u32, pcs: usize) -> u32 {
+    if max_pcs == 0 {
+        return 0;
+    }
+    let direct = st.workers.values().filter(|w| lab_of(w).is_none() && can_work(w)).count();
+    let behind: usize = st.workers.values().filter(|w| lab_of(w).is_some()).map(|w| w.lab_pcs.len()).sum::<usize>().max(pcs);
+    ((max_pcs as usize * pcs.max(1)).div_ceil(direct + behind)).max(1).min(max_pcs as usize) as u32
+}
+
 /// Is a blob missing on this node for chunk [a, b) of the job (job-wide blobs plus the shards its items name)?
 /// Virtual agents run cmd/list/SDK programs too (sharing their process's cache), so they need the blobs like any PC.
 /// An agent that has not reported its cache yet counts as missing.
@@ -319,7 +351,7 @@ pub(crate) fn chunk_missing(w: &Worker, j: &Job, a: u64, b: u64) -> bool {
     if j.blobs.is_empty() {
         return false;
     }
-    !w.blob_rep || crate::blobs::chunk_blobs(&j.shared, &j.shards, &j.item_sha, a, b).iter().any(|b| !w.have.contains(b))
+    !w.blob_rep || crate::blobs::chunk_blobs(&j.shared, &j.shards, &j.item_sha, j.item_base, a, b).iter().any(|b| !w.have.contains(b))
 }
 
 /// A chunk of the job near the front of its unassigned work that `w` already has the blobs for (same length as `len`).
@@ -495,10 +527,20 @@ fn placed(st: &State, j: &Job, wid: u64) -> bool {
     if !limited(j) {
         return true;
     }
+    if let Some(me) = st.workers.get(&wid).filter(|w| lab_of(w).is_some()) {
+        // a lab head applies max_pcs and the placement among its own PCs (its share, lab_head_share); when max_pcs is smaller than the
+        // number of labs only the max_pcs fastest labs get leases, so the cap holds
+        if j.max_pcs == 0 {
+            return true;
+        }
+        let r = node_rate(st, me, j.kind);
+        let faster = st.workers.iter().filter(|(i, o)| lab_of(o).is_some() && can_work(o) && (node_rate(st, o, j.kind), **i) > (r, wid)).count();
+        return (faster as u32) < j.max_pcs;
+    }
     let nodes: Vec<(u64, sched::PlaceNode)> = st
         .workers
         .iter()
-        .filter(|(_, w)| can_work(w) && j.selector.matches(&w.attrs) && (j.only.is_empty() || j.only.contains(&w.addr)))
+        .filter(|(_, w)| lab_of(w).is_none() && can_work(w) && j.selector.matches(&w.attrs) && (j.only.is_empty() || j.only.contains(&w.addr)))
         .map(|(i, w)| {
             let r = node_rate(st, w, j.kind);
             (*i, sched::PlaceNode { node_id: nkey(w), rate: if r > 0.0 { r } else { w.calib * 1e6 }, threads: w.threads, holds: w.inflight.iter().any(|t| t.0 == j.id), cached: !j.blobs.is_empty() && j.blobs.iter().all(|b| w.have.contains(b)) })
@@ -510,7 +552,7 @@ fn placed(st: &State, j: &Job, wid: u64) -> bool {
     };
     let me = me.node_id.clone();
     let pn: Vec<sched::PlaceNode> = nodes.into_iter().map(|n| n.1).collect();
-    sched::place(&j.placement, j.max_pcs, &pn).contains(&me)
+    sched::place(&j.placement, lab_share(st, j.max_pcs, pn.len()), &pn).contains(&me)
 }
 
 /// Workers holding a chunk of any of `user`'s jobs.
@@ -630,18 +672,19 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         return Some(out);
     }
     let addr = st.workers.get(&wid)?.addr.clone();
+    let is_lab = lab_of(st.workers.get(&wid)?).is_some(); // a lab head filters by selector among its own PCs
     let id = if st.policy.reserves.is_empty() && st.jobs.len() == 1 && st.quotas.is_empty() && st.jobs.values().all(|j| !limited(j)) {
         // fast path, same answer as sched::pick_job with one job and no reserves (which is O(workers) with attrs cloned
         // per node, ~1 ms at 1,000 nodes, under the State lock, once per result)
         let (w, j) = (&st.workers[&wid], st.jobs.values().next()?);
-        (can_work(w) && j.has_work() && lab_ok(w, j) && (j.only.is_empty() || j.only.contains(&addr)) && j.selector.matches(&w.attrs)).then_some(j.id)?
+        (can_work(w) && j.has_work() && lab_ok(w, j) && (j.only.is_empty() || j.only.contains(&addr)) && (lab_of(w).is_some() || j.selector.matches(&w.attrs))).then_some(j.id)?
     } else if st.policy.reserves.is_empty() {
         // same answer as the branch below (sched::pick_job), without a NodeView (two Strings + attrs clone) per node:
         // one pass tallies how many other nodes work for each job, sched::pick_core decides from the tallies
         let jv: Vec<JobView> = st
             .jobs
             .values()
-            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: j.selector.clone(), has_work: j.has_work() && st.workers.get(&wid).is_some_and(|w| lab_ok(w, j)) && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) && quota_ok(st, j, wid) })
+            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: if is_lab { Selector::default() } else { j.selector.clone() }, has_work: j.has_work() && st.workers.get(&wid).is_some_and(|w| lab_ok(w, j)) && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) && quota_ok(st, j, wid) })
             .collect();
         let w = st.workers.get(&wid)?;
         if !can_work(w) {
@@ -664,7 +707,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         let jv: Vec<JobView> = st
             .jobs
             .values()
-            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: j.selector.clone(), has_work: j.has_work() && st.workers.get(&wid).is_some_and(|w| lab_ok(w, j)) && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) && quota_ok(st, j, wid) })
+            .map(|j| JobView { id: j.id, priority: j.priority, user: j.user.clone(), selector: if is_lab { Selector::default() } else { j.selector.clone() }, has_work: j.has_work() && st.workers.get(&wid).is_some_and(|w| lab_ok(w, j)) && (j.only.is_empty() || j.only.contains(&addr)) && placed(st, j, wid) && quota_ok(st, j, wid) })
             .collect();
         sched::pick_job(wid, &views, &jv, &st.policy.reserves)?
     };
@@ -705,6 +748,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         if chunk_missing(&st.workers[&wid], j, a, b) {
             let w = st.workers.get_mut(&wid)?;
             w.staged = Some((id, a, b));
+            (w.staged_at, w.staged_strikes) = (Some(Instant::now()), 0);
             w.inflight.push((id, a, b));
             return None;
         }
@@ -737,7 +781,8 @@ fn speculate_take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8
     for j in st.jobs.values().filter(|j| !j.has_work() && j.selector.matches(&w.attrs) && (j.max_pcs == 0 || (st.workers.values().filter(|o| o.inflight.iter().any(|t| t.0 == j.id)).count() as u32) < j.max_pcs) && (j.only.is_empty() || j.only.contains(&w.addr)) && quota_ok(st, j, wid)) {
         let mut infl: Vec<sched::Inflight> = vec![];
         for (_, h) in st.workers.iter().filter(|(i, h)| **i != wid && lab_of(h).is_none()) {
-            for k in h.inflight.iter().filter(|k| k.0 == j.id) {
+            // a copy goes only to a PC that already holds the chunk's blobs (nothing stages a speculative copy)
+            for k in h.inflight.iter().filter(|k| k.0 == j.id && !chunk_missing(w, j, k.1, k.2)) {
                 let r = node_rate(st, h, j.kind);
                 infl.push(sched::Inflight {
                     job: j.id, a: k.1, b: k.2, copies: st.workers.values().filter(|o| o.inflight.contains(k)).count() as u32,
@@ -952,24 +997,29 @@ fn start_job(ctx: &Ctx, st: &mut State, id: u64) {
         return;
     }
     let (mut shared, mut shards, mut item_sha) = (spec.blobs.clone(), vec![], vec![]);
+    let item_base = if spec.kind == KIND_LIST { spec.from } else { 0 };
     if spec.kind == KIND_LIST && !spec.blobs.is_empty() {
+        // a blob named by items (not by every item) goes only to the PCs that get those items, not to every PC of the job
         let mut idx: HashMap<String, u32> = HashMap::new();
-        for it in ctx.store.items(id, 0, spec.end) {
-            item_sha.push(crate::blobs::item_blob(&it).map_or(0, |sha| {
+        for it in ctx.store.items(id, spec.from, spec.end) {
+            item_sha.push(crate::blobs::item_blobs(&it).into_iter().filter(|sha| spec.blobs.iter().any(|b| b == sha)).map(|sha| {
                 let n = idx.len() as u32;
                 *idx.entry(sha.to_string()).or_insert_with(|| {
                     shards.push(sha.to_string());
                     n + 1
                 })
-            }));
+            }).collect());
         }
         shared.retain(|b| !idx.contains_key(b));
     }
-    let lease_ok = spec.selector.trim().is_empty() && spec.only.is_empty() && spec.blobs.is_empty() && spec.max_pcs == 0 && matches!(spec.placement.as_str(), "" | "spread") && matches!(spec.kind, KIND_SHA | KIND_SYNTH);
+    let selector_src = spec.selector.clone();
+    // Lab heads serve every kind, with blobs, a selector, max_pcs (their share) and a placement (applied inside the lab): only `--only`
+    // names particular PCs, which the root alone knows.
+    let lease_ok = spec.only.is_empty() && matches!(spec.kind, KIND_SHA | KIND_SYNTH | KIND_CMD | KIND_LIST);
     st.jobs.insert(id, Job {
         id, kind: spec.kind, arg: spec.arg, next: spec.end, end: spec.end, chunk, total, left, todo: left,
         requeue: todo.into_iter().rev().collect(), only: spec.only, started: Instant::now(), selector, priority: spec.priority, user: spec.submitter.clone(), policy,
-        lease_ok, chunk_set: spec.chunk,
+        lease_ok, chunk_set: spec.chunk, item_base, selector_src,
         max_pcs: spec.max_pcs, placement: spec.placement, mem_mb: spec.mem_mb, blobs: spec.blobs, blob_mode: spec.blob_mode, shared, shards, item_sha,
     });
     let p = paused_now(st);
@@ -1625,7 +1675,7 @@ pub(crate) fn finish_part(ctx: &Ctx, wid: u64, p: &[u8], partial: bool) -> io::R
         return Ok((ack_now(&st), credit)); // already stored (re-run, speculative copy, or an agent resending after a failover, HA-04): ACK at once
     }
     acct_kept(&mut st, job, wid, b - a, secs);
-    crate::lab::on_part(job, a, b, &p[RESULT_HDR..]); // a lab head: queue it for the next batch upward
+    crate::lab::on_part(job, a, b, &p[RESULT_HDR..], files.as_deref()); // a lab head: queue it for the next batch upward
     if let Some(f) = &files {
         ctx.store.put_job_files(job, a, b, f);
     }
@@ -1958,12 +2008,17 @@ fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>
                 if let Some(t) = take(&mut st, wid).or_else(|| speculate_take(&mut st, wid)) {
                     let mem = st.jobs.get(&t.0).map_or(0, |j| j.mem_mb);
                     let blobs = st.jobs.get(&t.0).map(|j| j.blobs.clone()).unwrap_or_default();
-                    let facts = st.jobs.get(&t.0).map_or((2u8, 0u64, 0u64), |j| (j.priority, j.mem_mb, j.chunk_set));
+                    // what a lab head needs to run the job's leases like the root would (selector and max_pcs apply inside its lab)
+                    let facts = st.jobs.get(&t.0).map(|j| {
+                        let pcs = st.workers.get(&wid).map_or(0, |w| w.lab_pcs.len());
+                        serde_json::json!({"id": t.0, "priority": j.priority, "mem_mb": j.mem_mb, "chunk": j.chunk_set, "selector": j.selector_src, "max_pcs": lab_head_share(&st, j.max_pcs, pcs), "placement": j.placement,
+                            "blobs": j.blobs, "shared": j.shared})
+                    });
                     let wk = st.workers.get_mut(&wid).unwrap();
                     let mem = if mem > 0 && wk.told.insert(t.0) { mem } else { 0 };
                     // cmd and list jobs always get this CTRL once: it carries the job-scoped blob upload token too
                     let jb = ((!blobs.is_empty() || matches!(t.3, KIND_CMD | KIND_LIST)) && wk.told_b.insert(t.0)).then_some(blobs);
-                    let hj = (lab_of(wk).is_some() && wk.told_h.insert(t.0)).then_some(facts);
+                    let hj = (lab_of(wk).is_some() && wk.told_h.insert(t.0)).then_some(facts).flatten();
                     wk.inflight.push((t.0, t.1, t.2));
                     wk.fed += 1;
                     wk.sent.insert((t.0, t.1, t.2), Instant::now());
@@ -1977,11 +2032,13 @@ fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>
         if mem > 0 {
             ctrl_to(&w, serde_json::json!({"job": {"id": job, "mem_mb": mem}}));
         }
-        if let Some((priority, mem_mb, chunk)) = hj {
-            ctrl_to(&w, serde_json::json!({"hier_job": {"id": job, "priority": priority, "mem_mb": mem_mb, "chunk": chunk}}));
+        if let Some(hj) = hj {
+            ctrl_to(&w, serde_json::json!({"hier_job": hj}));
         }
         if let Some(jb) = jb {
-            ctrl_to(&w, serde_json::json!({"job_blobs": {"id": job, "blobs": jb, "put": {"port": dash_port(), "token": crate::blobs::put_token(job)}}}));
+            // a lab head's PCs upload output files and bulk results straight to the root (the job's owner), not to the lab head
+            let put = crate::lab::put_target(&ctx, job).unwrap_or_else(|| serde_json::json!({"port": dash_port(), "token": crate::blobs::put_token(job)}));
+            ctrl_to(&w, serde_json::json!({"job_blobs": {"id": job, "blobs": jb, "put": put}}));
         }
         let mut p = pack(&[job, a, b]);
         p.push(kind);
@@ -2130,7 +2187,7 @@ fn submit_with(ctx: &Ctx, mut spec: JobSpec, sub: Option<mpsc::Sender<(u8, Vec<u
         if spec.items.is_empty() {
             return Err("a list job needs items".into());
         }
-        (spec.from, spec.end) = (0, spec.items.len() as u64); // tasks are item index ranges
+        (spec.from, spec.end) = (spec.item_base, spec.item_base + spec.items.len() as u64); // tasks are item index ranges
     }
     if !spec.policy.is_empty() && sched::parse_policy(&spec.policy).is_none() {
         return Err(format!("unknown policy '{}': use adaptive, guided or fixed", spec.policy));
@@ -2140,13 +2197,15 @@ fn submit_with(ctx: &Ctx, mut spec: JobSpec, sub: Option<mpsc::Sender<(u8, Vec<u
     }
     // wave 13: items may name blobs (@blob:<sha>...); the job needs those too, and every blob must exist on this head
     for it in &spec.items {
-        if let Some(sha) = crate::blobs::item_blob(it) {
+        for sha in crate::blobs::item_blobs(it) {
             if !spec.blobs.iter().any(|b| b == sha) {
                 spec.blobs.push(sha.to_string());
             }
         }
     }
-    if let Some(b) = spec.blobs.iter().find(|b| !crate::blobs::valid_sha(b) || ctx.store.blob_size(b).is_none()) {
+    // a lab head's shadow job names the root job's blobs; only the ones its lease needs are here yet (the root staged those)
+    let lab_lease = spec.submitter.starts_with("lab:");
+    if let Some(b) = spec.blobs.iter().find(|b| !crate::blobs::valid_sha(b) || (!lab_lease && ctx.store.blob_size(b).is_none())) {
         return Err(format!("unknown blob {b}: upload it first (PUT /api/v1/blobs)"));
     }
     if !spec.blob_mode.is_empty() && !matches!(spec.blob_mode.as_str(), "auto" | "direct" | "peer") {
@@ -2201,6 +2260,25 @@ fn preempt_lower(st: &mut State, id: u64) -> Sends {
         }
     }
     sends
+}
+
+/// Stop a running job with an error (a blob it needs is gone, say). No-op if it already ended.
+pub(crate) fn fail_job(ctx: &Ctx, id: u64, msg: &str) {
+    let mut st = ctx.sh.0.lock().unwrap();
+    if !st.jobs.contains_key(&id) {
+        return;
+    }
+    let outs = stop_job(ctx, &mut st, id, JobState::Failed, Some(msg), "job.failed", "head", &format!("job {id}: {msg}"));
+    drop(st);
+    cancel_outs(outs, id);
+}
+
+/// Lab head: the job-wide blobs of a leased job are the root's, not "every blob that no leased item names".
+pub(crate) fn set_job_shared(ctx: &Ctx, id: u64, shared: Vec<String>) {
+    if let Some(j) = ctx.sh.0.lock().unwrap().jobs.get_mut(&id) {
+        j.shared = shared;
+    }
+    ctx.sh.1.notify_all();
 }
 
 /// Cancel a queued or running job. Chunks already running on workers are told to stop.
@@ -2753,6 +2831,7 @@ pub(crate) fn cand_list(ctx: &Ctx, sel: &Selector) -> Vec<Cand> {
         let st = ctx.sh.0.lock().unwrap();
         st.workers.values().filter_map(|w| Some((w.hello.as_ref()?.node_id.clone(), (w.calib, w.presence == "busy")))).collect()
     };
+    let via: std::collections::HashSet<String> = ctx.sh.0.lock().unwrap().workers.values().flat_map(|w| w.lab_pcs.iter().cloned()).collect(); // PCs behind a lab head are reachable
     let (head, standbys) = (crate::identity::node_id(), crate::repl::standby_nodes(ctx));
     let asleep = pw_ctx(ctx).asleep.clone();
     let lost = losses_24h(ctx);
@@ -2772,6 +2851,7 @@ pub(crate) fn cand_list(ctx: &Ctx, sel: &Selector) -> Vec<Cand> {
         let p = peers.iter().find(|p| p.id == r.node_id);
         let role = if r.node_id == head { "head" } else if standbys.contains(&r.node_id) { "standby" } else { "candidate" };
         let why = match p {
+            None if via.contains(&r.node_id) => if asleep.contains(&r.node_id) { "asleep" } else { "" },
             None => "not connected",
             Some(p) if p.virt => "virtual PC",
             Some(p) if p.out.is_none() => "not connected",
@@ -3141,6 +3221,120 @@ mod tests {
     }
 
     #[test]
+    fn pcs_behind_a_lab_head_are_candidates() {
+        let c = ctx();
+        c.store.upsert_node("pc-in-lab", "h1", "", "{}", 1).unwrap();
+        c.store.upsert_node("pc-offline", "h2", "", "{}", 1).unwrap();
+        c.sh.0.lock().unwrap().workers.insert(1, Worker { lab_pcs: vec!["pc-in-lab".into()], ..Default::default() });
+        let v = candidates(&c);
+        let get = |id: &str| v.iter().find(|x| x["node_id"] == id).unwrap().clone();
+        assert_eq!(get("pc-in-lab")["eligible"], true, "reachable through its lab head");
+        assert_eq!(get("pc-offline")["why"], "not connected");
+    }
+
+    fn blob_job(c: &Ctx, sha: &str) -> u64 {
+        c.store.put_blob(sha, 10, 0);
+        let sp = JobSpec { kind: KIND_LIST, items: vec![format!("@refs:{sha}|zAAAA")], chunk: 1, blobs: vec![sha.to_string()], arg: b"x".to_vec(), ..spec(1) };
+        submit(c, sp).unwrap().id
+    }
+    fn stage_worker(c: &Ctx, job: u64) {
+        let mut st = c.sh.0.lock().unwrap();
+        let w = Worker { addr: "a".into(), state: "active".into(), presence: "idle".into(), blob_rep: true, hello: Some(Hello { node_id: "n".into(), ..Default::default() }), ..Default::default() };
+        st.workers.insert(1, w);
+        assert!(take(&mut st, 1).is_none() && st.workers[&1].staged.is_some(), "reserved while its blobs are missing");
+        assert_eq!(st.jobs[&job].shards.len(), 1, "an @refs: item places its blob per chunk");
+    }
+    fn age_stage(c: &Ctx) {
+        c.sh.0.lock().unwrap().workers.get_mut(&1).unwrap().staged_at = Instant::now().checked_sub(Duration::from_secs(10_000));
+    }
+
+    #[test]
+    fn staged_chunk_is_restaged_then_given_back() {
+        let c = ctx();
+        let sha = crate::blobs::hex(&[5u8; 32]);
+        let job = blob_job(&c, &sha);
+        crate::blobs::test_meta(&sha);
+        stage_worker(&c, job);
+        age_stage(&c);
+        crate::blobs::stage_tick(&c);
+        assert_eq!(c.sh.0.lock().unwrap().workers[&1].staged_strikes, 1, "first timeout: fetch again from the head");
+        assert!(c.sh.0.lock().unwrap().workers[&1].staged.is_some());
+        age_stage(&c);
+        crate::blobs::stage_tick(&c);
+        let st = c.sh.0.lock().unwrap();
+        assert!(st.workers[&1].staged.is_none() && st.workers[&1].shunned.contains_key(&job), "second: the chunk goes back, this PC is off the job for a while");
+        assert_eq!(st.jobs[&job].requeue, vec![(0, 1)]);
+        assert!(!lab_ok(&st.workers[&1], &st.jobs[&job]));
+    }
+
+    #[test]
+    fn staged_chunk_whose_blob_left_the_head_fails_the_job() {
+        let c = ctx();
+        let sha = crate::blobs::hex(&[6u8; 32]);
+        let job = blob_job(&c, &sha); // no blob metadata on disk: the head cannot serve it
+        stage_worker(&c, job);
+        age_stage(&c);
+        crate::blobs::stage_tick(&c);
+        assert!(c.sh.0.lock().unwrap().workers[&1].staged.is_none());
+        let r = c.store.job(job).unwrap();
+        assert!(r.state == JobState::Failed && r.error.unwrap_or_default().contains("not on the head"), "{:?}", r.state);
+    }
+
+    #[test]
+    fn speculative_copy_only_goes_to_a_pc_that_has_the_blobs() {
+        let c = ctx();
+        let sha = crate::blobs::hex(&[8u8; 32]);
+        let job = blob_job(&c, &sha);
+        let mk = |have: bool| Worker { addr: "a".into(), state: "active".into(), presence: "idle".into(), blob_rep: true, hello: Some(Hello { node_id: "n".into(), ..Default::default() }), have: if have { [sha.clone()].into() } else { Default::default() }, ..Default::default() };
+        let mut st = c.sh.0.lock().unwrap();
+        st.workers.insert(2, mk(true));
+        let t = take(&mut st, 2).expect("holder gets the chunk");
+        let w2 = st.workers.get_mut(&2).unwrap();
+        w2.rate = 1.0;
+        w2.inflight.push((t.0, t.1, t.2));
+        w2.sent.insert((t.0, t.1, t.2), Instant::now().checked_sub(Duration::from_secs(1000)).unwrap());
+        st.rates.insert(("n".to_string(), KIND_LIST), 1.0);
+        st.workers.insert(1, mk(false));
+        assert!(speculate_take(&mut st, 1).is_none(), "job {job}: a PC without the shard would only fail the copy");
+        st.workers.insert(3, mk(true));
+        assert!(speculate_take(&mut st, 3).is_some(), "a PC with it may run the copy");
+    }
+
+    #[test]
+    fn max_pcs_is_shared_between_the_root_and_its_labs() {
+        let c = ctx();
+        {
+            let mut st = c.sh.0.lock().unwrap();
+            st.workers.insert(1, Worker { hello: Some(Hello { lab_head: Some(LabHello { lab: "A".into(), port: 1, api: 3, pcs: 6 }), ..Default::default() }), lab_pcs: (0..6).map(|i| format!("p{i}")).collect(), state: "active".into(), ..Default::default() });
+            st.workers.insert(2, Worker { hello: Some(Hello { lab_head: Some(LabHello { lab: "B".into(), port: 1, api: 3, pcs: 2 }), ..Default::default() }), lab_pcs: vec!["q0".into(), "q1".into()], state: "active".into(), ..Default::default() });
+        }
+        let st = c.sh.0.lock().unwrap();
+        assert_eq!(lab_share(&st, 0, 2), 0, "no limit stays no limit");
+        assert_eq!(lab_head_share(&st, 8, 6), 6);
+        assert_eq!(lab_head_share(&st, 8, 2), 2);
+        assert_eq!(lab_head_share(&st, 4, 2), 1, "a small cap still gives each lab one PC");
+        assert_eq!(lab_share(&st, 8, 2), 2, "two PCs at the root next to 8 behind labs");
+        drop(st);
+        let plain = ctx();
+        assert_eq!(lab_share(&plain.sh.0.lock().unwrap(), 5, 3), 5, "without lab heads max_pcs is untouched");
+    }
+
+    #[test]
+    fn every_kind_with_blobs_selector_and_max_pcs_is_leasable() {
+        let c = ctx();
+        let sha = crate::blobs::hex(&[7u8; 32]);
+        let job = blob_job(&c, &sha);
+        let sp = JobSpec { kind: KIND_CMD, arg: b"true".to_vec(), selector: "cores>=1".into(), max_pcs: 2, placement: "fastest".into(), ..spec(10) };
+        let j2 = submit(&c, sp).unwrap().id;
+        let sp = JobSpec { only: vec!["1.2.3.4".into()], ..spec(10) };
+        let j3 = submit(&c, sp).unwrap().id;
+        let st = c.sh.0.lock().unwrap();
+        assert!(st.jobs[&job].lease_ok && st.jobs[&j2].lease_ok, "list with blobs, cmd with selector / max_pcs / placement");
+        assert!(!st.jobs[&j3].lease_ok, "--only names PCs the root alone knows");
+        assert_eq!(st.jobs[&j2].selector_src, "cores>=1");
+    }
+
+    #[test]
     fn chunks_need_only_their_own_shard_blobs() {
         let c = ctx();
         let shas: Vec<String> = (1..=4u8).map(|i| crate::blobs::hex(&[i; 32])).collect();
@@ -3164,7 +3358,7 @@ mod tests {
         st.workers.insert(2, mk(&[]));
         assert!(take(&mut st, 2).is_none());
         let (_, a, b) = st.workers[&2].staged.expect("staged");
-        let need = crate::blobs::chunk_blobs(&st.jobs[&j.id].shared, &st.jobs[&j.id].shards, &st.jobs[&j.id].item_sha, a, b);
+        let need = crate::blobs::chunk_blobs(&st.jobs[&j.id].shared, &st.jobs[&j.id].shards, &st.jobs[&j.id].item_sha, st.jobs[&j.id].item_base, a, b);
         assert_eq!(need.len(), 2, "code + one shard, not all four: {need:?}");
         assert!(st.workers[&2].inflight.contains(&(j.id, a, b)), "a lost PC would requeue it");
         // once the blobs arrive the same chunk goes out

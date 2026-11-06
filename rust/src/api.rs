@@ -236,7 +236,7 @@ pub fn job_spec(v: &Value, who: &Who) -> Result<JobSpec, String> {
         None | Some(Value::Null) => false,
         Some(x) => x.as_bool().ok_or("preempt must be true or false")?,
     };
-    Ok(JobSpec { preempt, blobs, blob_mode, max_pcs, placement, mem_mb, name, kind: k, from, end, chunk, arg, only, submitter: who.name.clone(), selector, priority, policy, reducer, items })
+    Ok(JobSpec { preempt, blobs, blob_mode, max_pcs, placement, mem_mb, name, kind: k, from, end, chunk, arg, only, submitter: who.name.clone(), selector, priority, policy, reducer, items, item_base: 0 })
 }
 
 /// Fill in the estimated finish of a running job (SCH-03).

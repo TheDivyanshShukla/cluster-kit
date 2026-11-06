@@ -6,6 +6,9 @@ import hashlib, json, os, sys
 
 # ---- fast path (before the heavy imports below: pickle, zlib, typing... cost about 7 ms per process start): a task whose warm worker
 # is already up only needs hashlib/json/os/sys/socket here, hands its stdin to the worker and exits.
+_RUNNER_V = "2"  # bump when the line format changes (2: `@refs:` prefix): a warm worker from an older runner must not serve new lines
+
+
 def _code() -> "str":
     g = globals().get("PAYLOAD")
     if not g:  # code shipped as a blob: its sha is PAYLOAD_BLOB, the file is in the cache directory
@@ -33,7 +36,7 @@ def _warm_client(g: "str", data: "str", real: "Any") -> "tuple[int, Optional[tup
     d = _warm_dir()
     if d is None:
         return 0, None
-    key = hashlib.sha256((g + repr(globals().get("BATCH")) + "\0" + sys.executable + "\0" + sys.version).encode()).hexdigest()[:16]
+    key = hashlib.sha256((g + repr(globals().get("BATCH")) + "\0" + sys.executable + "\0" + sys.version + "\0" + _RUNNER_V).encode()).hexdigest()[:16]
     sp = os.path.join(d, key + ".s")
     got = 0
     try:
@@ -132,6 +135,8 @@ class _U(pickle.Unpickler):
 
 
 def dec(line: str) -> Any:
+    if line.startswith("@refs:"):  # `@refs:<sha>,<sha>|<codec line>`: the head reads the shas to place the item, the PC drops them
+        line = line.split("|", 1)[1]
     raw = base64.b64decode(line[1:])
     import io
     return _U(io.BytesIO(zlib.decompress(raw) if line[0] == "z" else raw)).load()

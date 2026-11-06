@@ -34,7 +34,7 @@ _cfg: Opts = {"head": os.environ.get("CK_HEAD", "http://127.0.0.1:7702"), "token
         "batch": True, "batch_s": 0.5, "push": True, "adaptive": True, "replan_min_s": 2.0, "history": True,
         "learn_last": 20, "fixed_s": 0.1, "item_c": 1e-5, "start_s": 0.03,
         # bulk distribution (docs/BULK.md): blob_auto_kb mirrors the head knob of the same name; result_head is how the PCs reach the head
-        "pc_python": None, "bulk": True, "blob_per_chunk": False, "blob_auto_kb": 64, "code_blob_kb": 8, "bulk_results": True, "result_head": None}
+        "pc_python": None, "bulk": True, "blob_per_chunk": True, "blob_auto_kb": 64, "code_blob_kb": 8, "bulk_results": True, "result_head": None}
 _OPTS = ("pcs", "placement", "priority", "selector", "local", "mem_mb", "timeout_s", "retries", "name", "batch", "adaptive", "history", "blob_per_chunk", "bulk")
 
 
@@ -244,8 +244,14 @@ def _cmd_for(fn: Callable[..., Any], mode: str, batch: bool) -> tuple[str, float
     return cmd, time.perf_counter() - t0, hs
 
 
+def _refs(x: Any, line: str, many: bool = False) -> str:
+    """`@refs:<sha>,..|line` when the item (or, `many`, any item of a batch) holds blob handles: the head then sends each blob only to the PCs that get the item."""
+    shas = sorted({h.sha for h in (_bulk.find(x) if not many else [h for y in x for h in _bulk.find(y)])})
+    return "@refs:" + ",".join(shas) + "|" + line if shas else line
+
+
 def _encode(items: Sequence[Any]) -> list[str]:
-    lines = [("@blob:" + x.sha) if isinstance(x, _bulk.Handle) else _runner.enc(x) for x in items]  # the head swaps `@blob:` for a path, and places by it
+    lines = [("@blob:" + x.sha) if isinstance(x, _bulk.Handle) else _refs(x, _runner.enc(x)) for x in items]  # the head swaps `@blob:` for a path, and places by it
     lim = _cfg["max_item_bytes"]
     for i, s in enumerate(lines):
         if len(s) > lim:
@@ -445,6 +451,9 @@ def _cluster_view(o: Opts) -> tuple[list[tuple[int, float | None]], int, float, 
     pcs = []
     for w in c.get("workers", []):
         if w.get("blocked") or (allowed is not None and w.get("node_id") not in allowed):
+            continue
+        if w.get("lab_pcs"):  # a lab head: plan over the PCs behind it (they are free to run, memory unknown)
+            pcs += [(p.get("threads") or 1, None) for p in w["lab_pcs"] if allowed is None or p.get("node_id") in allowed]
             continue
         th = w.get("threads") or 1
         cap = w.get("cap")
@@ -727,7 +736,7 @@ def _groups(items: Sequence[Any], size: int, limit: int) -> list[str]:
     out: list[str] = []
 
     def put(chunk: Sequence[Any]) -> None:
-        s = _runner.enc(chunk)
+        s = _refs(chunk, _runner.enc(chunk), True)
         if len(s) > limit and len(chunk) > 1:
             h = len(chunk) // 2
             put(chunk[:h])

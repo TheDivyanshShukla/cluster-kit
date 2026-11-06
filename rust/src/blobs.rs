@@ -53,6 +53,9 @@ pub fn store_dir() -> PathBuf {
 }
 /// Agent cache.
 pub fn cache_dir() -> PathBuf {
+    if crate::lab::active() {
+        return store_dir(); // a lab head's fetches from the root land in its blob store: it is the first source for its lab's PCs
+    }
     data_dir().join("cache")
 }
 pub fn blob_port() -> u16 {
@@ -662,7 +665,14 @@ pub static HEAD_IP: Mutex<String> = Mutex::new(String::new());
 /// Downloads in flight in this process -> the other connections that asked for the same blob meanwhile (virtual agents share one process and one
 /// cache; each connection must still hear "have" for it, or the head keeps waiting to stage a chunk on a PC that already holds the blob).
 static FETCHING: LazyLock<Mutex<HashMap<String, Vec<Arc<Mutex<Out>>>>>> = LazyLock::new(Default::default);
-static JOB_BLOBS: Mutex<Vec<(u64, Vec<String>, Option<(u16, String)>)>> = Mutex::new(Vec::new());
+/// (job, blobs, upload capability); `host` empty = the head this agent is connected to (a lab head points its PCs at the root).
+type Put = Option<(String, u16, String)>;
+static JOB_BLOBS: Mutex<Vec<(u64, Vec<String>, Put)>> = Mutex::new(Vec::new());
+
+/// The upload capability (host, port, token) the head that sent `job` gave this process (a lab head forwards it to its PCs).
+pub fn put_for(job: u64) -> Put {
+    JOB_BLOBS.lock().unwrap().iter().find(|x| x.0 == job).and_then(|x| x.2.clone())
+}
 
 /// Shas in the cache (complete files only).
 pub fn cached() -> Vec<String> {
@@ -725,7 +735,7 @@ pub fn agent_ctrl(v: &Value, w: &Arc<Mutex<Out>>) {
         if let (Some(id), Some(l)) = (j["id"].as_u64(), j["blobs"].as_array()) {
             let mut g = JOB_BLOBS.lock().unwrap();
             g.retain(|x| x.0 != id);
-            let put = j["put"]["port"].as_u64().zip(j["put"]["token"].as_str()).map(|(p, t)| (p as u16, t.to_string()));
+            let put = j["put"]["port"].as_u64().zip(j["put"]["token"].as_str()).map(|(p, t)| (j["put"]["host"].as_str().unwrap_or("").to_string(), p as u16, t.to_string()));
             g.push((id, l.iter().filter_map(|s| s.as_str().map(String::from)).collect(), put));
             if g.len() > 64 {
                 g.remove(0);
@@ -750,7 +760,7 @@ pub fn agent_ctrl(v: &Value, w: &Arc<Mutex<Out>>) {
             let m = Meta { sha: sha.clone(), size, piece, hashes };
             match fetch(&cache_dir(), &m, &srcs) {
                 Ok(g) => {
-                    let gone = evict(&cache_dir(), (crate::tune::get("blob_cache_gb") * 1073741824.0) as u64, &[sha.clone()]);
+                    let gone = if crate::lab::active() { crate::lab::blob_landed(&sha, size); vec![] } else { evict(&cache_dir(), (crate::tune::get("blob_cache_gb") * 1073741824.0) as u64, &[sha.clone()]) };
                     info_log("blob.fetch", json!({"sha": sha, "bytes": g.bytes, "peer_bytes": g.peer_bytes, "source": g.from, "ms": g.ms, "evicted": gone.len()}));
                     let waiting = FETCHING.lock().unwrap().remove(&sha).unwrap_or_default();
                     for o in &waiting {
@@ -787,9 +797,10 @@ pub fn env_for(job: u64) -> Vec<(String, String)> {
     let Some((l, put)) = JOB_BLOBS.lock().unwrap().iter().find(|x| x.0 == job).map(|x| (x.1.clone(), x.2.clone())) else { return vec![] };
     let dir = cache_dir();
     let mut e = vec![("CK_BLOBS".to_string(), dir.display().to_string())];
-    if let Some((port, tok)) = put {
+    if let Some((host, port, tok)) = put {
         // job-scoped upload capability for bulk results: valid for PUT /api/v1/blobs of this job only, until the job ends
-        e.push(("CK_BLOB_PUT_URL".into(), format!("http://{}:{port}/api/v1/blobs", HEAD_IP.lock().unwrap())));
+        let host = if host.is_empty() { HEAD_IP.lock().unwrap().clone() } else { host };
+        e.push(("CK_BLOB_PUT_URL".into(), format!("http://{host}:{port}/api/v1/blobs")));
         e.push(("CK_BLOB_PUT_TOKEN".into(), tok));
     }
     for (i, sha) in l.iter().enumerate() {
@@ -803,8 +814,8 @@ pub fn env_for(job: u64) -> Vec<(String, String)> {
 /// Agent: upload one output file to the head's blob store with the job's upload capability (JOB-08). Returns (sha, size).
 /// ponytail: one connection per file, streamed from disk; no resume (a failed upload fails the chunk, which is retried).
 pub fn upload_file(job: u64, path: &Path) -> Result<(String, u64), String> {
-    let (port, tok) = JOB_BLOBS.lock().unwrap().iter().find(|x| x.0 == job).and_then(|x| x.2.clone()).ok_or("the head sent no upload capability for this job")?;
-    let host = HEAD_IP.lock().unwrap().clone();
+    let (host, port, tok) = JOB_BLOBS.lock().unwrap().iter().find(|x| x.0 == job).and_then(|x| x.2.clone()).ok_or("the head sent no upload capability for this job")?;
+    let host = if host.is_empty() { HEAD_IP.lock().unwrap().clone() } else { host };
     let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let len = f.metadata().map_err(|e| e.to_string())?.len();
     let addr = (host.as_str(), port).to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("bad head address")?;
@@ -846,6 +857,15 @@ pub fn item_blob(item: &str) -> Option<&str> {
     item.strip_prefix("@blob:").and_then(|r| r.split(':').next()).filter(|s| valid_sha(s))
 }
 
+/// Every blob an item needs: `@blob:<sha>[:off:len]` (the head turns it into a path) or `@refs:<sha>,<sha>|<payload>` (the SDK:
+/// the payload is an opaque pickle that holds handles; only the PC that gets the item needs those blobs).
+pub fn item_blobs(item: &str) -> Vec<&str> {
+    if let Some(r) = item.strip_prefix("@refs:") {
+        return r.split('|').next().unwrap_or("").split(',').filter(|s| valid_sha(s)).collect();
+    }
+    item_blob(item).into_iter().collect()
+}
+
 // ------------------------------------------------- job-scoped upload token --
 static SECRET: LazyLock<[u8; 32]> = LazyLock::new(crate::auth::nonce);
 /// Capability for one job: valid only for PUT /api/v1/blobs while the job is unfinished (checked by the API). Never the user's token.
@@ -859,10 +879,11 @@ pub fn check_put_token(tok: &str) -> Option<u64> {
 }
 
 /// Distinct blobs chunk [a, b) needs: the job-wide ones plus the shards its items name.
-pub fn chunk_blobs(shared: &[String], shards: &[String], item_sha: &[u32], a: u64, b: u64) -> Vec<String> {
+pub fn chunk_blobs(shared: &[String], shards: &[String], item_sha: &[Vec<u32>], base: u64, a: u64, b: u64) -> Vec<String> {
     let mut v: Vec<String> = shared.to_vec();
-    for i in a..b.min(item_sha.len() as u64) {
-        if let Some(k) = item_sha[i as usize].checked_sub(1) {
+    let (lo, hi) = (a.saturating_sub(base), b.saturating_sub(base).min(item_sha.len() as u64));
+    for i in lo..hi {
+        for k in item_sha[i as usize].iter().filter_map(|k| k.checked_sub(1)) {
             let s = &shards[k as usize];
             if !v.contains(s) {
                 v.push(s.clone());
@@ -1067,6 +1088,11 @@ static METAS: LazyLock<Mutex<HashMap<String, Arc<Meta>>>> = LazyLock::new(Defaul
 static UPLINK: Mutex<f64> = Mutex::new(0.0);
 static WINDOW: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
 
+#[cfg(test)]
+pub fn test_meta(sha: &str) {
+    METAS.lock().unwrap().insert(sha.into(), Arc::new(Meta { sha: sha.into(), size: 10, piece: 10, hashes: vec![[0; 32]] }));
+}
+
 pub fn meta_of(ctx: &Ctx, sha: &str) -> Option<Arc<Meta>> {
     if let Some(m) = METAS.lock().unwrap().get(sha) {
         return Some(m.clone());
@@ -1203,9 +1229,55 @@ pub fn is_ctrl(v: &Value) -> bool {
 pub fn stage_tick(ctx: &Ctx) {
     observe_uplink(ctx);
     let mut sends: Vec<(Arc<Mutex<Out>>, Value)> = vec![];
+    let mut pending_fail: Vec<(u64, String)> = vec![];
     {
         let mut st = ctx.sh.0.lock().unwrap();
         let st = &mut *st;
+        // A reserved chunk whose blobs do not land (a peer died mid-transfer, the fetch answer was lost, the blob is gone from the head):
+        // first re-stage it from the head alone, then give the chunk to another PC and keep this one off the job for a while.
+        let limit = crate::tune::secs("stage_timeout_s");
+        let mut hopeless: Vec<(u64, String)> = vec![];
+        let mut back: Vec<(u64, u64, u64)> = vec![];
+        for (wid, w) in st.workers.iter_mut() {
+            let (Some((jid, a, b)), Some(t)) = (w.staged, w.staged_at) else { continue };
+            let Some(j) = st.jobs.get(&jid) else { continue };
+            let missing: Vec<String> = chunk_blobs(&j.shared, &j.shards, &j.item_sha, j.item_base, a, b).into_iter().filter(|s| !w.have.contains(s)).collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let bytes: u64 = missing.iter().filter_map(|s| ctx.store.blob_size(s)).sum();
+            if t.elapsed() < limit + Duration::from_secs_f64(bytes as f64 / 2e6) {
+                continue;
+            }
+            let node = w.hello.as_ref().map_or(w.addr.clone(), |h| h.node_id.clone());
+            let gone = missing.iter().find(|s| meta_of(ctx, s).is_none());
+            if w.staged_strikes == 0 && gone.is_none() {
+                w.fetching.retain(|s, _| !missing.contains(s));
+                w.avoid.insert(u64::MAX); // the next fetch comes from the head, not from a peer
+                (w.staged_strikes, w.staged_at) = (1, Some(Instant::now()));
+                crate::head::event(ctx, "blob.restage", "head", &format!("job {jid} chunk {a}..{b} on {node}: {} blob(s) did not arrive in {:.0} s, fetching again from the head", missing.len(), t.elapsed().as_secs_f64()));
+                continue;
+            }
+            if let Some(g) = gone {
+                hopeless.push((jid, format!("blob {} is not on the head any more (it never reached {node}); upload it again and resubmit", &g[..12.min(g.len())])));
+            }
+            w.staged = None;
+            w.inflight.retain(|x| *x != (jid, a, b));
+            w.shunned.insert(jid, Instant::now());
+            back.push((jid, a, b));
+            crate::head::event(ctx, "blob.stage_timeout", "head", &format!("job {jid} chunk {a}..{b} given back: node {node} still lacked {} blob(s) after {:.0} s", missing.len(), t.elapsed().as_secs_f64()));
+            let _ = wid;
+        }
+        for (jid, a, b) in back {
+            if let Some(j) = st.jobs.get_mut(&jid) {
+                j.requeue.push((a, b));
+                j.requeue.sort_by(|x, y| y.cmp(x)); // lowest last
+            }
+            ctx.sh.1.notify_all();
+        }
+        for (jid, msg) in hopeless {
+            pending_fail.push((jid, msg));
+        }
         // sha -> (mode, wids that need it): blobs of the chunk each PC has reserved (head::take stages it)
         let mut need: HashMap<String, (String, Vec<u64>)> = HashMap::new();
         for (wid, w) in st.workers.iter() {
@@ -1214,7 +1286,7 @@ pub fn stage_tick(ctx: &Ctx) {
             if !real(w) {
                 continue;
             }
-            for sha in chunk_blobs(&j.shared, &j.shards, &j.item_sha, a, b).into_iter().filter(|s| !w.have.contains(s) && !w.fetching.contains_key(s)) {
+            for sha in chunk_blobs(&j.shared, &j.shards, &j.item_sha, j.item_base, a, b).into_iter().filter(|s| !w.have.contains(s) && !w.fetching.contains_key(s)) {
                 let e = need.entry(sha).or_insert_with(|| (j.blob_mode.clone(), vec![]));
                 if !e.1.contains(wid) {
                     e.1.push(*wid);
@@ -1303,6 +1375,12 @@ pub fn stage_tick(ctx: &Ctx) {
     }
     for (o, v) in sends {
         let _ = o.lock().unwrap().put(proto::CTRL, v.to_string().as_bytes());
+    }
+    let mut seen = HashSet::new();
+    for (jid, msg) in pending_fail {
+        if seen.insert(jid) {
+            crate::head::fail_job(ctx, jid, &msg);
+        }
     }
 }
 
@@ -1658,9 +1736,19 @@ mod tests {
         assert_eq!(check_put_token("cbp.7.00"), None);
         assert_eq!(check_put_token("sometoken"), None);
         let (sh, shards) = (vec!["code".to_string()], vec!["s1".to_string(), "s2".to_string()]);
-        assert_eq!(chunk_blobs(&sh, &shards, &[1, 2, 0, 1], 0, 4), vec!["code", "s1", "s2"]);
-        assert_eq!(chunk_blobs(&sh, &shards, &[1, 2, 0, 1], 2, 3), vec!["code"]);
-        assert_eq!(chunk_blobs(&sh, &shards, &[1, 2], 1, 99), vec!["code", "s2"], "range past the end is clipped");
+        assert_eq!(chunk_blobs(&sh, &shards, &[vec![1], vec![2], vec![], vec![1]], 0, 0, 4), vec!["code", "s1", "s2"]);
+        assert_eq!(chunk_blobs(&sh, &shards, &[vec![1], vec![2], vec![], vec![1]], 0, 2, 3), vec!["code"]);
+        assert_eq!(chunk_blobs(&sh, &shards, &[vec![1], vec![2]], 0, 1, 99), vec!["code", "s2"], "range past the end is clipped");
+        assert_eq!(chunk_blobs(&sh, &shards, &[vec![1, 2], vec![]], 100, 100, 101), vec!["code", "s1", "s2"], "an item may name several blobs; ranges count from the base");
+    }
+
+    #[test]
+    fn items_name_their_blobs() {
+        let (a, b) = ("ab".repeat(32), "cd".repeat(32));
+        assert_eq!(item_blobs(&format!("@blob:{a}:0:5")), vec![a.as_str()]);
+        assert_eq!(item_blobs(&format!("@refs:{a},{b}|zAAAA")), vec![a.as_str(), b.as_str()]);
+        assert_eq!(item_blobs(&format!("@refs:{a},nothex|zAAAA")), vec![a.as_str()]);
+        assert!(item_blobs("zAAAA").is_empty() && item_blobs("@refs:|p").is_empty());
     }
 
     #[test]

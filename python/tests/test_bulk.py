@@ -247,15 +247,26 @@ class B(unittest.TestCase):
         x.at(4)
         self.assertEqual(len(self.head.est_calls), 1)  # memoised
 
+    def test_items_with_handles_inside_name_their_blobs(self):
+        a, b = _bulk.from_bytes(b"shard-a" * 50), _bulk.from_bytes(b"shard-b" * 50)
+        lines = ck._encode([(1, a), (2, {"x": b}), 3, a])  # a tuple, a dict inside, a plain item, a bare handle
+        self.assertTrue(lines[0].startswith(f"@refs:{a.sha}|"), lines[0][:90])
+        self.assertTrue(lines[1].startswith(f"@refs:{b.sha}|"), lines[1][:90])
+        self.assertEqual(lines[3], "@blob:" + a.sha)
+        self.assertFalse(lines[2].startswith("@"))
+        self.assertEqual(_runner.dec(lines[0]), (1, {"__ck_blob__": a.sha}))  # the runner drops the prefix (a handle is a marker dict on the PC)
+        batch = ck._groups([(1, a), (2, b)], 2, 1 << 20)
+        self.assertEqual(batch[0].split("|")[0], "@refs:" + ",".join(sorted([a.sha, b.sha])))
+
     def test_plan_has_transfer_and_strategy(self):
         p = self.file(2000)
         hs = ck.shard(p, 20)
         self.head.workers = [{"threads": 4, "mem_total": 8 << 30, "mem_used": 1 << 30, "node_id": f"n{i}"} for i in range(8)]
         self.head.net = {"head_uplink_mbps": 80, "nodes": [{"net_mbps": 80}] * 8, "labs": [{"lab": "a", "pcs": 8}]}  # 10 MB/s: slow
         ck.config(local="never")
-        pl0 = ck.plan(bigfns.lines, hs)  # today's head: every PC that gets a chunk holds all the job's blobs
+        pl0 = ck.plan(bigfns.lines, hs, blob_per_chunk=False)  # a head from before `@refs:` items: every PC that gets a chunk holds all the job's blobs
         self.assertEqual((pl0.shared_bytes, pl0.item_bytes), (os.path.getsize(p), 0))
-        pl = ck.plan(bigfns.lines, hs, blob_per_chunk=True)
+        pl = ck.plan(bigfns.lines, hs)  # the default: each shard goes only to the PC that runs its item
         self.assertEqual(pl.item_bytes, os.path.getsize(p))
         self.assertGreater(pl.bytes, 0)
         self.assertIn(pl.strategy, ("direct", "peer"))
@@ -264,7 +275,7 @@ class B(unittest.TestCase):
         self.assertIn("to move", pl.transfer())
         # cached on a PC already: counts as moved
         self.head.holders = {h.sha: 1 for h in hs}
-        pl2 = ck.plan(bigfns.lines, hs, blob_per_chunk=True)
+        pl2 = ck.plan(bigfns.lines, hs)
         self.assertEqual(pl2.item_bytes, 0)
 
     def test_transfer_dominates_advice(self):

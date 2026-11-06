@@ -18,7 +18,7 @@ pub fn ui_file(path: &str) -> Option<&'static (&'static str, &'static str, &'sta
 
 pub fn worker_json(id: u64, w: &Worker) -> serde_json::Value {
     let h = w.hello.as_ref();
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "id": id, "addr": w.addr, "threads": w.threads, "chunks": w.chunks, "numbers": w.numbers,
         "secs": (w.secs * 1e6).round() / 1e6, "rate": w.rate.round(), "busy": !w.inflight.is_empty(),
         "cpu": (w.cpu * 10.0).round() / 10.0, "mem_used": w.mem_used, "mem_total": w.mem_total,
@@ -26,7 +26,12 @@ pub fn worker_json(id: u64, w: &Worker) -> serde_json::Value {
         "jobs_inflight": w.inflight.iter().map(|t| t.0).collect::<Vec<u64>>(),
         "virtual": h.is_some_and(|h| h.virtual_node), "inv": h.map(|h| &h.inv),
         "presence": if w.presence.is_empty() { "idle" } else { w.presence.as_str() }, "blocked": w.blocked, "cap": w.cap, "energy_j": w.energy_j,
-    })
+    });
+    if crate::head::lab_of(w).is_some() {
+        // a lab head stands for its PCs: the SDK plans over them, not over one big worker
+        v["lab_pcs"] = serde_json::json!(w.lab_stat["pcs"].as_array().into_iter().flatten().take(5000).map(|p| serde_json::json!({"node_id": p["id"], "threads": p["threads"]})).collect::<Vec<_>>());
+    }
+    v
 }
 
 pub fn stats(sh: &Shared, detail: bool) -> String {

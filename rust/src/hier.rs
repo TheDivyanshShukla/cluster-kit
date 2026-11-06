@@ -155,6 +155,24 @@ pub fn lab_ctrl(ctx: &Ctx, wid: u64, v: &Value) {
             lease_done(ctx, wid, j, a, b, d["secs"].as_f64().unwrap_or(0.0), d["rate"].as_f64().unwrap_or(0.0));
         }
     }
+    if let Some(d) = v.get("lease_decline") {
+        // the lab has no PC that may run this job (selector): the range goes back to the queue and the job stops being offered to it
+        if let (Some(j), Some(a), Some(b)) = (d["job"].as_u64(), d["a"].as_u64(), d["b"].as_u64()) {
+            let mut st = ctx.sh.0.lock().unwrap();
+            let out = st.workers.get_mut(&wid).map(|w| {
+                drop_within(w, j, a, b);
+                w.declined.insert(j);
+                w.out.clone()
+            });
+            if st.jobs.contains_key(&j) {
+                let g = gaps(a, b, &ctx.store.done_in(j, a, b));
+                requeue_missing(&mut st, j, g);
+            }
+            ctx.sh.1.notify_all();
+            drop(st);
+            flush(out.flatten().map(|o| vec![(o, ACK, pack(&[j, a, b]))]).unwrap_or_default());
+        }
+    }
     if let Some(l) = v["lab_head_failed"].as_str() {
         event(ctx, "hier.recruit", "head", &format!("a PC could not start a lab head: {l}"));
     }
@@ -516,7 +534,7 @@ fn recall(ctx: &Ctx, wid: u64) {
     let mut st = ctx.sh.0.lock().unwrap();
     let Some(w) = st.workers.get_mut(&wid) else { return };
     let gone = std::mem::take(&mut w.inflight);
-    w.sent.clear();
+    (w.sent.clear(), w.staged = None);
     let out = w.out.clone();
     for t in &gone {
         if st.jobs.contains_key(&t.0) {
@@ -735,7 +753,7 @@ mod lease_tests {
     fn fake_job(ok: bool) -> crate::head::Job {
         crate::head::Job { id: 1, kind: KIND_SYNTH, arg: vec![], next: 0, end: 10, chunk: 1, total: 10, left: 10, todo: 10, requeue: vec![], only: vec![], started: Instant::now(),
             selector: Default::default(), priority: 2, user: String::new(), policy: crate::sched::ChunkPolicy::Adaptive, max_pcs: 0, placement: String::new(), mem_mb: 0, blobs: vec![],
-            blob_mode: String::new(), shared: vec![], shards: vec![], item_sha: vec![], lease_ok: ok, chunk_set: 0 }
+            blob_mode: String::new(), shared: vec![], shards: vec![], item_sha: vec![], item_base: 0, selector_src: String::new(), lease_ok: ok, chunk_set: 0 }
     }
 
     #[test]

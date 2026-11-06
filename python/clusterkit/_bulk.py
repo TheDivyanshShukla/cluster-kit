@@ -244,8 +244,8 @@ def holders(ck: Any) -> dict[str, int]:
 
 
 def account(items: Sequence[Any], extra: Sequence[Handle[Any]], held: dict[str, int], per_chunk: bool = False) -> tuple[int, int, int]:
-    """(shared bytes, per-item bytes, distinct blobs). Today's head makes every PC that gets a chunk hold ALL the job's blobs, so all
-    bytes are shared (per_chunk=False). With a head that fetches only what a chunk's items name (per_chunk=True): blobs used by several
+    """(shared bytes, per-item bytes, distinct blobs). A head from before the `@refs:` items made every PC that gets a chunk hold ALL the
+    job's blobs, so all bytes are shared (per_chunk=False). A head that fetches only what a chunk's items name (per_chunk=True, the default): blobs used by several
     items (and code/data blobs) go to every PC that runs something, a blob used by one item goes to the PC that gets it.
     Blobs some PC already caches count as moved already."""
     cnt, hs = Counter(), {}
