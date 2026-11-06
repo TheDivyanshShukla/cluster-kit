@@ -48,6 +48,8 @@ export class LiveEngine {
 	padTop = 0;
 	layer: Layer = 'status';
 	selected: string | null = null;
+	/** keyboard focus ring (set only while the canvas has focus) */
+	focused: string | null = null;
 	follow: number | null = null;
 	bundles = false;
 	lod: Lod = 'square';
@@ -204,6 +206,10 @@ export class LiveEngine {
 	}
 	setSelected(id: string | null) {
 		this.selected = id;
+		this.dirty = true;
+	}
+	setFocused(id: string | null) {
+		this.focused = id;
 		this.dirty = true;
 	}
 	/** minimap click: the world point under it, or null when the click is elsewhere */
@@ -654,6 +660,20 @@ export class LiveEngine {
 			ctx.globalAlpha = 1;
 			ctx.beginPath();
 			ctx.roundRect(s.x - r, s.y - r, r * 2, r * 2, 5);
+			ctx.stroke();
+		}
+		const fi = this.focused ? this.scene.index.get(this.focused) : null;
+		if (fi != null) {
+			const s = pcs[fi];
+			const r = half(fi) + 7;
+			const w = 3 / Math.max(1, k * 0.7);
+			ctx.lineWidth = w + 3 / Math.max(1, k * 0.7);
+			ctx.strokeStyle = T.surface;
+			ctx.beginPath();
+			ctx.roundRect(s.x - r, s.y - r, r * 2, r * 2, 6);
+			ctx.stroke();
+			ctx.lineWidth = w;
+			ctx.strokeStyle = T.fg;
 			ctx.stroke();
 		}
 	}

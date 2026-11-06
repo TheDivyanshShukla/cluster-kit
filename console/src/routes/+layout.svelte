@@ -1,7 +1,8 @@
 <script lang="ts">
 	import '../app.css';
 	import { page } from '$app/state';
-	import { Bell, Hexagon, Lightbulb, CalendarClock, CircleAlert, FileText, FlaskConical, Gauge, Sigma, Search, ListChecks, Radio, LogOut, Map as MapIcon, Moon, MonitorPlay, Network, Server, Settings, SlidersHorizontal, Sun, User as UserIcon, Users, WifiOff } from '@lucide/svelte';
+	import { Bell, Hexagon, Lightbulb, CalendarClock, CircleAlert, FileText, FlaskConical, Gauge, Sigma, Search, Volume2, VolumeX, ListChecks, Radio, LogOut, Map as MapIcon, Moon, MonitorPlay, Network, Server, Settings, SlidersHorizontal, Sun, User as UserIcon, Users, WifiOff } from '@lucide/svelte';
+	import { untrack } from 'svelte';
 	import type { LayoutProps } from './$types';
 	import AuthForm from '#lib/components/AuthForm.svelte';
 	import CommandPalette from '#lib/components/CommandPalette.svelte';
@@ -13,6 +14,7 @@
 	import { authed, loadMe, roleNow, session, signOut, userNow } from '#lib/session.svelte.ts';
 	import { palette } from '#lib/palette.svelte.ts';
 	import { btnGhost } from '#lib/ui.ts';
+	import { announceFor, drain, loadEnabled, MAX_AGE_MS, newLimiter, push, saveEnabled, waitMs } from '#lib/announce.ts';
 	import { openCount, suggestionsText } from '#lib/advisor.ts';
 
 	let { children }: LayoutProps = $props();
@@ -23,6 +25,36 @@
 	$effect(() => {
 		const c = live.cluster;
 		if (c) history.push(c.workers, Date.now());
+	});
+
+	// one polite status region: a few meaningful events, at most one message per few seconds
+	let announce = $state(loadEnabled());
+	let said = $state('');
+	const lim = newLimiter();
+	let seenId = -1;
+	let drainT: ReturnType<typeof setTimeout> | undefined;
+	function say(t: string | null) {
+		if (t) said = t;
+	}
+	function toggleAnnounce() {
+		announce = !announce;
+		saveEnabled(announce);
+		lim.pending = [];
+		said = announce ? 'Announcements on' : 'Announcements off';
+	}
+	$effect(() => {
+		const evs = live.events;
+		untrack(() => {
+			const fresh = evs.filter((e) => e.id > seenId).reverse();
+			seenId = Math.max(seenId, ...evs.map((e) => e.id));
+			if (!announce) return;
+			for (const e of fresh) {
+				const m = Date.now() - e.ts_ms < MAX_AGE_MS ? announceFor(e) : null;
+				if (m) say(push(lim, m, Date.now()));
+			}
+			clearTimeout(drainT);
+			if (lim.pending.length) drainT = setTimeout(() => say(drain(lim, Date.now())), waitMs(lim, Date.now()) + 50);
+		});
 	});
 
 	const nav = $derived(
@@ -120,6 +152,17 @@
 				</p>
 				<button
 					type="button"
+					onclick={toggleAnnounce}
+					aria-pressed={announce}
+					class="text-muted-foreground hover:bg-raised hover:text-foreground flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] md:py-1.5"
+					aria-label="Announce changes to screen readers"
+					title="Announce job results, lost PCs, failover and cut-off lab heads to screen readers"
+				>
+					{#if announce}<Volume2 class="size-4" strokeWidth={1.75} aria-hidden="true" />{:else}<VolumeX class="size-4" strokeWidth={1.75} aria-hidden="true" />{/if}
+					<span class="hidden md:inline">Announce {announce ? 'on' : 'off'}</span>
+				</button>
+				<button
+					type="button"
 					onclick={toggleTheme}
 					class="text-muted-foreground hover:bg-raised hover:text-foreground flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] md:py-1.5"
 					aria-label={dark ? 'Switch to light theme' : 'Switch to dark theme'}
@@ -160,6 +203,7 @@
 {/if}
 
 {#if authed()}<CommandPalette />{/if}
+<p class="sr-only" role="status" aria-live="polite" aria-atomic="true">{said}</p>
 
 <!-- the page never scrolls: panels do (docs/DESIGN.md section 8) -->
 <style>

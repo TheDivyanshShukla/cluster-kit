@@ -59,7 +59,8 @@
 		{#if node}<span class="ml-auto"><NodeStateChip state={node.state} online={node.online} power={node.power} id={node.node_id} /></span>{/if}
 		<button type="button" class="text-muted-foreground hover:text-foreground inline-flex size-8 items-center justify-center" aria-label="Close" onclick={onclose}><X class="size-4" aria-hidden="true" /></button>
 	</div>
-	<div class="thin min-h-0 flex-1 overflow-auto p-3 text-[13px]">
+	<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+	<div class="thin min-h-0 flex-1 overflow-auto p-3 text-[13px]" tabindex="0" role="region" aria-label="PC details">
 		{#if !node}
 			<p class="text-muted-foreground">This PC is no longer registered.</p>
 		{:else if tab === 'Info'}

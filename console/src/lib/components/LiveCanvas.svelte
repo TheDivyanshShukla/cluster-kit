@@ -6,6 +6,7 @@
 	import { decodeView, encodeView, HEAT_GRADIENT, isLayer, LAYER_LABEL, LAYERS, legendFor, type Layer } from '#lib/canvas/layers.ts';
 	import { params, patchQuery } from '#lib/urlstate.svelte.ts';
 	import { idsIn, hostIndex } from '#lib/canvas/effects.ts';
+	import { moveFocus, type Dir } from '#lib/canvas/focus.ts';
 	import { LiveEngine } from '#lib/canvas/engine.ts';
 	import { headAt, rewind, type NodeSnap } from '#lib/canvas/replay.ts';
 	import { parseSelector } from '#lib/canvas/select.ts';
@@ -312,6 +313,40 @@
 		return () => c.removeEventListener('wheel', wheel);
 	});
 
+	// ---- keyboard: the canvas is one tab stop; arrows move between PCs, Enter opens what a click opens.
+	// aria-activedescendant points at the hidden option list below; the ring is drawn on the canvas.
+	let kbFocus = $state<string | null>(null);
+	let hasFocus = $state(false);
+	const KEYS: Record<string, Dir> = { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down' };
+	const kbItems = $derived(engine && total + counts.busy + counts.lost + counts.asleep >= 0 ? engine.items.slice(0, 300) : []); // items is mutated in place: re-read when the counts move
+	const kbPcs = () => (engine?.scene.pcs ?? []).slice(0, 300);
+	const optId = (id: string) => `ck-pc-${id.replace(/[^\w-]/g, '_')}`;
+	$effect(() => engine?.setFocused(hasFocus && !wall ? kbFocus : null));
+	function reveal(id: string) {
+		const e = engine, i = e?.scene.index.get(id);
+		if (!e || i == null) return;
+		const s = e.screenOf(id)!;
+		if (s.x < 16 || s.y < e.padTop + 8 || s.x > e.w - 16 || s.y > e.h - e.padBottom - 8) e.centerOn(e.scene.pcs[i].x, e.scene.pcs[i].y);
+	}
+	function key(ev: KeyboardEvent) {
+		if (wall || !engine || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+		const pcs = kbPcs();
+		let next: string | null | undefined;
+		if (KEYS[ev.key]) next = moveFocus(pcs, kbFocus, KEYS[ev.key]);
+		else if (ev.key === 'Home') next = pcs[0]?.id;
+		else if (ev.key === 'End') next = pcs.at(-1)?.id;
+		else if ((ev.key === 'Enter' || ev.key === ' ') && kbFocus) {
+			ev.preventDefault();
+			return onpick?.(kbFocus);
+		} else return;
+		ev.preventDefault();
+		if (next) (kbFocus = next), reveal(next);
+	}
+	function focusIn() {
+		hasFocus = true;
+		if (!kbFocus || !engine?.scene.index.has(kbFocus)) kbFocus = selected && engine?.scene.index.has(selected) ? selected : (kbPcs()[0]?.id ?? null);
+	}
+
 	// ---- tooltip content
 	const tipInfo = $derived.by(() => {
 		if (!tip || !engine) return null;
@@ -354,10 +389,17 @@
 </script>
 
 <div bind:this={wrap} class="relative size-full min-h-0 overflow-hidden rounded-lg">
+	<!-- svelte-ignore a11y_no_interactive_element_to_noninteractive_role -->
 	<canvas
 		bind:this={canvas}
 		class="absolute inset-0 size-full {wall ? '' : 'cursor-grab touch-none active:cursor-grabbing'} {frozen ? 'opacity-50 grayscale' : ''} transition-[opacity,filter]"
-		aria-hidden="true"
+		role="application"
+		tabindex={wall || compact ? -1 : 0}
+		aria-label="Live map of labs and PCs. Arrow keys move between PCs, Enter opens the PC."
+		aria-activedescendant={kbFocus && hasFocus ? optId(kbFocus) : undefined}
+		onkeydown={key}
+		onfocus={focusIn}
+		onblur={() => (hasFocus = false)}
 		onpointerdown={down}
 		onpointermove={move}
 		onpointerup={up}
@@ -366,6 +408,20 @@
 		ondblclick={() => !wall && engine?.resetView()}
 	></canvas>
 	<p class="sr-only" aria-live="polite">{summary}</p>
+	{#if !wall && !compact}
+		<ul class="sr-only" role="listbox" aria-label="PCs on the live map">
+			{#each kbItems as it (it.node.node_id)}
+				<li id={optId(it.node.node_id)} role="option" aria-selected={kbFocus === it.node.node_id}>{it.node.host}, {it.node.online ? it.node.state : 'offline'}</li>
+			{/each}
+		</ul>
+	{/if}
+	{#if !wall && !compact}
+		<ul class="sr-only" role="listbox" aria-label="PCs on the live map">
+			{#each kbItems as it (it.node.node_id)}
+				<li id={optId(it.node.node_id)} role="option" aria-selected={kbFocus === it.node.node_id}>{it.node.host}, {it.node.online ? it.node.state : 'offline'}</li>
+			{/each}
+		</ul>
+	{/if}
 	{#if !wall}
 		<details class="bg-surface border-line sr-only z-30 rounded-lg border focus-within:not-sr-only focus-within:absolute focus-within:top-2 focus-within:left-2" ontoggle={(e) => (listOpen = e.currentTarget.open)}>
 			<summary class="cursor-pointer px-3 py-1.5 text-xs font-medium">PCs as a list ({total})</summary>
