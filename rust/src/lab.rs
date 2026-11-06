@@ -665,7 +665,7 @@ pub fn status(ctx: &Ctx) -> serde_json::Value {
         let st = ctx.sh.0.lock().unwrap();
         let pcs: Vec<serde_json::Value> = st.workers.values().take(5000).map(|w| serde_json::json!({
             "id": w.hello.as_ref().map(|h| h.node_id.as_str()).unwrap_or(&w.addr), "host": w.hello.as_ref().map(|h| h.host.as_str()).unwrap_or(""),
-            "threads": w.threads, "busy": !w.inflight.is_empty()})).collect();
+            "threads": w.threads, "busy": !w.inflight.is_empty(), "virtual": w.hello.as_ref().is_some_and(|h| h.virtual_node)})).collect();
         (pcs, st.workers.values().map(|w| w.threads as u64).sum::<u64>(), st.workers.values().map(|w| w.calib).sum::<f64>(), st.workers.values().map(|w| w.inflight.len()).sum::<usize>())
     };
     let g = lab();

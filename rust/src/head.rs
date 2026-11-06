@@ -2831,7 +2831,14 @@ pub(crate) fn cand_list(ctx: &Ctx, sel: &Selector) -> Vec<Cand> {
         let st = ctx.sh.0.lock().unwrap();
         st.workers.values().filter_map(|w| Some((w.hello.as_ref()?.node_id.clone(), (w.calib, w.presence == "busy")))).collect()
     };
-    let via: std::collections::HashSet<String> = ctx.sh.0.lock().unwrap().workers.values().flat_map(|w| w.lab_pcs.iter().cloned()).collect(); // PCs behind a lab head are reachable
+    let (via, via_virt, lab_heads) = {
+        let st = ctx.sh.0.lock().unwrap();
+        let via: std::collections::HashSet<String> = st.workers.values().flat_map(|w| w.lab_pcs.iter().cloned()).collect(); // PCs behind a lab head are reachable
+        let virt: std::collections::HashSet<String> = st.workers.values().flat_map(|w| w.lab_stat["pcs"].as_array().into_iter().flatten())
+            .filter(|p| p["virtual"] == true).filter_map(|p| p["id"].as_str().map(String::from)).collect();
+        let lh: std::collections::HashSet<String> = st.workers.values().filter(|w| lab_of(w).is_some()).filter_map(|w| Some(w.hello.as_ref()?.node_id.clone())).collect();
+        (via, virt, lh)
+    };
     let (head, standbys) = (crate::identity::node_id(), crate::repl::standby_nodes(ctx));
     let asleep = pw_ctx(ctx).asleep.clone();
     let lost = losses_24h(ctx);
@@ -2851,7 +2858,9 @@ pub(crate) fn cand_list(ctx: &Ctx, sel: &Selector) -> Vec<Cand> {
         let p = peers.iter().find(|p| p.id == r.node_id);
         let role = if r.node_id == head { "head" } else if standbys.contains(&r.node_id) { "standby" } else { "candidate" };
         let why = match p {
-            None if via.contains(&r.node_id) => if asleep.contains(&r.node_id) { "asleep" } else { "" },
+            _ if lab_heads.contains(&r.node_id) => "already a lab head",
+            // ponytail: the root has no attrs for PCs behind a lab head, so the standby selector is not checked for them
+            None if via.contains(&r.node_id) => if via_virt.contains(&r.node_id) { "virtual PC" } else if asleep.contains(&r.node_id) { "asleep" } else { "" },
             None => "not connected",
             Some(p) if p.virt => "virtual PC",
             Some(p) if p.out.is_none() => "not connected",
@@ -3225,11 +3234,14 @@ mod tests {
         let c = ctx();
         c.store.upsert_node("pc-in-lab", "h1", "", "{}", 1).unwrap();
         c.store.upsert_node("pc-offline", "h2", "", "{}", 1).unwrap();
-        c.sh.0.lock().unwrap().workers.insert(1, Worker { lab_pcs: vec!["pc-in-lab".into()], ..Default::default() });
+        c.store.upsert_node("pc-virt", "h3", "", "{}", 1).unwrap();
+        c.sh.0.lock().unwrap().workers.insert(1, Worker { lab_pcs: vec!["pc-in-lab".into(), "pc-virt".into()],
+            lab_stat: serde_json::json!({"pcs": [{"id": "pc-virt", "virtual": true}]}), ..Default::default() });
         let v = candidates(&c);
         let get = |id: &str| v.iter().find(|x| x["node_id"] == id).unwrap().clone();
         assert_eq!(get("pc-in-lab")["eligible"], true, "reachable through its lab head");
         assert_eq!(get("pc-offline")["why"], "not connected");
+        assert_eq!(get("pc-virt")["why"], "virtual PC", "a virtual PC behind a lab head is never recommended");
     }
 
     fn blob_job(c: &Ctx, sha: &str) -> u64 {
