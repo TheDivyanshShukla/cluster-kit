@@ -1,0 +1,1 @@
+import{_ as e,v as t}from"./Cdxv086n.js";import{w as n}from"./CarwWTB4.js";var r={name:`gauge`,size:24,node:[[`path`,{d:`m12 14 4-4`}],[`path`,{d:`M3.34 19a10 10 0 1 1 17.32 0`}]]};r.node;var i=new Set([`$$slots`,`$$events`,`$$legacy`]);function a(a,o){let s=e(o,i);n(a,t(()=>s,{get icon(){return r}}))}export{a as t};

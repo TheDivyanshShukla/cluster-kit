@@ -64,7 +64,7 @@
 	}
 
 	let menu = $state<HTMLDetailsElement>();
-	const online = $derived(live.cluster?.workers.length ?? 0);
+	const online = $derived((live.cluster?.workers ?? []).reduce((n, w) => n + (w.lab_pcs ? w.lab_pcs.length : 1), 0)); // a lab head stands for its PCs
 </script>
 
 <svelte:head><title>Cluster Kit</title></svelte:head>

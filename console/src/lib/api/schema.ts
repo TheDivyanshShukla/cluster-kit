@@ -32,7 +32,9 @@ export const Worker = z.object({
 	inv: Inventory.nullable().default(null),
 	presence: z.enum(['busy', 'idle']).catch('idle'),
 	blocked: z.boolean().default(false),
-	cap: z.number().int().nullable().default(null)
+	cap: z.number().int().nullable().default(null),
+	/** set on a lab head: the PCs it serves */
+	lab_pcs: z.array(z.object({ node_id: z.string().nullable() })).optional()
 });
 
 export const Job = z.object({

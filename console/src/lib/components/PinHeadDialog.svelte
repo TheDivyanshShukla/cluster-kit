@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import type { Candidate } from '#lib/api/schema.ts';
 	import { pct } from '#lib/format.ts';
@@ -28,6 +29,8 @@
 				(r) => {
 					cands = rankFor(lab, r.candidates);
 					pick = (cands.find((c) => c.eligible && c.node_id !== current) ?? cands.find((c) => c.node_id !== current))?.node_id ?? '';
+						// the list arrives after the dialog opens: move focus from Cancel to the chosen PC
+						void tick().then(() => dlg.querySelector<HTMLInputElement>('input:checked')?.focus());
 				},
 				(e) => ((cands = []), (err = e instanceof ApiError ? e.message : 'Could not rank this lab\'s PCs.'))
 			);

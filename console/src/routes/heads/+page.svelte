@@ -159,7 +159,7 @@
 
 				<!-- tree -->
 				<section aria-labelledby="tree-h">
-					<h2 id="tree-h" class="sr-only">Topology</h2>
+					<h2 id="tree-h" class="sr-only">Root and labs</h2>
 					<div class="border-line flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border p-3">
 						<Crown class="text-primary size-5 shrink-0" aria-hidden="true" />
 						<div class="min-w-0">
