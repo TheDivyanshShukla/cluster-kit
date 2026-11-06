@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { viaText } from '#lib/hier.ts';
 	import { CircleCheck, Server, Unplug } from '@lucide/svelte';
 	import { api, ApiError } from '#lib/api/client.ts';
 	import AvailChips from '#lib/components/AvailChips.svelte';
@@ -146,7 +147,7 @@
 						<input type="checkbox" checked={selected.includes(n.node_id)} aria-label="Select {n.host}" onchange={(e) => (selected = e.currentTarget.checked ? [...selected, n.node_id] : selected.filter((s) => s !== n.node_id))} />
 					{:else if c.key === 'host'}
 						<p class="truncate font-medium" title={n.host}><Hl text={n.host} q={l.state.q} /></p>
-						<p class="text-muted-foreground truncate font-mono text-[11px]">{n.addr}{r.w?.virtual ? ' · virtual' : ''}</p>
+						<p class="text-muted-foreground truncate font-mono text-[11px]">{n.addr}{r.w?.virtual ? ' · virtual' : ''}{n.via_lab ? ` · ${viaText(n.via_lab)}` : ''}</p>
 					{:else if c.key === 'state'}
 						<NodeStateChip state={n.state} online={n.online} power={n.power} id={n.node_id} />
 					{:else if c.key === 'lab'}
@@ -198,6 +199,7 @@
 					</div>
 					{#if n.state_reason}<p class="text-muted-foreground">{n.state_reason}{n.state_by ? ` · ${n.state_by}` : ''}</p>{/if}
 					<dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
+						<dt class="text-muted-foreground">Works via</dt><dd>{n.via_lab ? viaText(n.via_lab) : 'the root'}</dd>
 						<dt class="text-muted-foreground">Seat</dt><dd>{n.lab_id != null && n.x != null ? `${labName(n.lab_id)} · column ${n.x + 1}, row ${(n.y ?? 0) + 1}` : 'Unplaced'}</dd>
 						<dt class="text-muted-foreground">CPU</dt><dd class="min-w-0 break-words">{n.inventory?.cpu_model || '—'}</dd>
 						<dt class="text-muted-foreground">Threads</dt><dd class="num">{count(cur.w?.threads ?? n.inventory?.cores_logical)}</dd>

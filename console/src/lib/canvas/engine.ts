@@ -12,6 +12,7 @@ import { Particles, planParticles } from './particles';
 import type { NodeSnap } from './replay';
 import { attrsOf, classOf, CLASSES, jobSlots, makeJobFinder, type Cls } from './state';
 import type { Attrs, Matcher } from './select';
+import type { CanvasHead } from '../hier';
 
 export const HUGE = 2000;
 export type Input = {
@@ -28,6 +29,8 @@ export type Input = {
 	/** node_id -> losses in 24 h (Reliability layer) and head score 0-100 (Head fitness layer) */
 	losses?: Record<string, number>;
 	scores?: Record<string, number>;
+	/** lab heads (docs/HIERARCHY.md), drawn on their lab box */
+	hier?: CanvasHead[];
 };
 type Group = { cls: Cls; fill: string; a: number; dim: boolean; idx: number[] };
 export type LabStat = { busy: number; awake: number; total: number; rate: number; share: number };
@@ -49,6 +52,8 @@ export class LiveEngine {
 	bundles = false;
 	lod: Lod = 'square';
 	labStats = new Map<number, LabStat>();
+	/** lab heads by lab name */
+	labHeads = new Map<string, CanvasHead>();
 	maxRate = 0;
 	maxLoss = 0;
 	/** called after the user (or fit/follow) changed the view */
@@ -234,6 +239,7 @@ export class LiveEngine {
 	// ------------------------------------------------------------ data in
 	update(inp: Input, now = performance.now()) {
 		this.input = inp;
+		this.labHeads = new Map((inp.hier ?? []).map((h) => [h.lab, h]));
 		this.replay = inp.overrides != null;
 		const items = toItems(inp.nodes, this.replay ? [] : inp.workers).filter((i) => i.node.state !== 'retired');
 		this.items = items;
@@ -864,6 +870,44 @@ export class LiveEngine {
 			drawGlyph(ctx, 'crown', head.x, head.y, 20);
 		}
 		// a slot waiting for a recruit is drawn by the legend / HeadTopology; here only real standbys
+		this.drawLabHeads();
+	}
+
+	/** Lab heads: a small hexagon on the top edge of the lab box, a link up to the root, and a ring that fills as the lease is worked off. */
+	private drawLabHeads() {
+		const { ctx, tokens: T, scene: S } = this;
+		if (!this.labHeads.size) return;
+		const R = 6.5, RING = 9.5;
+		for (const l of S.labs) {
+			const h = this.labHeads.get(l.name);
+			if (!h) continue;
+			const x = l.x + l.w / 2, y = l.y;
+			const tone = h.cut ? T.warn : h.drain ? T.idle : T.primary;
+			ctx.lineWidth = 1.2;
+			ctx.globalAlpha = 0.7;
+			ctx.strokeStyle = tone;
+			ctx.setLineDash(h.cut ? [3, 3] : []);
+			ctx.beginPath();
+			ctx.moveTo(S.head.x, S.head.y + 16);
+			ctx.quadraticCurveTo(S.head.x, (S.head.y + y) / 2 + 20, x, y - RING);
+			ctx.stroke();
+			ctx.setLineDash([]);
+			ctx.globalAlpha = 1;
+			this.node(x, y, R, T.surface, tone);
+			ctx.strokeStyle = tone;
+			ctx.beginPath();
+			ctx.arc(x, y, RING, 0, TAU);
+			ctx.globalAlpha = 0.25;
+			ctx.stroke();
+			ctx.globalAlpha = 1;
+			if (h.progress != null) {
+				ctx.lineWidth = 2;
+				ctx.beginPath();
+				ctx.arc(x, y, RING, -Math.PI / 2, -Math.PI / 2 + TAU * Math.max(0.02, h.progress));
+				ctx.stroke();
+			}
+			drawGlyph(ctx, 'crown', x, y, 7);
+		}
 	}
 	private slotOf(id: string) {
 		const i = this.shown.findIndex((s) => s.id === id);

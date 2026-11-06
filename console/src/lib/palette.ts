@@ -177,6 +177,8 @@ export const PAGES: { href: string; label: string; keys: string; need?: Role }[]
 	{ href: '/events?view=logs', label: 'Logs', keys: 'log lines' },
 	{ href: '/experiments', label: 'Experiments', keys: 'research runs compare' },
 	{ href: '/alerts', label: 'Alerts', keys: 'slow flaky warnings' },
+	{ href: '/heads', label: 'Lab heads', keys: 'hierarchy heads tree lease lab head pin drain partition' },
+	{ href: '/heads?tab=settings', label: 'Lab head settings', keys: 'hierarchy mode off manual auto lease silence', need: 'admin' },
 	{ href: '/advisor', label: 'Advisor', keys: 'suggestions advice improve tune fix' },
 	{ href: '/advisor?tab=policy', label: 'Advisor policy', keys: 'auto suggest off advice switch', need: 'admin' },
 	{ href: '/advisor?tab=applied', label: 'Advisor outcomes', keys: 'applied undo predicted observed accuracy' },

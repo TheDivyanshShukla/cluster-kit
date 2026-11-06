@@ -4,7 +4,7 @@
 import { api, ApiError } from './api/client';
 import { runningJobs } from './jobs';
 import { failoverStep, noFailover, primaryAddr, type Failover } from './ha';
-import { AdviceEvent, type Suggestion, Alert, Changed, Cluster, LogBatch, WHAT, type What, EventRow, HaStatus, JobRow, NodeRow, type HaSettings, type LabPower, type LabRow, type PowerSettings } from './api/schema';
+import { AdviceEvent, Hierarchy, type Suggestion, Alert, Changed, Cluster, LogBatch, WHAT, type What, EventRow, HaStatus, JobRow, NodeRow, type HaSettings, type LabPower, type LabRow, type PowerSettings } from './api/schema';
 
 export const live = $state({
 	cluster: null as Cluster | null,
@@ -36,6 +36,8 @@ export const live = $state({
 	powerCfg: null as PowerSettings | null,
 	/** every alert seen: read at start, then `alert` events (merged by id). Active ones have `active` set. */
 	alerts: [] as Alert[],
+	/** GET /api/v1/hierarchy: the lab-head tree; refreshed on labhead.* / hier.* events and every 4 s while lab heads are on */
+	hier: null as Hierarchy | null,
 	/** advisor: open suggestions (GET /advice, then `advice` events); null until the first read */
 	advice: null as Suggestion[] | null,
 	/** SSE `changed`: a counter per list that goes up after each write of it; panels refetch when theirs moves */
@@ -73,6 +75,19 @@ export async function loadPowerCfg() {
 		live.powerCfg = null;
 	}
 }
+export async function loadHier() {
+	try {
+		live.hier = await api.hierarchy();
+	} catch {
+		// a standby answers 503 and an old head 404: the console then shows no lab heads
+		live.hier = null;
+	}
+}
+let hierTimer: ReturnType<typeof setTimeout> | null = null;
+const hierSoon = () => (hierTimer ??= setTimeout(() => ((hierTimer = null), void loadHier()), 400));
+setInterval(() => {
+	if (es && live.hier && live.hier.mode !== 'off') void loadHier();
+}, 4000);
 let lastEpoch: number | null = null;
 
 /** This console is served by a standby head. */
@@ -155,6 +170,7 @@ async function probe() {
 	void loadHa();
 	api.alerts().then((r) => r.alerts.forEach(putAlert)).catch(() => {});
 	api.advice().then((r) => (live.advice = r.suggestions)).catch(() => {});
+	void loadHier();
 }
 
 function connect() {
@@ -192,6 +208,7 @@ function connect() {
 	listen('advice', (v) => AdviceEvent.safeParse(v), (e) => (live.advice = e.suggestions));
 	listen('event', (v) => EventRow.safeParse(v), (ev) => {
 		live.events = [ev, ...live.events.filter((x) => x.id !== ev.id)].slice(0, 100);
+		if (ev.kind.startsWith('labhead.') || ev.kind.startsWith('hier.')) hierSoon();
 		if (ev.kind.startsWith('power.') && live.powerCfg) void loadPowerCfg();
 		if (ev.kind === 'ha.recruit') {
 			void loadHa();

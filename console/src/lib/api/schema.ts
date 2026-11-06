@@ -128,7 +128,9 @@ export const NodeRow = z.preprocess(normNode, z.object({
 	/** when the PC entered that power state (epoch ms); null if the head does not know */
 	power_since_ms: z.number().nullish(),
 	/** FLT-07: the PC is showing its "it is me" banner until this epoch ms; null when off */
-	identify_until_ms: z.number().nullish()
+	identify_until_ms: z.number().nullish(),
+	/** lab head (name of the lab) whose connection this PC works through; null = straight to the root */
+	via_lab: z.string().nullish().catch(null)
 }));
 export const NodeOne = z.object({ node: NodeRow });
 export const NodesChanged = z.object({ nodes: z.array(NodeRow) });
@@ -449,3 +451,58 @@ export type Suggestion = z.infer<typeof Suggestion>;
 export type AdviceOption = z.infer<typeof AdviceOption>;
 export type AdviceApplied = z.infer<typeof AdviceApplied>;
 export type AdvicePreviewReply = z.infer<typeof AdvicePreviewReply>;
+
+/** GET /api/v1/hierarchy (docs/HIERARCHY.md): the lab-head tree */
+const n0 = z.number().catch(0);
+export const HierMode = z.enum(['off', 'manual', 'auto']);
+export type HierMode = z.infer<typeof HierMode>;
+export const LabHead = z.object({
+	node_id: z.string(),
+	host: z.string().nullish(),
+	addr: z.string().catch(''),
+	port: n0,
+	connected_s: z.number().nullish(),
+	pcs: n0,
+	threads: n0,
+	/** numbers the root has handed it and still counts as in flight */
+	granted_in_flight: n0,
+	/** as the lab head sees it: numbers in the leases it holds, and how many of them its PCs finished */
+	lab_granted: n0,
+	lab_done: n0,
+	leases_done: n0,
+	lag_s: z.number().nullish(),
+	unacked: n0,
+	partitioned: z.boolean().catch(false),
+	released: z.boolean().catch(false),
+	rate: n0,
+	root_inflight: z.array(z.object({ job: z.number(), a: z.number(), b: z.number() })).catch([])
+});
+export type LabHead = z.infer<typeof LabHead>;
+export const HierLabState = z.enum(['active', 'partitioned', 'released', 'absent', 'none']).catch('none');
+export type HierLabState = z.infer<typeof HierLabState>;
+export const HierLab = z.object({
+	lab: z.string(),
+	pinned: z.string().nullish(),
+	drain: z.boolean().catch(false),
+	state: HierLabState,
+	head: LabHead.nullish(),
+	pcs: z.array(z.object({ id: z.string(), host: z.string().catch(''), threads: n0, busy: z.boolean().catch(false) })).catch([]),
+	pcs_at_root: n0,
+	silent_s: z.number().nullish(),
+	orphaned_leases: z.number().nullish()
+});
+export type HierLab = z.infer<typeof HierLab>;
+export const Hierarchy = z.object({
+	mode: HierMode.catch('off'),
+	active: z.boolean().catch(false),
+	paused: z.string().nullish(),
+	settings: z.object({ lease_s: n0, lab_head_min_pcs: n0, lab_silence_s: n0, lab_head_standby: z.boolean().catch(false) }),
+	root: z.object({ node_id: z.string().catch(''), role: z.string().catch('primary'), epoch: n0, addr: z.string().nullish(), pcs_direct: n0 }),
+	standbys: z.array(z.string()).catch([]),
+	labs: z.array(HierLab),
+	orphans: z.array(z.object({ node_id: z.string(), lab: z.string(), leases: n0, silent_s: n0, expires_in_s: n0 })).catch([]),
+	unleasable_jobs: z.array(z.number()).catch([])
+});
+export type Hierarchy = z.infer<typeof Hierarchy>;
+export const HierSettingsPatch = z.object({ mode: HierMode, lease_s: z.number(), lab_head_min_pcs: z.number(), lab_silence_s: z.number() }).partial();
+export type HierSettingsPatch = z.infer<typeof HierSettingsPatch>;

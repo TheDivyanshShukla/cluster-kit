@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ChevronDown, Crown, Eye, Maximize, Spline, WifiOff, ZoomIn, ZoomOut } from '@lucide/svelte';
+	import { ChevronDown, Crown, Eye, Hexagon, Maximize, Spline, WifiOff, ZoomIn, ZoomOut } from '@lucide/svelte';
 	import { onMount, untrack } from 'svelte';
 	import { api } from '#lib/api/client.ts';
 	import { jobColor } from '#lib/canvas/colors.ts';
@@ -9,6 +9,7 @@
 	import { LiveEngine } from '#lib/canvas/engine.ts';
 	import { headAt, rewind, type NodeSnap } from '#lib/canvas/replay.ts';
 	import { parseSelector } from '#lib/canvas/select.ts';
+	import { canvasHeads } from '#lib/hier.ts';
 	import { CLS_WORDS, CLASSES, type Cls } from '#lib/canvas/state.ts';
 	import type { EventRow } from '#lib/api/schema.ts';
 	import { runningJobs } from '#lib/jobs.ts';
@@ -131,7 +132,7 @@
 		if (!e || frozen) return;
 		e.update({
 			nodes: live.nodes, labs: live.labs, workers: live.cluster?.workers ?? [], jobs: runningJobs(live.cluster),
-			ha: live.ha, filter: matcher, overrides, headId, losses, scores
+			ha: live.ha, filter: matcher, overrides, headId, losses, scores, hier: canvasHeads(live.hier)
 		});
 		counts = { ...e.counts };
 		maxRate = e.maxRate;
@@ -460,6 +461,7 @@
 		{#if !compact}
 			<span class="text-muted-foreground inline-flex items-center gap-1"><Crown class="size-3" aria-hidden="true" />head</span>
 			<span class="text-muted-foreground inline-flex items-center gap-1"><Eye class="size-3" aria-hidden="true" />standby</span>
+			{#if live.hier?.labs.some((l) => l.head)}<span class="text-muted-foreground inline-flex items-center gap-1"><Hexagon class="text-primary size-3" aria-hidden="true" />lab head (ring = lease done; dashed = cut off)</span>{/if}
 		{/if}
 		{#if tokens && !compact && (lg.kind === 'jobs' || layer === 'status')}
 			{#each jobs as j, i (j.id)}

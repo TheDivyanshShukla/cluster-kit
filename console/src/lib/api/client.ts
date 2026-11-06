@@ -59,6 +59,8 @@ import {
 	AdviceApplyReply,
 	AdvicePreviewReply,
 	AdviceSettingsReply,
+	Hierarchy,
+	type HierSettingsPatch,
 	type AdviceMode,
 	type Role
 } from './schema';
@@ -242,6 +244,14 @@ export const api = {
 	adviceApply: (id: string, option?: string) => call('POST', `/api/v1/advice/${encodeURIComponent(id)}/apply`, AdviceApplyReply, option ? { option } : {}),
 	adviceUndo: (id: string) => call('POST', `/api/v1/advice/${encodeURIComponent(id)}/undo`, AdviceReplyList, {}),
 	adviceDismiss: (id: string, snooze_h = 24) => call('POST', `/api/v1/advice/${encodeURIComponent(id)}/dismiss`, AdviceReplyList, { snooze_h }),
+	// lab heads (docs/HIERARCHY.md)
+	hierarchy: () => call('GET', '/api/v1/hierarchy', Hierarchy),
+	/** admin */
+	setHierarchy: (b: HierSettingsPatch) => call('PUT', '/api/v1/hierarchy/settings', Hierarchy, b),
+	/** operator: promote (or move) the lab head of `lab` to that PC */
+	pinLabHead: async (lab: string, node: string) => void (await send('POST', `/api/v1/hierarchy/labs/${encodeURIComponent(lab)}/head`, { node })),
+	unpinLabHead: async (lab: string) => void (await send('DELETE', `/api/v1/hierarchy/labs/${encodeURIComponent(lab)}/head`)),
+	drainLab: async (lab: string, on: boolean) => void (await send('POST', `/api/v1/hierarchy/labs/${encodeURIComponent(lab)}/drain`, { on })),
 	// legacy
 	stats: (detail = false) => call('GET', detail ? '/stats?detail=1' : '/stats', Stats)
 };
