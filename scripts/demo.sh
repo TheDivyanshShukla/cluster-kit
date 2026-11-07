@@ -11,20 +11,24 @@ D=${DEMO_DIR:-$(mktemp -d -t ck-demo)}
 [ -x "$B" ] || { echo "build first: (cd rust && cargo build --release)"; exit 1; }
 export CK_POWER_DRY=1 CK_PRESENCE=off CK_AUTH=off CK_FLEET=open CK_HIER_ALLOW_VIRTUAL=1
 pids=()
-stop() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; echo "demo stopped (data in $D)"; }
+# lab heads outlive their agent on purpose (a restarted agent reuses them), so stop them by their pid files too
+stop() { for p in "${pids[@]}" $(awk 1 "$D"/pc*/labhead-*/labhead.pid 2>/dev/null); do kill "$p" 2>/dev/null || true; done; echo "demo stopped (data in $D)"; }
 trap stop EXIT INT TERM
 
 api() { python3 -c 'import sys,json,urllib.request as u
 m,p,b=sys.argv[1],sys.argv[2],sys.argv[3] if len(sys.argv)>3 else None
 r=u.Request("http://127.0.0.1:'$((P + 2))'/api/v1"+p,method=m,data=b.encode() if b else None,headers={"Content-Type":"application/json"})
 print(u.urlopen(r).read().decode())' "$@"; }
+# poll a condition every 0.2 s instead of guessing a sleep; give up after 60 s
+until_ok() { local n=0; until eval "$1" > /dev/null 2>&1; do n=$((n + 1)); [ $n -lt 300 ] || { echo "demo: timed out waiting for $2 (logs in $D)"; exit 1; }; sleep 0.2; done; }
+pcs() { api GET /cluster | python3 -c 'import sys,json; print(sum(1 for w in json.load(sys.stdin)["workers"] if w["node_id"]))'; }
 
 CK_DATA=$D/root CK_PORT=$P CK_TUNE_LAB_HEAD_PORT=$((P + 40)) CK_TUNE_LAB_HEAD_MIN_PCS=4 "$B" head --no-local-worker > "$D/root.log" 2>&1 & pids+=($!)
-sleep 2
+until_ok 'api GET /cluster' "the root head"
 for i in 1 2; do
   CK_DATA=$D/pc$i CK_NODE_ID=demo-pc$i CK_HEADS=127.0.0.1:$P "$B" agent --head 127.0.0.1:$P --threads 1 --virtual 8 > "$D/pc$i.log" 2>&1 & pids+=($!)
 done
-sleep 6
+until_ok '[ "$(pcs)" -ge 16 ]' "16 simulated PCs"
 api POST /labs '{"name":"A","w":6,"h":4}' > /dev/null
 api POST /labs '{"name":"B","w":6,"h":4}' > /dev/null
 python3 - "$P" <<'PY'
@@ -46,5 +50,5 @@ api POST /jobs '{"name":"demo: list job","kind":"list","cmd":"sh -c \"echo $CK_I
 api POST /jobs '{"name":"demo: a command that fails","kind":"cmd","cmd":"false","n":20,"chunk":1}' > /dev/null
 url=http://127.0.0.1:$((P + 2))/
 echo "console: $url   (logs and data: $D; Ctrl-C stops the demo)"
-command -v open > /dev/null && open "$url" || true
+[ -n "${NO_OPEN:-}" ] || { command -v open > /dev/null && open "$url" || true; }
 wait
