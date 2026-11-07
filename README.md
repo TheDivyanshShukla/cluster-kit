@@ -16,6 +16,8 @@ Both engines have:
 
 Try the whole thing on one machine first. Use the `ck` binary directly; `kit rs ...` runs the same commands with the firewall handled.
 
+Fastest look at the console: `scripts/demo.sh` (after the build below). It starts a root head, a standby, two labs of 8 simulated PCs with a lab head each, and a few jobs, then opens `http://127.0.0.1:15002`. Power actions are dry runs and the long job only sleeps; Ctrl-C stops it all.
+
 ```
 # 1. Build (installs nothing else; add --no-default-features to skip GPU support)
 cd rust && cargo build --release && cd ..
