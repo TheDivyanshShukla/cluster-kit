@@ -313,6 +313,7 @@ fn pc(x: f64) -> String {
 // ---------------------------------------------------------------- rules
 
 /// Alert kinds research.rs can open; the advisor must have a rule for each (test `every_alert_kind_has_a_rule`).
+#[cfg(test)]
 pub const ALERT_KINDS: &[&str] = &["slow_pc", "flaky_pc", "head_hot", "standby_behind", "reserve_at_risk", "no_standby"];
 
 /// Job failure reasons: (needle in the error text lower-cased, reason id, title).

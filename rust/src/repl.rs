@@ -257,16 +257,6 @@ pub fn standby_nodes(ctx: &Ctx) -> Vec<String> {
     init(ctx).links.iter().map(|l| l.node.clone()).collect()
 }
 
-/// Size of the known membership (nodes connected in the last 60 s; after a takeover: the replicated list).
-pub fn membership(ctx: &Ctx) -> usize {
-    init(ctx).members.len()
-}
-
-/// Nodes connected now, as of the last `refresh`.
-pub fn connected(ctx: &Ctx) -> usize {
-    init(ctx).connected
-}
-
 /// Re-read the connected nodes from the head state, expire old members, clear "candidate" once a quorum is back and
 /// replicate membership changes. Takes the State lock briefly: do not call it while holding that lock.
 pub fn refresh(ctx: &Ctx) {
@@ -769,11 +759,6 @@ fn snapshot_done(store: &mut Store, sb: &mut Sb, s: &mut TcpStream, tx: &mut Hal
 // ---------------------------------------------------------------- standby side
 
 static STANDBY: OnceLock<Mutex<Status>> = OnceLock::new();
-
-/// Status of this process while it runs as a standby (role "standby", primary "ip:port"); a5 can serve it.
-pub fn standby_status() -> Status {
-    STANDBY.get_or_init(Default::default).lock().unwrap().clone()
-}
 
 fn set_sb(f: impl FnOnce(&mut Status)) {
     f(&mut STANDBY.get_or_init(Default::default).lock().unwrap());

@@ -25,13 +25,8 @@ pub fn cancelled(job: u64, a: u64) -> bool {
 #[cfg(feature = "gpu")]
 pub static GPU: OnceLock<Option<crate::gpu::Gpu>> = OnceLock::new();
 
-/// Run one chunk [a, b) of a job and return the RESULT body.
+/// Run one chunk [a, b) of a job and return the RESULT body; `out` = the chunk's CK_OUT directory (cmd and list jobs, JOB-08).
 /// Err((retry, message)): the chunk failed; retry = worth running again (JOB-04 exit code 75 or a timeout).
-pub fn run_task(kind: u8, job: u64, a: u64, b: u64, arg: &[u8]) -> Result<Vec<u8>, (bool, String)> {
-    run_task_out(kind, job, a, b, arg, None)
-}
-
-/// Like `run_task`; `out` = the chunk's CK_OUT directory (cmd and list jobs, JOB-08).
 pub fn run_task_out(kind: u8, job: u64, a: u64, b: u64, arg: &[u8], out: Option<&std::path::Path>) -> Result<Vec<u8>, (bool, String)> {
     match kind {
         KIND_SHA => Ok(gpu_sha(job, a, b, arg).unwrap_or_else(|| sha_range(job, a, b, arg))),
