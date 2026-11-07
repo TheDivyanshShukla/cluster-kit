@@ -6,6 +6,7 @@
 //! `CK_PRESENCE=off` disables it; virtual nodes never probe.
 //! Test hook: `CK_PRESENCE_FAKE=/path/file` makes `busy()` read "busy" or "idle" from that file.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
 pub fn enabled() -> bool {
@@ -19,6 +20,7 @@ pub fn busy() -> bool {
     probe()
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
     let o = Command::new(cmd).args(args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
