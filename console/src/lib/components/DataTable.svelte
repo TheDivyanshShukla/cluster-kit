@@ -112,7 +112,7 @@
 								tabindex={onrow ? 0 : undefined}
 							>
 								{#each cols as c (c.key)}
-									<div role="cell" class="min-w-0 px-3 max-sm:px-2 {c.right ? 'text-right' : ''}">{@render cell(r, c, idx)}</div>
+									<div role="cell" class="min-w-0 px-3 max-sm:px-2 max-sm:[&_a]:py-1 max-sm:[&_button]:min-h-7 max-sm:[&_input[type=checkbox]]:size-6 {c.right ? 'text-right' : ''}">{@render cell(r, c, idx)}</div>
 								{/each}
 							</div>
 						{/each}

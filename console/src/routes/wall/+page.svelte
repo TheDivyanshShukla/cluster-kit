@@ -53,16 +53,16 @@
 		{#each stats as s (s.label)}
 			<div class="bg-surface border-line rounded-lg border px-[1.2vw] py-[1vh]">
 				<p class="text-muted-foreground text-[max(0.9rem,1.3vw)]">{s.label}</p>
-				<p class="num text-[max(2rem,4.6vw)] lg:text-[3.3vw] leading-[1.1] font-semibold tracking-tight">{s.value}</p>
+				<p class="num text-[max(2rem,4.6vw)] lg:text-[3.3vw] leading-[1.15] font-semibold tracking-tight">{s.value}</p>
 			</div>
 		{/each}
 		<div class="bg-surface border-line min-w-0 rounded-lg border px-[1.2vw] py-[1vh]">
 			<p class="text-muted-foreground text-[max(0.9rem,1.3vw)]">{jobs.length > 1 ? `${jobs.length} running jobs` : 'Current job'}</p>
 			{#if jobs.length === 0}
-				<p class="text-muted-foreground text-[max(1.5rem,3vw)] leading-none font-semibold">Idle</p>
+				<p class="text-muted-foreground text-[max(1.5rem,3vw)] leading-[1.15] font-semibold">Idle</p>
 			{:else if jobs.length === 1}
 				{@const pj = Math.round(progress(jobs[0]) * 100)}
-				<p class="num text-[max(2rem,4.6vw)] lg:text-[3.3vw] leading-[1.1] font-semibold tracking-tight">{pj}%</p>
+				<p class="num text-[max(2rem,4.6vw)] lg:text-[3.3vw] leading-[1.15] font-semibold tracking-tight">{pj}%</p>
 				<p class="text-muted-foreground truncate text-[max(0.8rem,1vw)]">#{jobs[0].id}{jobs[0].name ? ` · ${jobs[0].name}` : ''}</p>
 			{/if}
 			{#each jobs.length > 1 ? jobs.slice(0, 3) : jobs as j (j.id)}

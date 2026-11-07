@@ -22,6 +22,8 @@ test('durations and ages', () => {
 	expect(duration(42_000)).toBe('42 s');
 	expect(duration(125_000)).toBe('2 m 5 s');
 	expect(duration(3_900_000)).toBe('1 h 5 m');
+	expect(duration(47 * 3_600_000)).toBe('47 h 0 m');
+	expect(duration(40 * 86_400_000 + 3_600_000)).toBe('40 d 1 h');
 	expect(ago(10_000, 10_000)).toBe('just now');
 	expect(ago(0, 90_000)).toBe('1 m 30 s ago');
 });

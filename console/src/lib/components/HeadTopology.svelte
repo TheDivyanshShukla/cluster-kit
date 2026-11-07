@@ -130,7 +130,7 @@
 					{#if stage !== 'steady' && s.n === 1}<LoaderCircle class="text-warn size-4 shrink-0 motion-safe:animate-spin" aria-hidden="true" />{:else}<Eye class="text-muted-foreground size-4 shrink-0" aria-hidden="true" />{/if}
 					<span class="min-w-0 flex-1">
 						<span class="block truncate font-medium" title={s.host}>{s.host}</span>
-						<span class="num block leading-tight {stage !== 'steady' ? 'text-warn' : s.lag > 0 ? 'text-warn' : 'text-ok'}" title="{s.lab ?? ''} {standbyStatus(s, stage, !!joined[s.id])}">
+						<span class="num block truncate leading-tight {stage !== 'steady' ? 'text-warn' : s.lag > 0 ? 'text-warn' : 'text-ok'}" title="{s.lab ?? ''} {standbyStatus(s, stage, !!joined[s.id])}">
 							{!compact && s.lab ? `${s.lab} · ` : ''}{standbyStatus(s, stage, !!joined[s.id])}
 						</span>
 					</span>

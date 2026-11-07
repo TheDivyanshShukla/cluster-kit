@@ -1161,7 +1161,7 @@ function applyScenario() {
 	const okIds = all.filter((x) => x.online && x.state === 'active' && x.power === 'awake').map((x) => x.node_id);
 
 	// ---- HA
-	haSeq = 1_000_000;
+	haSeq = L ? 9_876_543_210 : 1_000_000; // a standby can never be further behind than the log is long
 	ha.role = 'primary'; ha.head = okIds[0] ?? 'n001'; ha.epoch = H ? 4417 : L ? 987_654_321 : 3; headSince.ms = now() - (L ? 40 * 864e5 : 3 * 3_600_000);
 	const lags = H ? [0, 0, 3, 0, 150, 0, 2400, 12] : L ? [0, 987_654_321] : [0, 0];
 	const nsb = EMPTY ? 0 : H ? 8 : L ? 2 : SCEN === 'labheads' ? 1 : 2;

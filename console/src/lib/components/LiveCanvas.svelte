@@ -498,7 +498,7 @@
 	{/if}
 
 	<div bind:this={legend} class="bg-surface/90 border-line pointer-events-none absolute bottom-2 left-2 {showLegend ? 'right-2' : ''} flex items-center gap-x-3 gap-y-1 rounded-lg border px-2.5 py-1.5 {fs} {showLegend ? 'sm:right-auto sm:max-w-[min(100%-1rem,44rem)]' : 'right-auto left-2'} flex-wrap" aria-label="Legend">
-		{#if !compact && !wall}<button type="button" class="pointer-events-auto text-muted-foreground hover:text-foreground inline-flex min-h-6 items-center gap-1" aria-expanded={legendOpen} onclick={() => (legendOpen = !legendOpen)} title={legendOpen ? 'Hide the legend' : 'Show the legend'}><ChevronDown class="size-3.5 transition-transform {legendOpen ? '' : '-rotate-90'}" aria-hidden="true" />Legend</button>{/if}
+		{#if !compact && !wall}<button type="button" class="pointer-events-auto text-muted-foreground hover:text-foreground inline-flex min-h-6 items-center gap-1 max-sm:min-h-8 max-sm:px-1" aria-expanded={legendOpen} onclick={() => (legendOpen = !legendOpen)} title={legendOpen ? 'Hide the legend' : 'Show the legend'}><ChevronDown class="size-3.5 transition-transform {legendOpen ? '' : '-rotate-90'}" aria-hidden="true" />Legend</button>{/if}
 		{#if showLegend}
 		{#if lg.kind === 'scale'}
 			<span class="text-muted-foreground inline-flex items-center gap-2">

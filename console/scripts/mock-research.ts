@@ -42,14 +42,14 @@ function breakdown(ctx: Ctx, id: number) {
 	if (!j || !j.started_ms) return null;
 	const r = rnd(id * 7919);
 	const wall = Math.max(5, ((j.finished_ms ?? ctx.now()) - j.started_ms) / 1000);
-	const pcs = 6 + (id % 9);
+	const pcs = Math.min(6 + (id % 9), ctx.workers.length); // one row per distinct PC, like the head
 	const total = wall * pcs;
 	const fail = id % 3 === 0, rec = id % 4 === 1 || fail;
 	const frac = { dispatch_wait: 0.03 + r() * 0.03, tail_idle: 0.04 + r() * 0.05, recompute: rec ? 0.05 + r() * 0.04 : 0, failover_pause: fail ? 0.04 + r() * 0.02 : 0 };
 	const other = 0.01 + r() * 0.015;
 	const compute = total * (1 - Object.values(frac).reduce((a, b) => a + b, 0) - other);
 	const per = Array.from({ length: pcs }, (_, i) => {
-		const w = ctx.workers[(id + i * 3) % ctx.workers.length]!;
+		const w = ctx.workers[(id + i) % ctx.workers.length]!;
 		const slow = i === 2 && id % 2 === 0 ? 0.45 : 1;
 		const busy = (compute / pcs) * (0.9 + r() * 0.2) * (slow < 1 ? 0.8 : 1), rate = 5.6e6 * (0.92 + r() * 0.16) * slow;
 		return { node_id: w.node_id, host: w.host, chunks: Math.round(busy / 1.4), numbers: Math.round(busy * rate), rate, busy_s: busy };

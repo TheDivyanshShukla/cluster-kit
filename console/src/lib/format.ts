@@ -28,7 +28,8 @@ export function duration(ms: number | null | undefined): string {
 	const s = Math.round(ms / 1000);
 	if (s < 60) return `${s} s`;
 	if (s < 3600) return `${Math.floor(s / 60)} m ${s % 60} s`;
-	return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} m`;
+	if (s < 172_800) return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} m`;
+	return `${Math.floor(s / 86_400)} d ${Math.floor((s % 86_400) / 3600)} h`; // from two days up, minutes are noise
 }
 
 /** 1,840 W stays watts below 10 kW, then kW. */

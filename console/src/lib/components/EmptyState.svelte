@@ -14,5 +14,5 @@
 	<Icon class="text-muted-foreground mb-4 size-10 shrink-0" strokeWidth={1.5} aria-hidden="true" />
 	<h2 class="text-[15px] font-semibold">{title}</h2>
 	{#if body}<p class="text-muted-foreground mt-1 max-w-sm text-balance">{body}</p>{/if}
-	{#if action}<div class="mt-5">{@render action()}</div>{/if}
+	{#if action}<div class="mt-5 [&_a]:inline-flex [&_a]:min-h-9 [&_a]:items-center [&_button]:min-h-9">{@render action()}</div>{/if}
 </div>
