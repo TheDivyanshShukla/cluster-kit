@@ -57,7 +57,7 @@ test('registry rows first, unknown workers get a stand-in', () => {
 
 test('tile labels fit a cell', () => {
 	expect(tileLabel({ node_id: 'abc/v12', host: 'Divyanshs-MacBook-Air.local' })).toBe('v12');
-	expect(tileLabel({ node_id: 'abc', host: 'lab-a-07.college.in' })).toBe('lab-a-07'.slice(0, 6) + '…');
+	expect(tileLabel({ node_id: 'abc', host: 'lab-a-07.college.in' })).toBe('…b-a-07');
 	expect(tileLabel({ node_id: 'abc', host: 'pc12' })).toBe('pc12');
 });
 

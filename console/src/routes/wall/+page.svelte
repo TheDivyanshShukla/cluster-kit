@@ -48,7 +48,7 @@
 <main class="bg-background text-foreground flex h-dvh flex-col gap-[1.5vh] overflow-hidden p-[1.4vw]">
 	<h1 class="sr-only">Cluster wall</h1>
 	<a href="/" class="bg-primary text-primary-foreground sr-only rounded-lg px-3 py-2 focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50">Leave wall mode</a>
-	<div class="flex flex-col gap-[1vw] lg:flex-row">
+	<div class="flex flex-col gap-[1vw] lg:flex-row lg:items-start">
 	<div class="grid min-w-0 flex-1 grid-cols-2 gap-[1vw] md:grid-cols-4 lg:grid-cols-2">
 		{#each stats as s (s.label)}
 			<div class="bg-surface border-line rounded-lg border px-[1.2vw] py-[1vh]">

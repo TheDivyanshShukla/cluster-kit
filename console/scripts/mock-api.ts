@@ -1,5 +1,8 @@
 // Mock of the ck head HTTP API (docs/API.md) for developing and screenshotting the console.
 //   MOCK_AUTH=open (default) | required | bootstrap     bun run scripts/mock-api.ts
+//   MOCK_SCENARIO=normal (default) | huge | long | empty | labheads     worst-case data for screenshots (see applyScenario at the bottom)
+//     huge: 3000 PCs / 60 labs / 10 lab heads / 8 standbys / 200 jobs; long: longest strings and biggest numbers; empty: brand-new cluster;
+//     labheads: 2 labs x 8 PCs behind lab heads. Fixed seed; the data does not change over time except job progress and PC load.
 // Then: CK_DASH=7942 bun run dev -- --port 5174. Logins in "required" mode: admin / adminadminadmin.
 // Fake data only; it serves nothing but /api/v1/* and /stats.
 import { research } from './mock-research.ts';
@@ -7,6 +10,8 @@ type Role = 'viewer' | 'researcher' | 'operator' | 'admin';
 const RANK: Record<Role, number> = { viewer: 0, researcher: 1, operator: 2, admin: 3 };
 const PORT = Number(process.env.MOCK_PORT ?? 7942);
 const MODE = process.env.MOCK_AUTH ?? 'open';
+const SCEN = process.env.MOCK_SCENARIO ?? 'normal';
+const NORMAL = SCEN === 'normal';
 
 const users = new Map<string, { password: string; role: Role; created_ms: number; quota?: { max_pcs: number; max_running: number } }>();
 if (MODE === 'required') {
@@ -73,7 +78,7 @@ const workers = Array.from({ length: 30 }, (_, i) => {
 
 // ---- fleet: node registry, labs, join codes
 type NState = 'pending' | 'active' | 'cordoned' | 'draining' | 'maintenance' | 'retired';
-type Node = { node_id: string; host: string; addr: string; inventory: unknown; first_seen_ms: number; last_seen_ms: number; state: NState; state_reason: string; state_by: string; lab_id: number | null; x: number | null; y: number | null; online: boolean; calib_mhs: number | null; presence: 'busy' | 'idle'; labels: Record<string, string>; pools: string[]; class: string; power: 'awake' | 'asleep' | 'waking'; power_since_ms?: number; identify_until_ms?: number };
+type Node = { node_id: string; host: string; addr: string; inventory: unknown; first_seen_ms: number; last_seen_ms: number; state: NState; state_reason: string; state_by: string; lab_id: number | null; x: number | null; y: number | null; online: boolean; calib_mhs: number | null; presence: 'busy' | 'idle'; labels: Record<string, string>; pools: string[]; class: string; power: 'awake' | 'asleep' | 'waking'; power_since_ms?: number; via_lab?: string; identify_until_ms?: number };
 const labs: { id: number; name: string; w: number; h: number; created_ms: number }[] = [
 	{ id: 1, name: 'Lab A', w: 6, h: 4, created_ms: ago(8e8) },
 	{ id: 2, name: 'Lab B', w: 5, h: 3, created_ms: ago(7e8) }
@@ -191,12 +196,14 @@ const sendAll = (name: string, data: unknown) => { for (const s of subs) s(name,
 const changed = (what: string) => sendAll('changed', { what });
 // contract: the node's `power` is {state, since_ms} on the wire
 const wire = (n: Node) => ({ ...n, power: { state: n.power, since_ms: n.power_since_ms ?? null }, power_since_ms: undefined, identify_until_ms: (n.identify_until_ms ?? 0) > now() ? n.identify_until_ms : null });
-const setNode = (id: string, patch: Partial<Node>) => { const n = nodes.get(id)!; if (patch.power && patch.power !== n.power) patch = { ...patch, power_since_ms: now() }; Object.assign(n, patch); sendAll('node', wire(n)); };
-const takes = (id: string) => { const n = nodes.get(id)!; return n.online && (n.state === 'active' || n.state === 'draining'); };
+const setNode = (id: string, patch: Partial<Node>) => { const n = nodes.get(id); if (!n) return; if (patch.power && patch.power !== n.power) patch = { ...patch, power_since_ms: now() }; Object.assign(n, patch); sendAll('node', wire(n)); };
+const takes = (id: string) => { const n = nodes.get(id); return !!n && n.online && (n.state === 'active' || n.state === 'draining'); };
 // states change over time: pc-05 drains then cordons, pc-30 (unplaced) drops off, pc-12 comes back from maintenance
-setTimeout(() => setNode('n005', { state: 'draining', state_reason: 'disk check', state_by: 'admin' }), 12_000);
-setTimeout(() => setNode('n005', { state: 'cordoned' }), 28_000);
-setTimeout(() => { setNode('n030', { online: false }); logEvent('node.lost', '', 'pc-30 lost'); }, 20_000);
+if (NORMAL) {
+	setTimeout(() => setNode('n005', { state: 'draining', state_reason: 'disk check', state_by: 'admin' }), 12_000);
+	setTimeout(() => setNode('n005', { state: 'cordoned' }), 28_000);
+	setTimeout(() => { setNode('n030', { online: false }); logEvent('node.lost', '', 'pc-30 lost'); }, 20_000);
+}
 Object.assign(nodes.get('n004')!, { online: false, power: 'asleep' }); // an asleep PC from the start
 [...nodes.values()].forEach((n, i) => (n.power_since_ms = now() - (2 + (i % 9)) * 600_000 - i * 37_000));
 Object.assign(nodes.get('n012')!, { state: 'maintenance', state_reason: 'RAM swap', state_by: 'admin' });
@@ -268,11 +275,13 @@ const runningAll = () => jobs.filter((j) => j.state === 'running');
 const running = () => runningAll()[0] ?? null;
 const BASE = 30;
 function refreshRules() {
+	const act = wins.filter((x) => winActive(x)).map((x) => ({ x, ids: new Set(matchIds(x.selector)) })), rs = resvs.filter((r) => resvRow(r).active_now).map((r) => new Set(matchIds(r.selector)));
 	for (const w of workers.slice(0, BASE)) {
-		const n = nodes.get(w.node_id!)!;
+		const n = nodes.get(w.node_id!);
+		if (!n) continue;
 		n.presence = w.presence;
-		const hit = wins.filter((x) => winActive(x) && matchIds(x.selector).includes(w.node_id!));
-		const rsv = resvs.some((r) => resvRow(r).active_now && matchIds(r.selector).includes(w.node_id!));
+		const hit = act.filter((a) => a.ids.has(w.node_id!)).map((a) => a.x);
+		const rsv = rs.some((s) => s.has(w.node_id!));
 		w.blocked = rsv || hit.some((x) => x.action === 'block');
 		const caps = hit.filter((x) => x.action === 'cap').map((x) => x.cap_threads!);
 		w.cap = caps.length ? Math.min(...caps) : null;
@@ -296,6 +305,19 @@ function tick() {
 		w.mem_used = w.mem_total * (0.3 + Math.random() * 0.1);
 		if (w.busy) { const e = perTick * (0.6 + Math.random() * 0.8); w.numbers += w.rate * 0.5; w.chunks += Math.floor(e) + (Math.random() < e % 1 ? 1 : 0); w.secs += 0.5; }
 	}
+	for (const w of workers as W[]) { // a lab head: its PCs' busy state comes from lab_pcs
+		if (!w.lab_pcs) continue;
+		let on = 0;
+		w.rate = 0;
+		for (const p of w.lab_pcs) {
+			p.busy = !!j && nodes.get(p.node_id)?.presence !== 'busy' && (p.node_id.charCodeAt(p.node_id.length - 1) + p.node_id.charCodeAt(p.node_id.length - 2)) % 4 !== 3;
+			p.cpu = p.busy ? 90 + Math.random() * 9 : 2 + Math.random() * 5;
+			if (p.busy) { on++; w.rate += p.threads * (4.5e6 + Math.random() * 1.5e6); }
+		}
+		w.busy = on > 0;
+		w.cpu = w.busy ? 90 + Math.random() * 9 : 2 + Math.random() * 5;
+		if (w.busy) { w.numbers += w.rate * 0.5; w.secs += 0.5; w.chunks += on; }
+	}
 	if (j) {
 		j.done = Math.min(workers.length > BASE ? j.total * 0.5 : j.total, Math.floor(j.done + workers.reduce((a, w) => a + w.rate, 0) * 0.5)); // the 1000-PC probe keeps its jobs running
 		if (j.done >= j.total) {
@@ -310,7 +332,7 @@ function tick() {
 	void busy;
 }
 setInterval(tick, 500);
-const cluster = () => ({ now_ms: now(), workers: workers.filter((w) => nodes.get(w.node_id!)!.online), job: running(), jobs: runningAll() });
+const cluster = () => ({ now_ms: now(), workers: workers.filter((w) => nodes.get(w.node_id!)?.online ?? true), job: running(), jobs: runningAll() });
 
 // HA: head + 2 standbys (target 2). After 30 s the head "fails": candidate for 8 s, then the first standby is primary with epoch+1.
 // One standby is then missing for 6 s until a recruited PC joins (ha.recruit event, lag 5 then in sync 2 s later).
@@ -323,7 +345,7 @@ const hostOf = (id: string) => nodes.get(id)?.host ?? id;
 const pushHa = () => sendAll('ha', haState());
 const headSince = { ms: now() - 3 * 3_600_000 - 14 * 60_000 };
 const haState = () => {
-	const connected = workers.filter((w) => nodes.get(w.node_id!)!.online).length;
+	const connected = workers.filter((w) => nodes.get(w.node_id!)?.online ?? true).length;
 	const wob = (id: string) => (id === 'n022' && Math.floor(now() / 1000) % 5 === 0 ? 2 : 0); // a little lag now and then
 	const sb = ha.role === 'candidate' ? [] : ha.standbys.map((s) => ({ node_id: s.node_id, lag: Math.max(s.lag, wob(s.node_id)) }));
 	return {
@@ -360,7 +382,7 @@ function failover(after: number, first?: string) {
 		}, 8_000);
 	}, after);
 }
-failover(Number(process.env.MOCK_FAILOVER_MS ?? 30_000));
+if (NORMAL) failover(Number(process.env.MOCK_FAILOVER_MS ?? 30_000));
 setInterval(() => { haSeq += 3; }, 1000);
 let lastHa = '';
 setInterval(() => {
@@ -373,8 +395,10 @@ setInterval(() => {
 for (const id of ['n006', 'n007', 'n008', 'n015']) Object.assign(nodes.get(id)!, { online: false, power: 'asleep' });
 Object.assign(nodes.get('n010')!, { online: false, power: 'waking' });
 const hm = () => hhmm(new Date());
-setTimeout(() => { for (const id of ['n016', 'n017', 'n019']) setNode(id, { online: false, power: 'asleep' }); logEvent('power.sleep', '', `3 PCs went to sleep, ${hm()}`); }, 15_000);
-setTimeout(() => { setNode('n006', { power: 'waking' }); setTimeout(() => { setNode('n006', { online: true, power: 'awake' }); logEvent('power.wake', '', `pc-06 woke up, ${hm()}`); }, 6_000); }, 22_000);
+if (NORMAL) {
+	setTimeout(() => { for (const id of ['n016', 'n017', 'n019']) setNode(id, { online: false, power: 'asleep' }); logEvent('power.sleep', '', `3 PCs went to sleep, ${hm()}`); }, 15_000);
+	setTimeout(() => { setNode('n006', { power: 'waking' }); setTimeout(() => { setNode('n006', { online: true, power: 'awake' }); logEvent('power.wake', '', `pc-06 woke up, ${hm()}`); }, 6_000); }, 22_000);
+}
 
 // PCs that drop off and come back (pc-30 stays gone for a while), and a late wake
 const lose = (id: string, back: number) => {
@@ -386,9 +410,11 @@ const lose = (id: string, back: number) => {
 };
 const FLAPPY = ['n020', 'n021', 'n023', 'n024', 'n025', 'n026', 'n009', 'n011'];
 let flap = 0;
-setInterval(() => lose(FLAPPY[flap++ % FLAPPY.length], 7_000 + Math.random() * 8_000), 11_000);
-setTimeout(() => { setNode('n030', { online: true }); logEvent('node.join', '', 'pc-30 joined'); }, 52_000);
-setTimeout(() => { setNode('n016', { power: 'waking' }); setTimeout(() => { setNode('n016', { online: true, power: 'awake' }); logEvent('power.wake', '', `pc-16 woke up, ${hm()}`); }, 5_000); }, 40_000);
+if (NORMAL) {
+	setInterval(() => lose(FLAPPY[flap++ % FLAPPY.length], 7_000 + Math.random() * 8_000), 11_000);
+	setTimeout(() => { setNode('n030', { online: true }); logEvent('node.join', '', 'pc-30 joined'); }, 52_000);
+	setTimeout(() => { setNode('n016', { power: 'waking' }); setTimeout(() => { setNode('n016', { online: true, power: 'awake' }); logEvent('power.wake', '', `pc-16 woke up, ${hm()}`); }, 5_000); }, 40_000);
+}
 
 // ---- bigger fleets for the canvas FPS probe: any request with ?pcs=N (or MOCK_PCS=N) resizes the fleet; ?pcs=0 goes back to 30
 function setFleet(n: number) {
@@ -412,7 +438,7 @@ function setFleet(n: number) {
 }
 setFleet(Number(process.env.MOCK_PCS ?? 170)); // 30 hand-made PCs + 170 = 200 (MOCK_PCS=0 for the original 30)
 setInterval(() => {
-	if (workers.length <= BASE) return;
+	if (!NORMAL || workers.length <= BASE) return;
 	const w = workers[BASE + Math.floor(Math.random() * (workers.length - BASE))];
 	if (w.id % 5 === 0) lose(w.node_id!, 4_000);
 }, 1_500);
@@ -469,13 +495,16 @@ const tunables = () => KNOBS.map(([key, group, def, min, max, unit, scope, help]
 function candidates() {
 	const w = { speed: tuneVal('head_w_speed'), memory: tuneVal('head_w_memory'), stability: tuneVal('head_w_stability'), free: tuneVal('head_w_free') };
 	const sum = w.speed + w.memory + w.stability + w.free || 1;
-	const lostLast = (id: string) => events.filter((e) => e.kind === 'node.lost' && e.detail.includes(nodes.get(id)!.host)).length;
+	const lostBy = new Map<string, number>();
+	for (const e of events) if (e.kind === 'node.lost') { const h = e.detail.split(' ')[0]; lostBy.set(h, (lostBy.get(h) ?? 0) + 1); }
+	const lostLast = (id: string) => lostBy.get(nodes.get(id)!.host) ?? 0;
+	const eligible = new Set(matchIds(haCfg.selector));
 	const standbyIds = new Set(ha.standbys.map((s) => s.node_id));
 	return [...nodes.values()].map((n, i) => {
 		const inv = (n.inventory ?? {}) as any;
 		const parts = { speed: Math.min(1, (n.calib_mhs ?? 0) / 70), memory: Math.min(1, (inv.ram_bytes / 2 ** 30) / 32 * 0.6 + (inv.cores_logical / 16) * 0.4), stability: Math.max(0, 1 - lostLast(n.node_id) * 0.2 - (i % 7 === 0 ? 0.25 : 0)), free: n.presence === 'busy' ? 0 : 1 };
 		const score = Math.round(100 * (parts.speed * w.speed + parts.memory * w.memory + parts.stability * w.stability + parts.free * w.free) / sum * 10) / 10;
-		const why = n.node_id === ha.head || standbyIds.has(n.node_id) ? '' : i >= 28 ? 'virtual PC' : !n.online ? (n.power === 'asleep' ? 'asleep' : 'not connected') : n.state !== 'active' ? `not active (${n.state})` : !matchIds(haCfg.selector).includes(n.node_id) ? 'does not match the standby selector' : '';
+		const why = n.node_id === ha.head || standbyIds.has(n.node_id) ? '' : NORMAL && i >= 28 ? 'virtual PC' : !n.online ? (n.power === 'asleep' ? 'asleep' : 'not connected') : n.state !== 'active' ? `not active (${n.state})` : !eligible.has(n.node_id) ? 'does not match the standby selector' : '';
 		const role = n.node_id === ha.head ? 'head' : standbyIds.has(n.node_id) ? 'standby' : 'candidate';
 		const lab = labs.find((l) => l.id === n.lab_id)?.name ?? null;
 		return { node_id: n.node_id, host: n.host, lab, score, parts, role, eligible: why === '', why };
@@ -580,7 +609,7 @@ async function handle(req: Request): Promise<Response> {
 	const url = new URL(req.url);
 	const p = url.pathname;
 	const m = req.method;
-	if (url.searchParams.has('pcs')) setFleet(Number(url.searchParams.get('pcs')));
+	if (NORMAL && url.searchParams.has('pcs')) setFleet(Number(url.searchParams.get('pcs')));
 	const body = async () => (await req.json().catch(() => ({}))) as Record<string, any>;
 
 	if (p === '/stats') return err(404, 'not_found', 'stats is not mocked');
@@ -1040,11 +1069,206 @@ async function handle(req: Request): Promise<Response> {
 		});
 		return new Response(stream, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' } });
 	}
+	if (!NORMAL && (d = scenarioRoutes({ p, m, url, me, need }))) return d;
 	if (p.startsWith('/api/v1/')) {
 	const r = await research({ p, m, url, me, RANK, json, err, body, jobs, workers, now, subs });
 	if (r) return r;
 	}
 	return err(404, 'not_found', `No route ${m} ${p}.`);
+}
+
+// ---- MOCK_SCENARIO: after the normal setup has run, replace fleet, labs, jobs, events, HA, alerts and lists with worst-case data.
+type LabPc = { node_id: string; busy: boolean; threads: number; cpu: number };
+type W = (typeof workers)[number] & { lab_pcs?: LabPc[] };
+type LabSpec = { name: string; w: number; h: number; count: number; head?: boolean };
+const labHeads = new Map<string, W>(), pinnedLabs = new Map<string, string>(), partLabs = new Set<string>();
+let scenAlerts: Record<string, any>[] = [];
+function applyScenario() {
+	const r = rng(SCEN.length * 7919 + 17), ri = (n: number) => Math.floor(r() * n);
+	const H = SCEN === 'huge', L = SCEN === 'long', EMPTY = SCEN === 'empty', mixed = H || L;
+	const hex = (n: number) => Array.from({ length: n }, () => '0123456789abcdef'[ri(16)]).join('');
+	const rep = (s: string, n: number) => s.repeat(Math.ceil(n / s.length)).slice(0, n);
+	const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
+	workers.splice(0); nodes.clear(); labs.splice(0); jobs.length = 0; jobSeq = 0; events.length = 0; evSeq = 0; logLines.length = 0;
+	pools.clear(); caps.length = 0; reserves.length = 0; wins.length = 0; resvs.length = 0; templates.length = 0; labHeads.clear(); pinnedLabs.clear(); partLabs.clear();
+
+	// ---- lab layout
+	let specs: LabSpec[] = [], unplaced = 0;
+	if (H) {
+		const dims = Array.from({ length: 60 }, (_, i) => ({ w: 6 + ((i * 5) % 7), h: 4 + ((i * 3) % 7) }));
+		dims[7] = dims[8] = { w: 12, h: 10 };
+		unplaced = 30;
+		const cnt = dims.map((d, i) => (i % 10 === 3 ? d.w * d.h + 3 + (i % 4) : Math.round(d.w * d.h * (0.55 + 0.4 * r())))); // every 10th lab is over-full: PCs sit outside the grid
+		let delta = 3000 - unplaced - cnt.reduce((a, b) => a + b, 0);
+		for (let k = 0; delta && k < 100_000; k++) { const i = k % 60, s = Math.sign(delta); if (i % 10 !== 3 && cnt[i] + s >= 1 && cnt[i] + s <= dims[i].w * dims[i].h) { cnt[i] += s; delta -= s; } }
+		specs = dims.map((d, i) => ({ name: `Lab ${String(i + 1).padStart(2, '0')}`, ...d, count: cnt[i], head: i % 6 === 5 }));
+	} else if (L) specs = [1, 2, 3, 4].map((k) => ({ name: `L${k}-${rep('Department of Computational and Experimental Sciences Teaching Laboratory ', 80)}`.slice(0, 80), w: 5, h: 4, count: 10 }));
+	else if (SCEN === 'labheads') specs = ['Lab A', 'Lab B'].map((name) => ({ name, w: 4, h: 2, count: 8, head: true }));
+
+	// ---- PCs
+	type Made = { id: string; host: string; addr: string; threads: number; inv: W['inv']; mem: number; node: Node; ok: boolean };
+	let n = 0;
+	const addPc = (lab: { id: number; name: string } | null, x: number | null, y: number | null, via: boolean): Made => {
+		const i = n++;
+		const id = L ? hex(40) : `n${String(i + 1).padStart(H ? 4 : 3, '0')}`;
+		const host = L ? `${String(i + 1).padStart(3, '0')}-${rep('physics-teaching-lab-workstation-', 64)}`.slice(0, 64) : `pc-${String(i + 1).padStart(H ? 4 : 2, '0')}`;
+		const addr = L ? `[2001:db8:85a3:08d3:1319:8a2e:0370:${(i + 4096).toString(16)}]:7701` : `10.${(i >> 8) & 255}.${i & 255}.${10 + (i % 200)}:7701`;
+		const threads = L ? 128 : [4, 8, 8, 12, 16, 32][ri(6)], ram = L ? 2048 : [8, 16, 32, 64][ri(4)];
+		const inv = {
+			cpu_model: L ? 'Intel(R) Xeon(R) Platinum 8480+ Engineering Sample @ 3.80GHz (stepping 8, microcode 0x2b0004d0, hyper-threading enabled)' : ['AMD Ryzen 7 5700G', 'Intel Core i5-10400', 'Intel Core i7-12700'][i % 3],
+			cores_physical: threads / 2, cores_logical: threads, ram_bytes: ram * 2 ** 30,
+			os: L ? 'Ubuntu 24.04.1 LTS (Noble Numbat) with the long-term-support kernel and extended security maintenance enabled' : 'Ubuntu 24.04', kernel: L ? '6.8.0-45-generic-lowlatency-hwe-24.04-edge-custom-build' : '6.8.0', arch: 'x86_64', ck_version: '0.2.0'
+		};
+		const a = mixed ? r() : 1, b = mixed ? r() : 1, c = mixed ? r() : 1;
+		const state: NState = a < 0.03 ? 'pending' : a < 0.07 ? 'cordoned' : a < 0.1 ? 'draining' : a < 0.13 ? 'maintenance' : a < 0.16 ? 'retired' : 'active';
+		const power: Node['power'] = b < 0.05 ? 'asleep' : b < 0.06 ? 'waking' : 'awake';
+		const online = power === 'awake' && !(b >= 0.06 && b < 0.1) && state !== 'retired';
+		const presence = c < 0.08 ? 'busy' : 'idle';
+		const node: Node = {
+			node_id: id, host, addr, inventory: inv, first_seen_ms: ago(5e8 + i * 1000), last_seen_ms: online ? now() : ago(60_000 * (5 + (i % 600))), state,
+			state_reason: state === 'active' ? '' : L ? rep('scheduled hardware maintenance of the storage array and network switch ', 120) : 'checking', state_by: state === 'active' ? '' : L ? rep('maintenance-operator-', 64) : 'admin',
+			lab_id: lab?.id ?? null, x, y, online, calib_mhs: L ? 123456.7 : 20 + r() * 50, presence, power, power_since_ms: now() - (2 + (i % 9)) * 600_000 - i * 37_000,
+			labels: L ? { [rep('rack-location-in-the-east-wing-of-the-main-building-', 48)]: rep('value-', 80), [rep('owner-department-', 40)]: 'y' } : mixed && i % 4 === 0 ? { room: String(1 + (i % 9)), gpu: i % 8 === 0 ? 'yes' : 'no' } : {},
+			pools: [], class: `${inv.cpu_model}/${threads}c/${ram}G`, ...(via && lab ? { via_lab: lab.name } : {})
+		};
+		nodes.set(id, node);
+		if (!via) workers.push({ id: i + 1, addr, threads, chunks: 0, numbers: 0, secs: 0, rate: 0, busy: false, cpu: 0, mem_used: 0, mem_total: ram * 2 ** 30, version: 1, node_id: id, host, virtual: false, presence, blocked: false, cap: null as number | null, inv });
+		return { id, host, addr, threads, inv, mem: ram * 2 ** 30, node, ok: online && state === 'active' };
+	};
+	specs.forEach((sp, li) => {
+		const lab = { id: li + 1, name: sp.name, w: sp.w, h: sp.h, created_ms: ago(8e8 - li * 1e6) };
+		labs.push(lab);
+		const cells = sp.w * sp.h, stride = [7, 5, 11, 13, 3, 1].find((s) => gcd(s, cells) === 1)!;
+		const made: Made[] = [];
+		for (let k = 0; k < sp.count; k++) { const s = k < cells ? (k * stride) % cells : k; made.push(addPc(lab, s % sp.w, Math.floor(s / sp.w), false)); } // k >= cells: outside the grid
+		if (!sp.head) return;
+		const up = made.filter((m) => m.ok), host = up[0];
+		if (!host) return;
+		for (const m of made) { m.node.via_lab = sp.name; const wi = workers.findIndex((w) => w.node_id === m.id); if (wi >= 0) workers.splice(wi, 1); } // they work through the lab head, not the root
+		const lp = up.map((m) => ({ node_id: m.id, busy: false, threads: m.threads, cpu: 3 }));
+		const hw = Object.assign({ id: 5000 + li, addr: host.addr.replace(':7701', ':7710'), threads: lp.reduce((a, p) => a + p.threads, 0), chunks: 0, numbers: 0, secs: 0, rate: 0, busy: false, cpu: 3, mem_used: host.mem * 0.3, mem_total: host.mem, version: 1, node_id: `${host.id}/lab-${sp.name}`, host: host.host, virtual: false, presence: 'idle' as 'busy' | 'idle', blocked: false, cap: null as number | null, inv: host.inv }, { lab_pcs: lp });
+		workers.push(hw);
+		labHeads.set(sp.name, hw);
+		if (H && labHeads.size === 3) partLabs.add(sp.name);
+	});
+	for (let u = 0; u < unplaced; u++) addPc(u < 6 ? labs[(u * 9) % labs.length] : null, null, null, false); // unplaced, or in a lab without a seat
+	if (H) { const l4 = [...nodes.values()].find((x) => x.lab_id === labs[4].id); if (l4) pinnedLabs.set(labs[4].name, l4.node_id); }
+	const all = [...nodes.values()];
+	for (const w of workers) if ((w as W).lab_pcs) continue; else w.presence = nodes.get(w.node_id!)!.presence;
+	const okIds = all.filter((x) => x.online && x.state === 'active' && x.power === 'awake').map((x) => x.node_id);
+
+	// ---- HA
+	haSeq = 1_000_000;
+	ha.role = 'primary'; ha.head = okIds[0] ?? 'n001'; ha.epoch = H ? 4417 : L ? 987_654_321 : 3; headSince.ms = now() - (L ? 40 * 864e5 : 3 * 3_600_000);
+	const lags = H ? [0, 0, 3, 0, 150, 0, 2400, 12] : L ? [0, 987_654_321] : [0, 0];
+	const nsb = EMPTY ? 0 : H ? 8 : L ? 2 : SCEN === 'labheads' ? 1 : 2;
+	ha.standbys = okIds.slice(1, 1 + nsb).map((node_id, k) => ({ node_id, lag: lags[k] }));
+	haCfg = { target_standbys: H ? 8 : EMPTY ? 0 : 2, selector: '!virtual' };
+
+	// ---- organisation lists
+	if (!EMPTY) {
+		const ids = all.map((x) => x.node_id);
+		pools.set(L ? rep('overnight-batch-machines-', 40) : 'night', { name: L ? rep('overnight-batch-machines-', 40) : 'night', members: ids.filter((_, k) => k % 7 === 0), note: L ? rep('Used for the overnight batch runs of the whole department. ', 200) : 'Overnight batch machines' });
+		pools.set(L ? rep('gpu-accelerated-nodes-', 40) : 'gpu', { name: L ? rep('gpu-accelerated-nodes-', 40) : 'gpu', members: ids.filter((_, k) => k % 11 === 0), note: '' });
+		syncPools();
+		const sel = (k: number) => (labs[k] ? `lab="${labs[k].name}"` : '');
+		caps.push({ id: 1, selector: L ? rep(`${sel(0)} room=1,2,3,4,5,6,7,8,9 `, 300) : sel(0), max_threads: 4, note: L ? rep('Students work here by day and the machines must stay responsive. ', 200) : 'Students work here by day' });
+		reserves.push({ id: 1, selector: sel(1) || sel(0), keep_n: 3, keep_pct: 0, note: L ? rep('Free for students during the exam period. ', 200) : 'Free for students' });
+		wins.push({ id: 1, selector: sel(0), days: 'mon-fri', start: '09:00', end: '17:00', action: 'cap', cap_threads: 2, note: 'Classes' });
+		if (H) wins.push({ id: 2, selector: sel(1), days: 'mon-sun', start: '00:00', end: '23:59', action: 'block', cap_threads: null, note: 'Closed for refurbishment (active now)' });
+		const day = new Date(t0.getFullYear(), t0.getMonth(), t0.getDate() + 1, 9).getTime();
+		resvs.push({ id: 1, selector: sel(0), start_ms: day, end_ms: day + 3 * 3_600_000, note: 'Midterm exam' });
+		const nt = H ? 12 : L ? 2 : 1;
+		for (let k = 0; k < nt; k++) templates.push({ name: L ? rep(`template-with-a-name-at-the-limit-${k}-`, 40) : `tpl-${k + 1}`, spec: { kind: 'synth', n: 5_000_000, synth_ns: 800, priority: 'low', selector: sel(0) }, note: L ? rep('A template whose note is as long as the console allows. ', 200) : 'Nightly batch', owner: 'ana', created_ms: ago(6e8 - k * 1e7) });
+	}
+	capSeq = 1; resSeq = 1; winSeq = wins.length; rsvSeq = resvs.length; labSeq = labs.length;
+
+	// ---- users
+	const submitters = ['ana', 'admin'];
+	if (MODE !== 'bootstrap') {
+		if (H) for (let k = 0; k < 40; k++) { const nm = `user${String(k + 1).padStart(2, '0')}`; submitters.push(nm); users.set(nm, { password: 'userpassword1234', role: (['viewer', 'researcher', 'researcher', 'operator'] as Role[])[k % 4], created_ms: ago(3e8 + k * 4e6), quota: k % 3 ? { max_pcs: 0, max_running: 0 } : { max_pcs: 8 * (1 + (k % 5)), max_running: 1 + (k % 4) } }); }
+		if (L) for (let k = 0; k < 3; k++) { const nm = rep(`researcher-${k}-with-a-very-long-user-name-`, 64); submitters.push(nm); users.set(nm, { password: 'userpassword1234', role: 'researcher', created_ms: ago(3e8), quota: { max_pcs: 1_000_000, max_running: 99_999 } }); }
+	}
+
+	// ---- jobs
+	const PAT = ['running', 'done', 'queued', 'done', 'failed', 'running', 'done', 'cancelled', 'done'] as const, names = ['Hash sweep', 'Prime search', 'Grade batch', 'Render tiles', 'Word list', 'Monte Carlo', 'Checksum audit', 'Nightly SHA', 'Seed scan', 'Matrix probe'];
+	const nj = H ? 200 : L ? 14 : 0;
+	for (let i = 0; i < nj; i++) {
+		const st = PAT[i % PAT.length], kind = (['sha', 'cmd', 'synth', 'list'] as const)[i % 4];
+		const total = kind === 'list' ? 12 : L ? (i === 0 ? 2e15 : 1e12 * (1 + ri(9))) : 10 ** (6 + ri(7)) * (1 + ri(9));
+		const age = H ? (nj - i) * 1.5e6 + ri(1e6) : (nj - i) * 4e6, started = st === 'queued' ? null : ago(st === 'running' ? 30_000 + ri(900_000) : age);
+		mkJob({
+			name: L ? (i % 2 ? rep('Quarterly regression sweep of the entire parameter grid ', 120) : `${i + 1}-${rep('quarterly-regression-sweep-of-the-entire-parameter-grid-', 120)}`.slice(0, 120)) : `${names[i % names.length]} ${i + 1}`,
+			kind, total, state: st, submitter: submitters[(i * 7) % submitters.length], priority: i % 13 === 0 ? 0 : i % 5 === 1 ? 1 : i % 7 === 3 ? 3 : i % 17 === 5 ? 4 : 2,
+			done: st === 'done' ? total : st === 'queued' ? 0 : Math.floor(total * (0.05 + 0.8 * r())),
+			selector: L ? rep('lab="Department of Computational Sciences" room=1,2,3 gpu=yes class=Intel* ', 200) : i % 3 === 0 && labs.length ? `lab="${labs[i % labs.length].name}"` : i % 8 === 2 ? 'pool=night' : '',
+			error: st === 'failed' ? (L ? rep('worker exited with status 137 (killed by the out-of-memory killer) while processing chunk 4,018,000,000-4,019,000,000; ', 400) : `worker exited with status ${1 + (i % 3)}`) : null,
+			created_ms: started === null ? ago(age) : started - 5_000, started_ms: started, finished_ms: st === 'done' || st === 'failed' || st === 'cancelled' ? (started ?? 0) + 60_000 + ri(3e6) : null,
+			...(kind === 'list' ? { reducer: 'sort', policy: 'guided', items: Array.from({ length: 12 }, (_, k) => `item-${i}-${k}`) } : {})
+		});
+	}
+	if (SCEN === 'labheads') mkJob({ name: 'sleep 600 (one command per PC)', kind: 'cmd', total: 5e12, state: 'running', created_ms: ago(65_000), started_ms: ago(60_000) });
+	for (const j of jobs) {
+		if (j.state === 'done' && j.kind === 'cmd') j.files = 2 + (j.id % 3);
+		if (j.state === 'queued') j.wait_reason = j.id % 3 === 0 ? 'quota' : j.id % 3 === 1 ? 'priority' : 'no_pcs';
+	}
+
+	// ---- events (and the log lines they produce)
+	const nEv = EMPTY ? 0 : H ? 2000 : L ? 30 : 20, hosts = all.map((x) => x.host);
+	for (let i = nEv - 1; i >= 0; i--) {
+		const [k, a0, d] = EV_KINDS[(i * 7 + (i >> 3)) % EV_KINDS.length];
+		const detail = d(i).replace(/pc-\d+/, hosts[(i * 7) % hosts.length] ?? 'pc');
+		logEvent(k, L ? rep('operator-with-a-very-long-account-name-', 64) : a0 && i % 3 === 0 ? ACTORS[i % ACTORS.length] : a0, L ? `${detail} ${rep('Further detail that goes on and on without any hurry. ', 300)}` : detail, ago((i / nEv) ** 2.5 * 2.5 * 864e5 + i * 1500));
+	}
+	logLines.sort((x, y) => x.ts_ms - y.ts_ms);
+
+	// ---- alerts
+	const kinds = ['slow_pc', 'flaky_pc', 'head_hot', 'standby_behind', 'reserve_at_risk', 'no_standby'], sev = ['warn', 'bad', 'info'];
+	const na = EMPTY ? 0 : H ? 150 : L ? 6 : SCEN === 'labheads' ? 1 : 0;
+	scenAlerts = Array.from({ length: na }, (_, i) => {
+		const kind = kinds[i % 6], active = i % 3 !== 2, since = now() - (i + 1) * 1_500_000, host = all[(i * 13) % all.length]?.host ?? 'pc';
+		return { id: i + 1, kind, severity: sev[i % 3], node_id: ['head_hot', 'no_standby', 'reserve_at_risk'].includes(kind) ? null : all[(i * 13) % all.length]?.node_id ?? null, detail: L ? rep(`${host} runs at 41 % of the fleet median (rate 3.1 M/s vs 7.6 M/s) and has been lost 14 times in 24 h. `, 300) : `${host} ${kind.replace('_', ' ')} (${i})`, since_ms: since, last_ms: active ? now() : since + 600_000, active, acked_by: i % 5 === 4 ? 'admin' : null };
+	});
+}
+/** GET /hierarchy (docs/HIERARCHY.md) from the lab heads built above; alerts for the scenarios. Null = not mine. */
+function hier() {
+	const all = [...nodes.values()];
+	return {
+		mode: labHeads.size ? 'auto' : 'off', active: labHeads.size > 0, paused: null, settings: { lease_s: 30, lab_head_min_pcs: 6, lab_silence_s: 20, lab_head_standby: true },
+		root: { node_id: ha.head, role: ha.role, epoch: ha.epoch, addr: nodes.get(ha.head)?.addr ?? '', pcs_direct: workers.filter((w) => !(w as W).lab_pcs && (nodes.get(w.node_id!)?.online ?? false)).length },
+		standbys: ha.standbys.map((s) => s.node_id),
+		labs: labs.map((l) => {
+			const hw = labHeads.get(l.name), part = partLabs.has(l.name), mem = all.filter((x) => x.lab_id === l.id);
+			if (!hw) return { lab: l.name, pinned: pinnedLabs.get(l.name) ?? null, drain: false, state: pinnedLabs.has(l.name) ? 'absent' : 'none', head: null, pcs: [], pcs_at_root: mem.length, silent_s: pinnedLabs.has(l.name) ? 95 : null, orphaned_leases: null };
+			const lp = (hw as W).lab_pcs!;
+			return {
+				lab: l.name, pinned: null, drain: false, state: part ? 'partitioned' : 'active', pcs_at_root: 0, silent_s: part ? 42 : null, orphaned_leases: part ? 3 : null,
+				head: { node_id: hw.node_id, host: hw.host, addr: hw.addr, port: 7710, connected_s: 3600 + l.id * 61, pcs: lp.length, threads: hw.threads, granted_in_flight: 4e7 * lp.length, lab_granted: 5e7 * lp.length, lab_done: 3e7 * lp.length, leases_done: 12 * lp.length, lag_s: 0.4, unacked: 0, partitioned: part, released: false, rate: hw.rate, root_inflight: [{ job: 1, a: 1_000_000, b: 3_000_000 }] },
+				pcs: lp.map((p) => ({ id: p.node_id, host: nodes.get(p.node_id)?.host ?? '', threads: p.threads, busy: p.busy }))
+			};
+		}),
+		orphans: [...partLabs].map((lab) => ({ node_id: labHeads.get(lab)!.node_id, lab, leases: 3, silent_s: 42, expires_in_s: 18 })), unleasable_jobs: SCEN === 'huge' ? [3, 17] : []
+	};
+}
+function scenarioRoutes(c: { p: string; m: string; url: URL; me: { name: string }; need: (r: Role) => Response | null }): Response | null {
+	const { p, m, url, me, need } = c;
+	let d: Response | null;
+	if (p === '/api/v1/hierarchy' && m === 'GET') return json(hier());
+	if (p === '/api/v1/hierarchy/settings' && m === 'PUT') return (d = need('admin')) ?? json(hier());
+	if (p === '/api/v1/alerts' && m === 'GET') return json({ alerts: scenAlerts.filter((a) => url.searchParams.get('active') !== '1' || a.active).sort((a, b) => b.since_ms - a.since_ms) });
+	const am = /^\/api\/v1\/alerts\/(\d+)\/ack$/.exec(p);
+	if (am && m === 'POST') {
+		if ((d = need('operator'))) return d;
+		const a = scenAlerts.find((x) => x.id === Number(am[1]));
+		if (!a) return err(404, 'not_found', 'No such alert.');
+		a.acked_by = me.name;
+		return json({ alert: a });
+	}
+	return null;
+}
+if (!NORMAL) {
+	if (!['huge', 'long', 'empty', 'labheads'].includes(SCEN)) throw new Error(`MOCK_SCENARIO must be normal, huge, long, empty or labheads (got ${SCEN})`);
+	applyScenario();
 }
 
 // SSE `changed` after each successful write of a list (contract)
@@ -1055,4 +1279,4 @@ async function serve(req: Request) {
 	return res;
 }
 Bun.serve({ port: PORT, hostname: '127.0.0.1', idleTimeout: 0, fetch: serve });
-console.log(`mock ck head on http://127.0.0.1:${PORT} (auth: ${MODE})`);
+console.log(`mock ck head on http://127.0.0.1:${PORT} (auth: ${MODE}, scenario: ${SCEN})`);

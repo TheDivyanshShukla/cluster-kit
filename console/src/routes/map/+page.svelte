@@ -29,6 +29,8 @@
 	const items = $derived(toItems(live.nodes, live.cluster?.workers ?? []));
 	const unplaced = $derived(items.filter((i) => i.node.lab_id == null || i.node.x == null));
 	const inLab = (id: number) => items.filter((i) => i.node.lab_id === id && i.node.x != null);
+	// seats past the lab's width or height (the lab was shrunk after placing): not drawn, so say so
+	const outside = (lab: { id: number; w: number; h: number }) => inLab(lab.id).filter((i) => i.node.x! >= lab.w || (i.node.y ?? 0) >= lab.h);
 	const counts = $derived(powerCounts(Object.values(live.nodes)));
 	const byId = $derived(Object.fromEntries(items.map((i) => [i.node.node_id, i])));
 	const labName = (id: number | null) => live.labs.find((l) => l.id === id)?.name ?? '';
@@ -257,8 +259,12 @@
 				<div class="grid gap-5 xl:grid-cols-2">
 				{#each live.labs as lab (lab.id)}
 					<section class="bg-surface border-line min-w-0 rounded-lg border p-3" aria-label={lab.name}>
-						<h2 class="mb-2 flex items-baseline justify-between text-[13px] font-semibold">
-							{lab.name}<span class="text-muted-foreground num text-xs font-normal">{inLab(lab.id).length} of {lab.w * lab.h} seats</span>
+						<h2 class="mb-2 flex items-baseline justify-between gap-3 text-[13px] font-semibold">
+							<span class="min-w-0 truncate" title={lab.name}>{lab.name}</span>
+							<span class="text-muted-foreground num shrink-0 text-xs font-normal">
+								{#if outside(lab).length}<span class="text-warn mr-2" title={outside(lab).map((i) => i.node.host).join(', ')}>{outside(lab).length} outside the grid</span>{/if}
+								{inLab(lab.id).length} of {lab.w * lab.h} seats
+							</span>
 						</h2>
 						<FloorMap
 							{lab}

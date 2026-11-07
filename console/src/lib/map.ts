@@ -146,5 +146,8 @@ export function boxCells(r: Rect, a: [number, number], b: [number, number], w: n
 export function tileLabel(n: { node_id: string; host: string }): string {
 	const v = /\/(v\d+)$/.exec(n.node_id);
 	const base = v ? v[1] : (n.host || n.node_id).split('.')[0];
-	return base.length > 7 ? base.slice(0, 6) + '…' : base;
+	// the end tells PCs apart (pc-0012 vs pc-0013), so a long name keeps its tail
+	return base.length > 7 ? '…' + base.slice(-6) : base;
 }
+/** Font size that fits a tile label inside one tile (about 0.62 em per character, 38 units of room). */
+export const labelSize = (label: string, max = 10) => Math.min(max, 38 / (Math.max(1, label.length) * 0.62));

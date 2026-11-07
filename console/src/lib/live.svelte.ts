@@ -49,7 +49,9 @@ export const live = $state({
 	labPower: [] as LabPower[]
 });
 const TAIL_MAX = 500;
-const putAlert = (a: Alert) => (live.alerts = [a, ...live.alerts.filter((x) => x.id !== a.id)].sort((x, y) => y.last_ms - x.last_ms));
+const putAlert = (a: Alert) => {
+	live.alerts = [a, ...live.alerts.filter((x) => x.id !== a.id)].sort((x, y) => y.last_ms - x.last_ms);
+};
 
 function noteWake(n: NodeRow) {
 	if (n.power === 'waking') live.wakeSince[n.node_id] ??= Date.now();

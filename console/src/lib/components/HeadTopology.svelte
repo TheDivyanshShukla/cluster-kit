@@ -32,7 +32,7 @@
 		known = new Set(views.map((s) => s.id));
 	});
 	const shown = $derived(stage === 'steady' ? views : snap);
-	const limit = $derived(size === 'mini' ? 3 : 5);
+	const limit = $derived(size === 'mini' ? 3 : size === 'wall' ? 2 : 5); // the wall is read from across the room: the first two take over
 	const rows = $derived(shown.slice(0, limit));
 
 	// The recruit slot: whenever fewer standbys exist than the target says.
@@ -161,12 +161,13 @@
 		</div>
 		{#if size !== 'mini' && pills.length}
 			<ul class="mt-2 flex flex-wrap gap-1.5" aria-label="Labs">
-				{#each pills as p (p.id)}
+				{#each size === 'wall' ? pills.slice(0, 4) : pills as p (p.id)}
 					<li class="bg-raised text-muted-foreground num flex max-w-full items-center gap-1.5 rounded-full px-2.5 py-1" title={p.noStandby ? `${pillWords(p)}: no standby in this lab` : pillWords(p)}>
 						<span class="max-w-[14rem] truncate">{pillWords(p)}</span>
 						{#if p.noStandby}<span class="bg-warn size-2 shrink-0 rounded-full" role="img" aria-label="no standby in this lab"></span>{/if}
 					</li>
 				{/each}
+				{#if size === 'wall' && pills.length > 4}<li class="text-muted-foreground px-1 py-1">+{pills.length - 4} more labs</li>{/if}
 			</ul>
 		{/if}
 		{#if note}<p class="mt-2" role="status">{note}</p>{/if}
