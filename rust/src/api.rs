@@ -2075,7 +2075,7 @@ fn handle(ctx: &Arc<Ctx>, auth: &Auth, mut rq: tiny_http::Request) {
         };
         let _ = rq.as_reader().take(max as u64 + 1).read_to_end(&mut body);
     }
-    let gz = rq.headers().iter().any(|h| h.field.equiv("Accept-Encoding") && h.value.as_str().contains("gzip"));
+    let gz = rq.headers().iter().any(|h| h.field.equiv("Accept-Encoding") && accepts_gzip(h.value.as_str()));
     let req = Req { method: rq.method().as_str().to_string(), path: path.to_string(), query, cookie, bearer, body, ip, gz };
     let out = if req.body.len() > mb("max_body_mb") && !(req.method == "POST" && matches!(req.path.as_str(), "/api/v1/jobs" | "/api/v1/experiments")) { bad(&format!("body is over {} MB", crate::tune::get("max_body_mb"))) } else { route(ctx, auth, &req) };
     let _ = match out {
@@ -2473,9 +2473,23 @@ fn advice_post(ctx: &Ctx, r: &Req, who: Option<&Who>, id: &str, op: &str, actor:
     json_out(200, json!({"suggestions": st.list}))
 }
 
+/// `Accept-Encoding` lists gzip without `q=0` (which means "never gzip").
+fn accepts_gzip(v: &str) -> bool {
+    v.split(',').any(|e| {
+        let mut p = e.split(';');
+        p.next().is_some_and(|c| c.trim().eq_ignore_ascii_case("gzip")) && !p.any(|q| q.trim().strip_prefix("q=").and_then(|x| x.parse::<f32>().ok()) == Some(0.0))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gzip_only_when_accepted() {
+        assert!(accepts_gzip("gzip, deflate, br") && accepts_gzip("br;q=1, GZIP;q=0.5"));
+        assert!(!accepts_gzip("gzip;q=0") && !accepts_gzip("identity, gzip; q=0.0") && !accepts_gzip("x-gzip") && !accepts_gzip(""));
+    }
     use crate::jobs::Bus;
     use crate::store::Store;
 

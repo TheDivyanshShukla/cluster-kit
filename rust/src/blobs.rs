@@ -221,6 +221,7 @@ pub fn evict(dir: &Path, limit: u64, keep: &[String]) -> Vec<String> {
         }
         let _ = fs::remove_file(dir.join(&sha));
         let _ = fs::remove_file(dir.join(format!("{sha}.idx")));
+        verified().lock().unwrap().remove(&sha); // or check_job would want a file no chunk asks the head for
         total -= size;
         gone.push(sha);
     }

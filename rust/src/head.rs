@@ -1883,7 +1883,9 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
     // connection is gone: its leases go back at once.
     let silent = err.as_ref().is_some_and(|e| matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock));
     if let (Some(w), Some(n)) = (gw.as_ref().filter(|w| lab_of(w).is_some()), &node) {
-        crate::hier::lab_head_gone(lab_of(w).map_or("", |l| l.lab.as_str())); // a standby lab head takes over from here
+        let lab = lab_of(w).map_or("", |l| l.lab.as_str());
+        let primary_left = !st.workers.values().any(|o| lab_of(o).is_some_and(|l| l.lab == lab) && !crate::hier::is_standby(o));
+        crate::hier::lab_head_gone(lab, &n.0, primary_left); // a standby lab head takes over from here
         if silent && !gone.is_empty() && crate::hier::on() {
             st.orphans.insert(n.0.clone(), Orphan { since: Instant::now(), lab: lab_of(w).map(|l| l.lab.clone()).unwrap_or_default(), addr: addr.clone(), leases: std::mem::take(&mut gone) });
             event(&ctx, "labhead.partition", "head", &format!("lab head {} of lab {} is silent: its leases are kept for {} s", n.1, lab_of(w).map_or("", |l| l.lab.as_str()), crate::tune::get("lab_silence_s")));

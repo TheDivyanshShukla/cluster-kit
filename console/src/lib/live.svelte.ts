@@ -65,7 +65,8 @@ let haAt = 0;
 /** HA settings + the PCs its selector matches. Callers at the same moment share one request, and a load in the last 2 s
  *  is reused unless `force` (an SSE change or a save): panels mounting together used to fetch it three times. */
 export function loadHaCfg(force = false): Promise<void> {
-	if (haLoad) return haLoad;
+	// a forced load must start after the change, so it queues behind one already in flight
+	if (haLoad) return force ? haLoad.then(() => loadHaCfg(true)) : haLoad;
 	if (!force && Date.now() - haAt < 2000) return Promise.resolve();
 	haLoad = (async () => {
 		try {

@@ -62,9 +62,13 @@ pub(crate) fn is_standby(w: &Worker) -> bool {
 }
 
 /// A lab head of `lab` left the root. Forgetting the standby entry is the takeover: the standby lab head (if connected) is
-/// now the lab's head and gets its leases at once; if the standby itself left, the controller picks another.
-pub(crate) fn lab_head_gone(lab: &str) {
-    h().standby.remove(lab);
+/// now the lab's head and gets its leases at once; if the standby itself left, the controller picks another. A duplicate lab
+/// head leaving (`primary_left` false, not the standby) keeps the standby as it is.
+pub(crate) fn lab_head_gone(lab: &str, node: &str, primary_left: bool) {
+    let mut g = h();
+    if primary_left || g.standby.get(lab).is_some_and(|s| s.0 == base(node)) {
+        g.standby.remove(lab);
+    }
 }
 
 pub fn start(ctx: Arc<Ctx>) {
@@ -915,7 +919,9 @@ mod tests {
         assert!(is_standby(&standby), "the chosen PC's lab head is the standby: no leases (head.rs lab_ok)");
         assert!(!is_standby(&primary));
         assert!(!is_standby(&lab_head(other, "pcA/lab-sbLabU")) && is_standby(&lab_head(other, "pcB/lab-sbLabU")), "per lab");
-        lab_head_gone(lab); // the primary's connection closed
+        lab_head_gone(lab, "pcC/lab-sbLabT", false); // a duplicate lab head left; the primary is still there
+        assert!(is_standby(&standby), "a duplicate leaving keeps the standby");
+        lab_head_gone(lab, "pcA/lab-sbLabT", true); // the primary's connection closed
         assert!(!is_standby(&standby), "promoted at once: it is the lab's head and gets leases");
         assert!(is_standby(&lab_head(other, "pcB/lab-sbLabU")), "other labs keep their standby");
         h().standby.remove(other);
