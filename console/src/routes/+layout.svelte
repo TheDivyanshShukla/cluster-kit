@@ -9,7 +9,7 @@
 	import EmptyState from '#lib/components/EmptyState.svelte';
 	import HaBanners from '#lib/components/HaBanners.svelte';
 	import { history } from '#lib/canvas/history.ts';
-	import { isStandby, live, startLive } from '#lib/live.svelte.ts';
+	import { isStandby, live, pcsOnline, startLive } from '#lib/live.svelte.ts';
 	import { atLeast } from '#lib/jobs.ts';
 	import { authed, loadMe, roleNow, session, signOut, userNow } from '#lib/session.svelte.ts';
 	import { palette } from '#lib/palette.svelte.ts';
@@ -96,7 +96,7 @@
 	}
 
 	let menu = $state<HTMLDetailsElement>();
-	const online = $derived((live.cluster?.workers ?? []).reduce((n, w) => n + (w.lab_pcs ? w.lab_pcs.length : 1), 0)); // a lab head stands for its PCs
+	const online = $derived(pcsOnline(live.cluster?.workers));
 </script>
 
 <svelte:head><title>Cluster Kit</title></svelte:head>

@@ -56,6 +56,10 @@ function noteWake(n: NodeRow) {
 	else delete live.wakeSince[n.node_id];
 }
 
+/** PCs online: a lab head counts as the PCs behind it, not as one PC. */
+export const pcsOnline = (ws: { lab_pcs?: unknown[] }[] = []) => ws.reduce((n, w) => n + (w.lab_pcs ? w.lab_pcs.length : 1), 0);
+/** PCs working now, counting the PCs behind each lab head. */
+export const pcsBusy = (ws: { busy: boolean; lab_pcs?: { busy?: boolean }[] }[] = []) => ws.reduce((n, w) => n + (w.lab_pcs ? w.lab_pcs.filter((p) => p.busy).length : w.busy ? 1 : 0), 0);
 let haLoad: Promise<void> | null = null;
 let haAt = 0;
 /** HA settings + the PCs its selector matches. Callers at the same moment share one request, and a load in the last 2 s

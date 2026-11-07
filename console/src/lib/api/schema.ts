@@ -34,7 +34,7 @@ export const Worker = z.object({
 	blocked: z.boolean().default(false),
 	cap: z.number().int().nullable().default(null),
 	/** set on a lab head: the PCs it serves */
-	lab_pcs: z.array(z.object({ node_id: z.string().nullable() })).optional()
+	lab_pcs: z.array(z.object({ node_id: z.string().nullable(), busy: z.boolean().optional() })).optional()
 });
 
 export const Job = z.object({

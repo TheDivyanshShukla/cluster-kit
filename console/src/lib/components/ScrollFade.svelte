@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	// A scrolling area that fills its parent, with a thin scrollbar and a soft shadow at the edge that has more content.
+	// A scrolling area that fills its parent, with a thin scrollbar and a hairline at the edge that has more content.
 	interface Props {
 		el?: HTMLElement;
 		viewH?: number;
@@ -39,12 +39,7 @@
 	>
 		<div class="min-h-full min-w-0">{@render children()}</div>
 	</div>
-	{#if more.t}<div class="fade pointer-events-none absolute inset-x-0 z-20 h-5" style="top:{fadeTop}px" aria-hidden="true"></div>{/if}
-	{#if more.b}<div class="fade pointer-events-none absolute inset-x-0 bottom-0 z-20 h-5 rotate-180" aria-hidden="true"></div>{/if}
+	<!-- a crisp line, not a gradient: the old shadow read as a grey blur over the content -->
+	{#if more.t}<div class="pointer-events-none absolute inset-x-0 z-20 border-t border-line" style="top:{fadeTop}px" aria-hidden="true"></div>{/if}
+	{#if more.b}<div class="pointer-events-none absolute inset-x-0 bottom-0 z-20 border-t border-line" aria-hidden="true"></div>{/if}
 </div>
-
-<style>
-	.fade {
-		background: linear-gradient(to bottom, color-mix(in oklab, var(--foreground) 14%, transparent), transparent);
-	}
-</style>

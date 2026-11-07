@@ -12,7 +12,7 @@
 	import ProgressBar from '#lib/components/ProgressBar.svelte';
 	import StateChip from '#lib/components/StateChip.svelte';
 	import { eventLabel } from '#lib/events.ts';
-	import { live } from '#lib/live.svelte.ts';
+	import { live, pcsBusy, pcsOnline } from '#lib/live.svelte.ts';
 	import { ago, count, datetime, duration, rate } from '#lib/format.ts';
 	import { elapsedMs, etaMs, jobRate, mergeRows, progress, runningJobs } from '#lib/jobs.ts';
 	import { card } from '#lib/ui.ts';
@@ -22,7 +22,7 @@
 	const c = $derived(live.cluster);
 	const workers = $derived(c?.workers ?? []);
 	const cores = $derived(workers.reduce((a, w) => a + w.threads, 0));
-	const busy = $derived(workers.filter((w) => w.busy).length);
+	const busy = $derived(pcsBusy(workers));
 	const running = $derived(runningJobs(c));
 	const throughput = $derived(running.length ? workers.filter((w) => w.busy).reduce((a, w) => a + w.rate, 0) : 0);
 	const now = $derived(c?.now_ms ?? Date.now());
@@ -66,9 +66,9 @@
 			{:else}
 				<dl class="divide-line grid grid-cols-2 sm:grid-cols-4 sm:divide-x" aria-label="Fleet numbers">
 					{#each [
-						{ label: 'PCs connected', value: count(workers.length) },
+						{ label: 'PCs connected', value: count(pcsOnline(workers)) },
 						{ label: 'Threads', value: count(cores) },
-						{ label: 'Working now', value: `${busy} / ${workers.length}` },
+						{ label: 'Working now', value: `${busy} / ${pcsOnline(workers)}` },
 						{ label: 'Throughput', value: rate(throughput) }
 					] as k (k.label)}
 						<div class="px-4 py-2.5"><dt class="text-muted-foreground text-xs">{k.label}</dt><dd class="num text-xl font-semibold tracking-tight" aria-live="off">{k.value}</dd></div>

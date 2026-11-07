@@ -21,11 +21,10 @@
 	const facets = $derived(l.spec.facets.filter((f) => !show || show.includes(f.key)));
 	const opts = $derived(facets.map((f) => ({ f, o: l.options(rows, f.key) })).filter((x) => x.o.length > 0));
 
-	// Chips wrap to at most two rows on desktop (one scrollable row with edge fades on a phone); when facets do not fit,
+	// Chips wrap to at most two rows on desktop (one scrollable row on a phone; no edge fades, they read as blur); when facets do not fit,
 	// a Filters popover lists every one of them.
 	let strip = $state<HTMLDivElement>();
 	let clipped = $state(false);
-	let fade = $state({ l: false, r: false });
 	let pop = $state(false);
 	let at = $state({ top: 0, left: 0 });
 	let btn = $state<HTMLButtonElement>();
@@ -33,7 +32,6 @@
 		const s = strip;
 		if (!s) return;
 		clipped = s.scrollHeight > s.clientHeight + 2 || s.scrollWidth > s.clientWidth + 2;
-		fade = { l: s.scrollLeft > 2, r: s.scrollLeft + s.clientWidth < s.scrollWidth - 2 };
 	};
 	$effect(() => {
 		void opts;
@@ -51,7 +49,6 @@
 		pop = !pop;
 	}
 	const nActive = $derived(Object.values(l.state.f).reduce((a, v) => a + v.length, 0));
-	const mask = $derived(`${fade.l ? 'linear-gradient(to right, transparent, #000 20px' : 'linear-gradient(to right, #000 0'}, ${fade.r ? '#000 calc(100% - 20px), transparent)' : '#000 100%)'}`);
 
 	function key(e: KeyboardEvent) {
 		const t = e.target as HTMLElement | null;
@@ -112,7 +109,6 @@
 				bind:this={strip}
 				onscroll={measure}
 				class="thin flex min-w-0 flex-1 items-center gap-x-4 gap-y-1 overflow-x-auto max-sm:flex-nowrap sm:max-h-[3.6rem] sm:flex-wrap sm:overflow-x-hidden sm:overflow-y-hidden"
-				style="mask-image:{mask};-webkit-mask-image:{mask}"
 				role="group"
 				aria-label="Filters"
 			>
