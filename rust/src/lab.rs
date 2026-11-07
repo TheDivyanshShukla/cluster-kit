@@ -543,6 +543,9 @@ fn streamer(ctx: Arc<Ctx>, _lab_name: String) {
         // 1. batch pending pieces
         let mut frames: Vec<((u64, u64, u64), Vec<u8>, Option<Vec<u8>>)> = vec![];
         let mut finished: Vec<(u64, u64, u64, u64)> = vec![];
+        // fz1: leases that finished while the link to the root was down (a failover): `finished` but never announced. The reconnect list only
+        // makes the root ACK them, and the ACK of a lease the root was never told about is ignored (done_sent), so they stayed forever.
+        let mut redo: Vec<(u64, u64, u64, u64)> = vec![];
         let mut failed: Vec<(u64, u64, u64, u64)> = vec![];
         {
             let mut g = lab();
@@ -550,6 +553,9 @@ fn streamer(ctx: Arc<Ctx>, _lab_name: String) {
             for k in keys {
                 let l = g.leases.get_mut(&k).unwrap();
                 if l.finished {
+                    if !l.done_sent && l.local != 0 {
+                        redo.push((k.0, k.1, k.2, l.local));
+                    }
                     continue;
                 }
                 let pend = std::mem::take(&mut l.pending);
@@ -598,7 +604,7 @@ fn streamer(ctx: Arc<Ctx>, _lab_name: String) {
             }
             // throughput of the whole lab since the window opened (leases run side by side, so one lease's own time says little)
             let rate = if finished.is_empty() { 0.0 } else { window_rate() };
-            for (j, a, b, _) in &finished {
+            for (j, a, b, _) in finished.iter().chain(&redo) {
                 ok &= o.put(CTRL, serde_json::json!({"lease_done": {"job": j, "a": a, "b": b, "secs": 0.0, "rate": rate}}).to_string().as_bytes()).is_ok();
                 if let Some(l) = lab().leases.get_mut(&(*j, *a, *b)) {
                     l.done_sent = ok;

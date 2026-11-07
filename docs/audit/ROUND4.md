@@ -132,3 +132,18 @@ Already minimal, left alone (measured): `ck run` already gets parts in the submi
 Freeze tests for the folded ACK path (`scripts/stress/trips_freeze.py`, 12 PCs, ~20 s of work, bound 55 s): SIGSTOP one agent process for 9 s (23.9 s, exact), kill -9 one agent process with 2 chunks per PC prefetched (27.7 s, exact), SIGSTOP the head for 6 s (25.1 s, exact). Slow link through the netfault proxy: `mode_slow` 22.2 s and `mode_latency` 30.8 s, exact.
 
 Gate on the final binary: 242 Rust tests, `chaos.sh` 5 of 5, `robust.py all` 120 of 120, `lifecycle.py double` PASS, `hier_bench.py standby` and `comeback` ALL PASSED, SDK tests 60 of 60 (3 new), ruff clean. One timing-based SDK test (`test_advise_hot_loop_and_gil`, thread scaling) fails now and then when the Mac is loaded: 2 of 5 suite runs on the unchanged code, 2 of 6 on the new code, and it passes alone.
+
+## 9. Freeze hunt (fz1)
+
+`scripts/stress/freeze.py` pauses (SIGSTOP for 2, 8 or 40 s, then SIGCONT) or kills (-9) every role at a random moment (fixed seed, printed): head, standby, lab head, lab-head standby, agent, `ck run` client and an SDK caller. It also covers two roles at once and a pause during a failover, across synth, cmd, list, SDK-with-blob and cancel jobs, on a plain fleet and on a lab-head fleet. A case passes when the job ends exact (or cleanly failed or cancelled) within 3x its no-fault time plus the fault time plus 30 s, with no leases, in-flight chunks or orphan processes left. Each fleet has 12 virtual PCs, and at most 2 fleets run at once.
+
+The matrix ran 112 cases with seed 1 and part of seed 2 before a reboot, then 41 cases on the fixed build afterwards. All of the 41 pass.
+
+| # | Freeze or bug | Cause | Fix |
+| --- | --- | --- | --- |
+| F1 | When the blob port was taken, the job stalled at 0 forever | `blobs::start_server` left the bound port at 0, so the PCs were told to fetch from `ip:0` | bind any free port and announce that one |
+| F2 | Every `ck.shard` SDK job failed in about 11 s ("blob ... is missing or was corrupt") | `check_job` (added this round) demanded every blob of the job, but a PC holds only those its chunks use | a blob this process never verified counts as not needed here, not as lost |
+| F3 | After a root failover, finished leases stayed on a lab head for good | a lease that finished while the uplink was down was never announced, and the root ignores the ACK of a lease it was never told about | resend `lease_done` until it is sent |
+| F4 | A lab head that came back after its standby took over deadlocked the root | `h()` held across an `if let` body | fixed in defad7a; the hier_bench `comeback` case covers it |
+
+Still open: with seed 2, two lab-head cases with an agent paused finished at 3-6x the no-fault time, including a 43 s window with no progress while 2 PCs sat idle. They recovered without help, so this is slow recovery, not a freeze; the cause is not yet known.

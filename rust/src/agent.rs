@@ -14,7 +14,7 @@ use crate::auth::{self, FrameMac};
 use crate::head::{recv_any, Out};
 use crate::kernels::{run_task_out, CANCELLED, CANCELLED_RANGE};
 use crate::proto::*;
-use crate::{die, Opts};
+use crate::Opts;
 
 /// Join code for the head's own worker (set by head::run); other agents read CK_JOIN_CODE.
 pub static LOCAL_CODE: OnceLock<String> = OnceLock::new();

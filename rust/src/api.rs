@@ -1710,7 +1710,7 @@ fn put_quota(ctx: &Ctx, r: &Req, name: &str, actor: &str) -> Out {
     let v = match parse_body(r) { Ok(v) => v, Err(o) => return o };
     let Some(u) = ctx.store.users().into_iter().find(|u| u.name == name) else { return fail(404, "not_found", "no such user") };
     let cur = head::quota_of(ctx, name);
-    let mut get = |k: &str, old: u32| match v.get(k) {
+    let get = |k: &str, old: u32| match v.get(k) {
         None => Ok(old),
         Some(x) => uint(x).filter(|n| *n <= 1_000_000).map(|n| n as u32).ok_or(format!("{k} must be a whole number from 0 to 1000000")),
     };

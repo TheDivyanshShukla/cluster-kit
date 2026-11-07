@@ -1293,7 +1293,7 @@ pub fn hsim(s: &HScn) -> HOut {
             }
             m.refill(l, 0.0);
         }
-        if let Some((l, at, len)) = s.part.filter(|&(l, _, len)| l < nlabs && len > s.ttl_s) {
+        if let Some((l, at, _)) = s.part.filter(|&(l, _, len)| l < nlabs && len > s.ttl_s) {
             m.push(at + s.ttl_s, HK::Fence { lab: l }); // silent longer than the timeout: the root takes the leases back
         }
         if let Some((l, at)) = s.kill_lab.filter(|&(l, _)| l < nlabs) {

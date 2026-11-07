@@ -320,8 +320,15 @@ static BOUND: AtomicU64 = AtomicU64::new(0);
 pub fn start_server() -> u16 {
     SERVER.call_once(|| {
         let port = blob_port();
-        match TcpListener::bind(("0.0.0.0", port)) {
+        // fz1: a taken blob port used to leave BOUND at 0, and the head then told its PCs to fetch from "ip:0" (EADDRNOTAVAIL, retried
+        // forever, the job never finished). Take any free port instead: the port is announced to the PCs, which need no fixed number.
+        let bound = TcpListener::bind(("0.0.0.0", port)).or_else(|e| {
+            crate::warnl!("blob.port", "blob port {port}: {e}; using a free port instead");
+            TcpListener::bind(("0.0.0.0", 0))
+        });
+        match bound {
             Ok(l) => {
+                let port = l.local_addr().map(|a| a.port()).unwrap_or(port);
                 BOUND.store(port as u64, Relaxed);
                 thread::spawn(move || {
                     for s in l.incoming().flatten() {
@@ -709,6 +716,11 @@ pub fn check_job(job: u64) -> Result<(), String> {
     let dir = cache_dir();
     for sha in l.iter().filter(|s| valid_sha(s)) {
         let m = fs::metadata(dir.join(sha)).ok().filter(|m| m.is_file());
+        // fz1: the job's list names every blob of the job, but a PC holds only the ones its chunks use (ck.shard places them per chunk).
+        // A file this process never verified is not "lost", it is not needed here; failing on it failed every SDK shard job.
+        if m.is_none() && !verified().lock().unwrap().contains_key(sha.as_str()) {
+            continue;
+        }
         if !m.is_some_and(|m| m.modified().is_ok_and(|t| verify(&dir, sha, m.len(), t))) {
             // gone (the sweep above may have deleted it a moment ago) or bad: the head must learn this PC no longer has it
             RESYNC.store(true, Relaxed);

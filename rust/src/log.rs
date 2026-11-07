@@ -344,7 +344,7 @@ fn writer(rx: Receiver<Msg>, node: String, dir: PathBuf) {
             (max, keep) = (crate::tune::n("log_max_mb") << 20, crate::tune::n("log_keep") as usize);
             sinks.iter_mut().flatten().for_each(|s| s.set_limits(max, keep));
         }
-        flush_to.into_iter().for_each(|a| drop(a.send(())));
+        flush_to.into_iter().for_each(|a| { let _ = a.send(()); });
     }
 }
 
