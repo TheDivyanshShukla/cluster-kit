@@ -84,8 +84,8 @@
 			{#if kind === 'handover'}<ArrowRightLeft class="size-5" aria-hidden="true" />{:else}<Crown class="size-5" aria-hidden="true" />{/if}
 			{#if lostK}<X class="text-bad absolute -inset-0.5 size-6" strokeWidth={3} aria-hidden="true" />{/if}
 		</span>
-		<span class="min-w-0">
-			<span class="block font-semibold tracking-tight {lostK ? 'text-bad' : kind === 'handover' ? 'text-primary' : ''}">{lostK ? 'Head lost' : kind === 'handover' ? 'Handing over' : 'HEAD'}{#if kind === 'ok' && h?.head}<span class="text-muted-foreground ml-1.5 font-normal" title={h.head.addr}>{headHost}</span>{/if}</span>
+		<span class="min-w-0 flex-1">
+			<span class="flex min-w-0 items-baseline font-semibold tracking-tight {lostK ? 'text-bad' : kind === 'handover' ? 'text-primary' : ''}"><span class="shrink-0">{lostK ? 'Head lost' : kind === 'handover' ? 'Handing over' : 'HEAD'}</span>{#if kind === 'ok' && h?.head}<span class="text-muted-foreground ml-1.5 min-w-0 truncate font-normal" title="{headHost} {h.head.addr}">{headHost}</span>{/if}</span>
 			<span class="text-muted-foreground num block {compact ? 'truncate' : ''}">
 				{h?.role === 'standby' ? 'this console is on a standby' : `${h?.connected ?? 0}/${h?.membership ?? 0} PCs`}{#if kind === 'ok' && h?.head?.since_ms}{` · up ${duration(Date.now() - h.head.since_ms)}`}{/if}
 			</span>

@@ -12,7 +12,7 @@
 	import { pct } from '#lib/format.ts';
 	import { atLeast } from '#lib/jobs.ts';
 	import { live } from '#lib/live.svelte.ts';
-	import { autoArrange, AVAIL, boxCells, cellAt, STATE_LOOK, toItems, type Overlay } from '#lib/map.ts';
+	import { autoArrange, AVAIL, boxCells, cellAt, cpuTone, STATE_LOOK, SWATCH, toItems, type Overlay } from '#lib/map.ts';
 	import { roleNow } from '#lib/session.svelte.ts';
 	import { fleetWords, powerCounts } from '#lib/topology.ts';
 	import { btnGhost, btnPrimary, field } from '#lib/ui.ts';
@@ -36,7 +36,19 @@
 	// ---- pointer interaction: click selects, drag moves (edit mode), dragging empty floor box-selects
 	type Rec = { x: number; y: number; labId: number | null; nodeId: string | null; shift: boolean; moved: boolean };
 	let rec: Rec | null = null;
-	let drag = $state<{ id: string; x: number; y: number } | null>(null);
+	let drag = $state<{ id: string; x: number; y: number; target: { lab: number; x: number; y: number; taken: boolean } | null } | null>(null);
+	// the seat under the pointer while dragging (null off the map)
+	function seatAt(cx: number, cy: number, id: string) {
+		const svg = document.elementFromPoint(cx, cy)?.closest('svg[data-lab]');
+		const lab = svg && live.labs.find((l) => l.id === Number(svg.getAttribute('data-lab')));
+		const c = lab && cellAt(svg.getBoundingClientRect(), cx, cy, lab.w, lab.h);
+		if (!lab || !c) return null;
+		const taken = items.some((i) => i.node.lab_id === lab.id && i.node.x === c.x && i.node.y === c.y && i.node.node_id !== id);
+		return { lab: lab.id, ...c, taken };
+	}
+	// pointer moves are folded to one update per frame: the page re-renders at most 60 times a second while dragging
+	let raf = 0;
+	let lastMove: PointerEvent | null = null;
 	let boxPx = $state<{ labId: number; x0: number; y0: number; x1: number; y1: number } | null>(null);
 	const svgOf = (labId: number) => document.querySelector<SVGElement>(`svg[data-lab="${labId}"]`)?.getBoundingClientRect();
 	const toggle = (id: string, multi: boolean) =>
@@ -48,10 +60,15 @@
 	}
 	function move(e: PointerEvent) {
 		if (!rec) return;
+		lastMove = e;
+		if (!raf) raf = requestAnimationFrame(() => ((raf = 0), lastMove && step(lastMove)));
+	}
+	function step(e: PointerEvent) {
+		if (!rec) return;
 		if (!rec.moved && Math.hypot(e.clientX - rec.x, e.clientY - rec.y) < 5) return;
 		rec.moved = true;
 		if (rec.nodeId) {
-			if (editing) drag = { id: rec.nodeId, x: e.clientX, y: e.clientY };
+			if (editing) drag = { id: rec.nodeId, x: e.clientX, y: e.clientY, target: seatAt(e.clientX, e.clientY, rec.nodeId) };
 		} else if (rec.labId != null) {
 			const r = svgOf(rec.labId), lab = live.labs.find((l) => l.id === rec!.labId);
 			if (r && lab)
@@ -63,6 +80,8 @@
 		}
 	}
 	async function up(e: PointerEvent) {
+		cancelAnimationFrame(raf);
+		raf = 0;
 		const r = rec, d = drag, b = boxPx;
 		rec = null; drag = null; boxPx = null;
 		if (!r) return;
@@ -77,13 +96,9 @@
 			return;
 		}
 		if (d && editing) {
-			const el = document.elementFromPoint(e.clientX, e.clientY);
-			const svg = el?.closest('svg[data-lab]');
-			if (svg) {
-				const lab = live.labs.find((l) => l.id === Number(svg.getAttribute('data-lab')));
-				const c = lab && cellAt(svg.getBoundingClientRect(), e.clientX, e.clientY, lab.w, lab.h);
-				if (lab && c) return void place(d.id, lab.id, c.x, c.y);
-			} else if (el?.closest('[data-unplace]')) return void unplace([d.id]);
+			const t = seatAt(e.clientX, e.clientY, d.id);
+			if (t) return void place(d.id, t.lab, t.x, t.y);
+			if (document.elementFromPoint(e.clientX, e.clientY)?.closest('[data-unplace]')) return void unplace([d.id]);
 		} else if (b) {
 			const lab = live.labs.find((l) => l.id === b.labId), rect = svgOf(b.labId);
 			if (!lab || !rect) return;
@@ -107,19 +122,33 @@
 		if (lab && x >= 0 && y >= 0 && x < lab.w && y < lab.h) void place(n.node_id, lab.id, x, y);
 	}
 
+	// Optimistic: the tile moves at once (and glides, FloorMap), the head confirms after. A taken seat swaps the two PCs;
+	// the one sitting there goes to the moved PC's old seat (or to Unplaced if it had none).
 	async function place(id: string, lab_id: number, x: number, y: number) {
 		err = '';
+		const n = live.nodes[id];
+		if (!n || (n.lab_id === lab_id && n.x === x && n.y === y)) return;
+		const occ = Object.values(live.nodes).find((o) => o.node_id !== id && o.lab_id === lab_id && o.x === x && o.y === y);
+		const had = n.lab_id != null && n.x != null && n.y != null;
+		const back = had ? { lab_id: n.lab_id!, x: n.x!, y: n.y! } : { lab_id: null };
+		live.nodes[id] = { ...n, lab_id, x, y };
+		if (occ) live.nodes[occ.node_id] = { ...occ, lab_id: n.lab_id, x: had ? n.x : null, y: had ? n.y : null };
 		try {
+			if (occ) await api.place(occ.node_id, { lab_id: null }); // frees the seat first
 			live.nodes[id] = (await api.place(id, { lab_id, x, y })).node;
+			if (occ) live.nodes[occ.node_id] = (await api.place(occ.node_id, back)).node;
 		} catch (e) {
-			err = e instanceof ApiError ? (e.status === 409 ? 'That seat is taken. Pick an empty one.' : e.message) : 'Could not place the PC.';
+			err = e instanceof ApiError ? (e.status === 409 ? 'That seat was just taken. Try another one.' : e.message) : 'Could not place the PC.';
+			// put back what the head really has
+			for (const k of occ ? [id, occ.node_id] : [id]) api.node(k).then((r) => (live.nodes[k] = r.node)).catch(() => {});
 		}
 	}
 	async function unplace(ids: string[]) {
 		err = '';
 		busy = true;
 		try {
-			for (const id of ids) live.nodes[id] = (await api.place(id, { lab_id: null })).node;
+			for (const id of ids) if (live.nodes[id]) live.nodes[id] = { ...live.nodes[id], lab_id: null, x: null, y: null };
+		for (const id of ids) live.nodes[id] = (await api.place(id, { lab_id: null })).node;
 			selected = selected.filter((s) => !ids.includes(s));
 		} catch (e) {
 			err = e instanceof ApiError ? e.message : 'Could not remove the PC from the map.';
@@ -169,21 +198,33 @@
 
 	<Panel title="Map" tab="map" label="Floor map" count={live.labs.length ? `${live.labs.length} lab${live.labs.length === 1 ? '' : 's'}` : undefined}>
 		<div class="space-y-3">
-			<p class="text-muted-foreground flex flex-wrap gap-x-4 gap-y-1 text-xs" aria-label="Legend">
-	{#if overlay === 'state'}
-		{#each Object.entries(STATE_LOOK) as [s, v] (s)}<span><span class="text-foreground font-mono text-sm">{v.glyph}</span> {s}</span>{/each}
-	{:else if overlay === 'cpu'}
-		<span>number = CPU %</span><span>below 25 idle</span><span>25 to 60 normal</span><span>60 to 85 high</span><span>85 up busiest</span>
-	{:else if overlay === 'avail'}
-		{#each Object.values(AVAIL) as a (a.label)}<span><span class="text-foreground font-mono text-sm">{a.glyph}</span> {a.label}</span>{/each}
-	{:else}
-		<span><span class="text-foreground font-mono text-sm">▶</span> working</span><span><span class="text-foreground font-mono text-sm">–</span> idle</span>
-	{/if}
-	<span>OFFLINE = dimmed, not connected</span>
-	<span class="inline-flex items-center gap-1"><Moon class="text-foreground size-3.5" aria-hidden="true" />asleep (dashed, faint)</span>
-	<span class="inline-flex items-center gap-1"><Sunrise class="text-warn size-3.5" aria-hidden="true" />waking (warn outline)</span>
-</p>
-			{#if Object.keys(live.nodes).length}<p class="num text-[13px] font-medium" aria-label="PCs by power state">{fleetWords(counts)}</p>{/if}
+			{#snippet sw(tone: keyof typeof SWATCH, glyph: string, label: string)}
+				<li class="inline-flex items-center gap-1.5"><span class="grid size-4 place-items-center rounded-[4px] border text-[9px] leading-none font-semibold {SWATCH[tone]}" aria-hidden="true">{glyph}</span>{label}</li>
+			{/snippet}
+			<div class="flex flex-wrap items-center justify-between gap-x-6 gap-y-2">
+				<ul class="text-muted-foreground flex flex-wrap items-center gap-x-3.5 gap-y-1.5 text-xs" aria-label="Legend">
+					{#if overlay === 'state'}
+						{#each Object.entries(STATE_LOOK) as [st, v] (st)}{@render sw(v.tone, v.glyph, st)}{/each}
+					{:else if overlay === 'cpu'}
+						{#each [[10, 'under 25 %'], [40, '25 to 60'], [70, '60 to 85'], [90, 'over 85']] as const as [c, t] (t)}{@render sw(cpuTone(c), '', t)}{/each}
+					{:else if overlay === 'avail'}
+						{#each Object.values(AVAIL) as a (a.label)}{@render sw(a.tone, a.glyph, a.label)}{/each}
+					{:else}
+						{@render sw('busy', '▶', 'working')}{@render sw('idle', '', 'idle')}
+					{/if}
+					<li class="border-line ml-1 border-l pl-3.5">faded: offline</li>
+					<li class="inline-flex items-center gap-1"><Moon class="size-3.5" aria-hidden="true" />asleep</li>
+					<li class="text-warn inline-flex items-center gap-1"><Sunrise class="size-3.5" aria-hidden="true" />waking</li>
+				</ul>
+				{#if Object.keys(live.nodes).length}<p class="num text-muted-foreground text-xs font-medium" aria-label="PCs by power state">{fleetWords(counts)}</p>{/if}
+			</div>
+			{#if editing}
+				<div class="border-primary/40 bg-primary/10 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border px-3 py-2 text-[13px]" role="status">
+					<Pencil class="text-primary size-4 shrink-0" aria-hidden="true" />
+					<p class="min-w-0 flex-1">Drag a PC to a seat. Drop it on another PC to swap them, or on <span class="font-medium">Unplaced</span> to take it off the map. Arrow keys move the focused PC.</p>
+					<button type="button" class="{btnPrimary} shrink-0" onclick={() => ((edit = false), (selected = []))}>Done</button>
+				</div>
+			{/if}
 			{#if selected.length}<NodeActions ids={selected} ondone={() => (selected = [])} />{/if}
 			{#if err}<p class="text-bad text-[13px]" role="alert">{err}</p>{/if}
 			{#if !live.cluster && !Object.keys(live.nodes).length}
@@ -227,6 +268,7 @@
 							flash={live.flash}
 							{editing}
 							dragging={drag?.id ?? null}
+							target={drag?.target?.lab === lab.id ? drag.target : null}
 							box={boxPx?.labId === lab.id ? boxPx : null}
 							ondown={down}
 							onkey={key}
@@ -248,12 +290,10 @@
 
 	<Panel title="Unplaced" tab="unplaced" count={unplaced.length} label="Unplaced PCs">
 		<div data-unplace>
-
-				<h2 class="text-[13px] font-semibold">Unplaced <span class="text-muted-foreground num font-normal">({unplaced.length})</span></h2>
 				{#if unplaced.length === 0}
-					<p class="text-muted-foreground mt-2 text-xs">Every PC has a seat.</p>
+					<p class="text-muted-foreground text-xs">Every PC has a seat.</p>
 				{:else}
-					<ul class="mt-2 grid max-h-80 gap-1 overflow-y-auto">
+					<ul class="grid max-h-80 gap-1 overflow-y-auto {drag ? 'outline-primary/50 rounded-lg outline-2 outline-dashed' : ''}">
 						{#each unplaced as it (it.node.node_id)}
 							<li>
 								<button
@@ -271,7 +311,6 @@
 					</ul>
 				{/if}
 				{#if editing}
-					<p class="text-muted-foreground mt-3 text-xs">Drag a PC onto a seat, or select it and click a seat. On a keyboard, focus a tile and use the arrow keys, or use the form below.</p>
 					<div class="border-line mt-3 grid gap-2 border-t pt-3">
 						<div class="flex gap-2">
 							<select value={arrangeLab ?? live.labs[0]?.id} onchange={(e) => (arrangeLab = Number(e.currentTarget.value))} class="{field} min-w-0 flex-1" aria-label="Lab to fill">
@@ -284,8 +323,9 @@
 							<MapPinOff class="size-4" aria-hidden="true" />Remove from map{selPlaced.length ? ` (${selPlaced.length})` : ''}
 						</button>
 					</div>
-					<form class="border-line mt-3 grid gap-2 border-t pt-3" onsubmit={placeAt}>
-						<p class="text-[13px] font-medium">Place at</p>
+					<details class="border-line mt-3 border-t pt-3">
+					<summary class="text-muted-foreground hover:text-foreground cursor-pointer text-xs">Place by seat number</summary>
+					<form class="mt-2 grid gap-2" onsubmit={placeAt}>
 						<select bind:value={at.id} required class={field} aria-label="PC to place">
 							<option value="" disabled>PC…</option>
 							{#each unplaced as it (it.node.node_id)}<option value={it.node.node_id}>{it.node.host}</option>{/each}
@@ -299,6 +339,7 @@
 						</div>
 						<button type="submit" class={btnGhost} disabled={!at.id}><LayoutGrid class="size-4" aria-hidden="true" />Place</button>
 					</form>
+					</details>
 				{/if}
 			
 		</div>

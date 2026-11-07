@@ -6,7 +6,7 @@
 	import { count, duration, rate, watts } from '#lib/format.ts';
 	import { progress, runningJobs } from '#lib/jobs.ts';
 	import { failoverView } from '#lib/ha.ts';
-	import { live, loadPowerCfg, tickFailover } from '#lib/live.svelte.ts';
+	import { live, loadPowerCfg, pcsOnline, tickFailover } from '#lib/live.svelte.ts';
 	import { toItems } from '#lib/map.ts';
 	import { powerCounts, tickerLines } from '#lib/topology.ts';
 
@@ -37,7 +37,7 @@
 	const fo = $derived(failoverView(live.failover, now));
 	const lost = $derived(Object.values(live.lost));
 	const stats = $derived([
-		{ label: 'PCs online', value: count(ws.length) },
+		{ label: 'PCs online', value: count(pcsOnline(ws)) },
 		{ label: 'Threads', value: count(ws.reduce((a, w) => a + w.threads, 0)) },
 		{ label: 'Throughput', value: rate(ws.reduce((a, w) => a + w.rate, 0)) }
 	]);

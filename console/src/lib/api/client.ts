@@ -168,6 +168,7 @@ export const api = {
 	setHaSettings: (s: HaSettings) => call('PUT', '/api/v1/ha/settings', HaSettingsReply, s),
 	setNodeState: (node_ids: string[], state: NodeState, reason = '') =>
 		call('POST', '/api/v1/nodes/state', NodesChanged, { node_ids, state, ...(reason ? { reason } : {}) }),
+	node: (id: string) => call('GET', `/api/v1/nodes/${encodeURIComponent(id)}`, NodeOne),
 	/** lab null unplaces the PC. 409 means the seat is taken. */
 	place: (id: string, spot: { lab_id: number; x: number; y: number } | { lab_id: null }) =>
 		call('PUT', `/api/v1/nodes/${encodeURIComponent(id)}/place`, NodeOne, spot),

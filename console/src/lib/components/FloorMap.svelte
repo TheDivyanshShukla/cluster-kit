@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { Moon, Sunrise, TriangleAlert } from '@lucide/svelte';
+	import { fade } from 'svelte/transition';
 	import type { LabRow } from '#lib/api/schema.ts';
 	import { identifying } from '#lib/format.ts';
 	import { live } from '#lib/live.svelte.ts';
@@ -18,10 +19,12 @@
 		/** box-select rectangle in cell units */
 		box?: { x0: number; y0: number; x1: number; y1: number } | null;
 		dragging?: string | null;
+		/** the seat under a dragged PC: free (move there) or taken (swap) */
+		target?: { x: number; y: number; taken: boolean } | null;
 		ondown?: (e: PointerEvent, labId: number, nodeId: string | null) => void;
 		onkey?: (e: KeyboardEvent, item: Item) => void;
 	}
-	let { lab, items, overlay, selected = [], flash = {}, editing = false, wall = false, box = null, dragging = null, ondown, onkey }: Props = $props();
+	let { lab, items, overlay, selected = [], flash = {}, editing = false, wall = false, box = null, dragging = null, target = null, ondown, onkey }: Props = $props();
 
 	// waking tiles show how long ago the packet went out; one clock tick per second only while some PC is waking
 	let now = $state(Date.now());
@@ -53,8 +56,8 @@
 			y={c.y * CELL + 1}
 			width={CELL - 2}
 			height={CELL - 2}
-			rx="6"
-			class="fill-raised/40 stroke-line"
+			rx="8"
+			class="seat {editing ? 'fill-raised/40 stroke-muted-foreground/40' : 'fill-raised/25 stroke-line/60'}"
 			stroke-width="1"
 			stroke-dasharray={editing ? '3 3' : undefined}
 		/>
@@ -65,18 +68,19 @@
 		<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 		<g
 			data-node={it.node.node_id}
-			transform="translate({it.node.x! * CELL} {it.node.y! * CELL})"
+			style="transform:translate({it.node.x! * CELL}px,{it.node.y! * CELL}px)"
+			in:fade={{ duration: 150 }}
 			role="button"
 			tabindex={wall ? undefined : 0}
 			aria-pressed={sel}
 			aria-label="{it.node.host}, {it.node.state}{it.node.online ? '' : ', offline'}, {l.label}"
-			class="{editing ? 'cursor-grab' : 'cursor-pointer'} {l.dim ? 'opacity-40' : ''} {dragging === it.node.node_id ? 'opacity-30' : ''}"
+			class="tile {editing ? 'cursor-grab' : 'cursor-pointer'} {l.dim ? 'opacity-40' : ''} {dragging === it.node.node_id ? 'opacity-25' : ''}"
 			onkeydown={(e) => onkey?.(e, it)}
 		>
 			<title>{it.node.host}: {it.node.state}{it.node.online ? '' : ' (offline)'}, {l.label}</title>
-			<rect x="2" y="2" width={CELL - 4} height={CELL - 4} rx="6" class="{l.fill} {l.stroke}" stroke-width="1.5" stroke-dasharray={l.dash ? '4 2' : undefined} />
-			<text x={l.power ? 4 : CELL / 2} y="14" text-anchor={l.power ? 'start' : 'middle'} font-size={l.power ? 8.5 : 9} class="fill-muted-foreground pointer-events-none">{tileLabel(it.node)}</text>
-			<text x={CELL / 2} y="31" text-anchor="middle" font-size="15" font-weight="600" class="{l.text} pointer-events-none">{l.glyph}</text>
+			<rect x="2" y="2" width={CELL - 4} height={CELL - 4} rx="8" class="{l.fill} {l.stroke}" stroke-width="1.25" stroke-dasharray={l.dash ? '4 2' : undefined} />
+			<text x={l.power ? 5 : CELL / 2} y={l.glyph || l.power || !it.node.online ? 16 : CELL / 2 + 3.5} text-anchor={l.power ? 'start' : 'middle'} font-size={l.power ? 8.5 : 10} font-weight="500" class="fill-foreground/85 pointer-events-none">{tileLabel(it.node)}</text>
+			<text x={CELL / 2} y="32" text-anchor="middle" font-size="12" font-weight="600" class="{l.text} pointer-events-none">{l.glyph}</text>
 				{#if identifying(it.node, now)}<rect x="1" y="1" width={CELL - 2} height={CELL - 2} rx="7" fill="none" class="ck-pulse stroke-primary pointer-events-none" stroke-width="4" />{/if}
 				{#if l.power === 'waking'}<rect x="2" y="2" width={CELL - 4} height={CELL - 4} rx="6" fill="none" class="ck-pulse stroke-warn pointer-events-none" stroke-width="1.5" />{/if}
 			{#if l.power === 'asleep'}<Moon x={CELL - 14} y="3" width="11" height="11" class="stroke-muted-foreground pointer-events-none" />
@@ -96,6 +100,12 @@
 			{/key}
 		</g>
 	{/each}
+	{#if target}
+		<g class="pointer-events-none" style="transform:translate({target.x * CELL}px,{target.y * CELL}px)">
+			<rect x="1" y="1" width={CELL - 2} height={CELL - 2} rx="9" class={target.taken ? 'fill-warn/15 stroke-warn' : 'fill-primary/15 stroke-primary'} stroke-width="2" />
+			{#if target.taken}<text x={CELL / 2} y={CELL - 5} text-anchor="middle" font-size="7.5" font-weight="700" class="fill-warn">SWAP</text>{/if}
+		</g>
+	{/if}
 	{#if box}
 		<rect
 			x={Math.min(box.x0, box.x1) * CELL}
@@ -142,6 +152,19 @@
 		.ck-flash {
 			display: none;
 		}
+	}
+	.tile {
+		transform-box: view-box;
+	}
+	@media (prefers-reduced-motion: no-preference) {
+		.tile {
+			transition:
+				transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1),
+				opacity 150ms;
+		}
+	}
+	.seat {
+		transition: fill 120ms;
 	}
 	g:focus-visible {
 		outline: 2px solid var(--ring);

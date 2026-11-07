@@ -18,7 +18,7 @@ test('state overlay: every state has its own glyph', () => {
 
 test('cpu and work overlays', () => {
 	expect(look(item({}, wk({ cpu: 91.4 })), 'cpu')).toMatchObject({ glyph: '91', stroke: 'stroke-bad' });
-	expect(look(item({}, wk({ cpu: 10 })), 'cpu').stroke).toBe('stroke-idle');
+	expect(look(item({}, wk({ cpu: 10 })), 'cpu').stroke).toBe('stroke-idle/50');
 	expect(look(item({}, null), 'cpu').glyph).toBe('–');
 	expect(look(item({}, wk({ busy: true })), 'work')).toMatchObject({ glyph: '▶', label: 'working' });
 	expect(look(item(), 'work').label).toBe('idle');

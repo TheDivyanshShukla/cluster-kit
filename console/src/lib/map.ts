@@ -10,17 +10,26 @@ export type Item = { node: NodeRow; w: Worker | null };
 export type Look = { fill: string; stroke: string; text: string; glyph: string; label: string; dim: boolean; dash: boolean; power: 'asleep' | 'waking' | 'failed' | null };
 
 // Tailwind needs whole class names in source, hence the literal tables. Every look has a glyph: never colour alone.
+// The normal case (ok) is quiet; exceptions carry the strong colour.
 const tone = {
-	ok: { fill: 'fill-ok/20', stroke: 'stroke-ok', text: 'fill-ok' },
+	ok: { fill: 'fill-ok/10', stroke: 'stroke-ok/45', text: 'fill-ok' },
 	warn: { fill: 'fill-warn/20', stroke: 'stroke-warn', text: 'fill-warn' },
 	bad: { fill: 'fill-bad/20', stroke: 'stroke-bad', text: 'fill-bad' },
-	idle: { fill: 'fill-idle/15', stroke: 'stroke-idle', text: 'fill-idle' },
-	busy: { fill: 'fill-busy/20', stroke: 'stroke-busy', text: 'fill-busy' }
+	idle: { fill: 'fill-idle/10', stroke: 'stroke-idle/50', text: 'fill-idle' },
+	busy: { fill: 'fill-busy/25', stroke: 'stroke-busy', text: 'fill-busy' }
 } as const;
+/** The same tones as legend swatches (HTML, so bg/border instead of fill/stroke). */
+export const SWATCH: Record<keyof typeof tone, string> = {
+	ok: 'bg-ok/10 border-ok/45',
+	warn: 'bg-warn/20 border-warn',
+	bad: 'bg-bad/20 border-bad',
+	idle: 'bg-idle/10 border-idle/50',
+	busy: 'bg-busy/25 border-busy'
+};
 
 export const STATE_LOOK: Record<NodeState, { tone: keyof typeof tone; glyph: string }> = {
 	pending: { tone: 'warn', glyph: '?' },
-	active: { tone: 'ok', glyph: '✓' },
+	active: { tone: 'ok', glyph: '' }, // the normal case stays quiet: no mark, only exceptions get one
 	cordoned: { tone: 'idle', glyph: '⊘' },
 	draining: { tone: 'busy', glyph: '↓' },
 	maintenance: { tone: 'bad', glyph: '≡' },
@@ -53,7 +62,7 @@ export function look({ node, w }: Item, overlay: Overlay, wakeSecs = 0): Look {
 	} else if (overlay === 'work') {
 		const busy = !!w?.busy;
 		t = busy ? 'busy' : 'idle';
-		glyph = busy ? '▶' : '–';
+		glyph = busy ? '▶' : '';
 		label = busy ? 'working' : 'idle';
 	} else if (overlay === 'avail') {
 		const a = availability(node, w);
@@ -80,11 +89,16 @@ const byHost = (a: Item, b: Item) =>
 	a.node.host.localeCompare(b.node.host, undefined, { numeric: true }) || a.node.node_id.localeCompare(b.node.node_id);
 
 /** Registered PCs in host-name order. Workers the registry does not know (virtual ones) get a stand-in row. */
+/** A lab head's node id is "<PC>/lab-<lab>" (rust hier.rs): a process on a PC, never a seat of its own. */
+export const isLabHead = (id: string) => /\/lab-[^/]+$/.test(id);
+
 export function toItems(nodes: Record<string, NodeRow>, workers: Worker[]): Item[] {
+	// A lab head is a process, not a seat: its PCs stand in for it (busy, threads from its report), it is not a PC itself.
+	workers = workers.flatMap((w) => (w.lab_pcs ? w.lab_pcs.filter((p) => p.node_id).map((p) => ({ ...w, node_id: p.node_id, busy: !!p.busy, threads: p.threads ?? 1, rate: w.rate / w.lab_pcs!.length, lab_pcs: undefined })) : [w]));
 	const byId = new Map(workers.filter((w) => w.node_id).map((w) => [w.node_id as string, w]));
-	const items: Item[] = Object.values(nodes).map((node) => ({ node, w: node.online ? (byId.get(node.node_id) ?? null) : null }));
+	const items: Item[] = Object.values(nodes).filter((n) => !isLabHead(n.node_id)).map((node) => ({ node, w: node.online ? (byId.get(node.node_id) ?? null) : null }));
 	for (const w of workers) {
-		if (w.node_id && nodes[w.node_id]) continue;
+		if (w.node_id && (nodes[w.node_id] || isLabHead(w.node_id))) continue;
 		items.push({
 			w,
 			node: {
