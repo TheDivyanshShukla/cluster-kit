@@ -985,7 +985,9 @@ export class LiveEngine {
 			ctx.fillStyle = T.fg;
 			ctx.fillText(txt, x + (inStrip ? 8 : 8), ty);
 		}
-		// head caption, term counter (rolls on a failover) and standby names
+		// head caption, term counter (rolls on a failover) and standby names; zoomed far out (head under ~6 px across) they
+		// would sit on top of the labs, and the head card names them anyway
+		if (v.k < 0.4) return;
 		const head = S.head;
 		// the head's name and term sit to its left, so they never meet the lab strips below
 		ctx.textAlign = 'right';

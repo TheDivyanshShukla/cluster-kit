@@ -121,7 +121,7 @@
 	<a href="#main" class="bg-primary text-primary-foreground sr-only rounded-lg px-3 py-2 text-[13px] font-medium focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-50">Skip to main content</a>
 	<div class="flex h-dvh flex-col overflow-hidden md:flex-row">
 		<aside class="border-line bg-surface flex shrink-0 items-center gap-1 border-b px-3 py-1.5 md:h-dvh md:w-52 md:flex-col md:items-stretch md:border-r md:border-b-0 md:px-3 md:py-4">
-			<a href="/" class="mr-2 flex items-center gap-2 px-2 font-semibold tracking-tight md:mr-0 md:mb-5" aria-label="Cluster Kit home">
+			<a href="/" class="mr-2 flex min-h-9 min-w-9 items-center justify-center gap-2 px-2 font-semibold md:min-h-0 md:justify-start tracking-tight md:mr-0 md:mb-5" aria-label="Cluster Kit home">
 				<span class="{live.link === 'live' ? 'bg-primary' : 'bg-warn'} size-2.5 shrink-0 rounded-sm" aria-hidden="true" title={live.link === 'live' ? 'Live' : 'Reconnecting…'}></span><span class="hidden md:inline">Cluster Kit</span>
 			</a>
 			<button type="button" onclick={() => (palette.open = true)} class="text-muted-foreground hover:bg-raised hover:text-foreground border-line flex shrink-0 items-center gap-2 rounded-lg border px-2 py-2 text-[13px] md:mb-2 md:px-2.5 md:py-1.5" aria-label="Search and commands" aria-keyshortcuts="Control+K Meta+K">

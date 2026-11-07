@@ -1070,6 +1070,9 @@ async function handle(req: Request): Promise<Response> {
 		return new Response(stream, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' } });
 	}
 	if (!NORMAL && (d = scenarioRoutes({ p, m, url, me, need }))) return d;
+	// the advisor (rust advisor.rs): no suggestions in the mock, but the endpoints exist so pages load without 404s
+	if (p === '/api/v1/advice' && m === 'GET') return json({ enabled: true, policy: {}, suggestions: [], accuracy: {} });
+	if (p === '/api/v1/advice/history' && m === 'GET') return json({ history: [], accuracy: {} });
 	if (p.startsWith('/api/v1/')) {
 	const r = await research({ p, m, url, me, RANK, json, err, body, jobs, workers, now, subs });
 	if (r) return r;

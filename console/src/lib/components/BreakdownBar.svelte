@@ -34,7 +34,7 @@
 			<dt class="truncate">{c.label}</dt>
 			<dd class="num ml-auto whitespace-nowrap">
 				{Math.round(b.pc_seconds[c.key]).toLocaleString('en-IN')} <span class="text-muted-foreground text-xs">PC-s</span>
-				<span class="text-muted-foreground inline-block w-12 text-right">{((b.pc_seconds[c.key] / total) * 100).toFixed(1)} %</span>
+				<span class="text-muted-foreground inline-block min-w-12 text-right">{((b.pc_seconds[c.key] / total) * 100).toFixed(1)} %</span>
 			</dd>
 		</div>
 	{/each}
