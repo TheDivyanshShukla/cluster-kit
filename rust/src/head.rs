@@ -365,7 +365,9 @@ pub(crate) fn lease_len(st: &State, w: &Worker, kind: u8, remaining: u64, dflt: 
     let labs = st.workers.values().filter(|o| lab_of(o).is_some() && can_work(o)).count().max(1) as u64;
     let rate = node_rate(st, w, kind);
     // guided: at most half of what is left per live lab, but never a sliver (a tail of ever-smaller leases costs a round trip each)
-    let floor = (rate as u64).max(dflt).max(1).min(remaining);
+    // fz1: and at least one chunk for each PC of the lab (but no more than its share), or the tail runs 1-2 chunks at a time on a lab of many idle PCs
+    let tail = (dflt * w.lab_pcs.len() as u64).min(remaining.div_ceil(labs));
+    let floor = (rate as u64).max(dflt).max(tail).max(1).min(remaining);
     let cap = (remaining / (2 * labs)).max(floor);
     if rate > 0.0 { ((rate * crate::tune::get("lease_s")) as u64).clamp(floor, cap) } else { (dflt * w.threads.max(1) as u64 * 4).min(cap).max(1) } // speed unknown: a few chunks per thread
 }
