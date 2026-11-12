@@ -28,7 +28,21 @@ Start-Transcript -Path (Join-Path $LogDir 'provision.log') -Append | Out-Null
 
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 Write-Host "Cluster Kit provisioning $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $env:COMPUTERNAME as $env:USERNAME"
-if (-not $admin) { Bad 'not an administrator: open PowerShell with Run as administrator and run this again'; Stop-Transcript | Out-Null; return }
+if (-not $admin) {
+  # not elevated: relaunch this same script in an Administrator PowerShell (UAC asks once), passing the CK_ settings along
+  $ScriptUrl = "https://raw.githubusercontent.com/$Repo/$Branch/scripts/provision.ps1"
+  $pass = ''
+  foreach ($v in 'CK_ADMIN_KEY', 'CK_FLEET', 'CK_AUTH', 'CK_ROLE', 'CK_HEAD_IP', 'CK_BRANCH') {
+    $val = [Environment]::GetEnvironmentVariable($v)
+    if ($val) { $pass += "`$env:$v='$val'; " }
+  }
+  Write-Host 'not running as Administrator: asking Windows for it (UAC). Click Yes in the prompt.'
+  try {
+    Start-Process powershell -Verb RunAs -ArgumentList '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "$pass iex (irm '$ScriptUrl')"
+  } catch { Bad "could not start an Administrator PowerShell (UAC cancelled?): $($_.Exception.Message). Right-click PowerShell and choose Run as administrator, then run the command again" }
+  Stop-Transcript | Out-Null
+  return
+}
 
 Step 'network'
 function Test-Online { try { $c = New-Object Net.Sockets.TcpClient; $r = $c.BeginConnect('github.com', 443, $null, $null); $up = $r.AsyncWaitHandle.WaitOne(8000) -and $c.Connected; $c.Close(); $up } catch { $false } }
