@@ -101,6 +101,7 @@ Copy or clone this folder to every PC, then:
 - **Sleep:** setup also offers to disable sleep on that PC.
 - **Windows and Rust:** building needs the MSVC build tools. If the build fails, setup prints the `winget` command that installs them.
 - **Ubuntu PCs:** what to copy, packages, offline builds and ports are in [docs/UBUNTU.md](docs/UBUNTU.md).
+- **Many Ubuntu PCs, fast:** `sudo bash scripts/provision.sh` does everything on one PC and repairs what it finds wrong: no sleep or screen lock, packages, ssh, the folder in `~/Desktop/cluster-kit`, the build, and a `ck-worker` service that starts at boot and joins the head. Run it again any time. An ESP32-S3/S2 stick can type it for you: flash it with `hid/flash.sh` (see the header of [hid/ck_provision/ck_provision.ino](hid/ck_provision/ck_provision.ino)), plug it into a logged-in PC, unplug after 3 seconds.
 
 ## Run
 

@@ -29,3 +29,9 @@ docs/paper/
 # agent run files
 agent.log
 agent.pid
+
+# ESP32 provisioning stick: holds the sudo password
+hid/ck_provision/config.h
+
+# built firmware images
+hid/build/
