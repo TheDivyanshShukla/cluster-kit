@@ -538,7 +538,8 @@ def _plan(fn: Callable[..., Any], items: list[Any], mode: str, o: Opts, profile:
     except ClusterError as e:
         if o["local"] == "never":
             raise
-        p["reasons"].append(f"head unreachable ({e})")
+        why = "not signed in: set CK_TOKEN (ck token), or start the head with CK_AUTH=off" if "HTTP 401" in str(e) else "head unreachable"
+        p["reasons"].append(f"{why} ({e})")
         return Plan(**p)
     m = p["model"] = _model(o, rtt)
     p["learned"] = m["learned"]
