@@ -22,3 +22,10 @@ rust/ck-data/
 
 # macOS
 .DS_Store
+
+# paper drafts stay local
+docs/paper/
+
+# agent run files
+agent.log
+agent.pid
