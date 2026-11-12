@@ -116,12 +116,15 @@ elseif (-not (Have-Cargo)) { if (Test-Path $Bin) { Ok 'using the ck that is alre
 else {
   Write-Host '   building ck: 2 to 10 minutes (the ESP stick can be unplugged now)'
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  $built = Build-Ck @()
-  if (-not $built -and -not (Have-Msvc) -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-    Write-Host '   the C++ build tools are missing: installing them (several GB, 10 to 20 minutes)'
-    winget install --id Microsoft.VisualStudio.2022.BuildTools -e --accept-package-agreements --accept-source-agreements --override '--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended' | Out-Null
-    $built = Build-Ck @()
+  # Rust on Windows links with the MSVC C++ tools (and bundled SQLite compiles C): install them before building
+  if (-not (Have-Msvc)) {
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+      Write-Host '   the C++ build tools are missing: installing them (several GB, 10 to 20 minutes)'
+      winget install --id Microsoft.VisualStudio.2022.BuildTools -e --silent --accept-package-agreements --accept-source-agreements --override '--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended' *>> (Join-Path $LogDir 'msvc.log')
+    }
+    if (-not (Have-Msvc)) { Bad 'C++ build tools (MSVC) are missing and could not be installed. Install "Visual Studio Build Tools" with the "Desktop development with C++" workload from https://visualstudio.microsoft.com/visual-cpp-build-tools/, then run this script again' }
   }
+  $built = Build-Ck @()
   if (-not $built) { Write-Host '   again without GPU support'; $built = Build-Ck @('--no-default-features') }
   if ($built -and (Test-Path $Bin)) { Set-Content $Stamp $zipHash; Fixed "built ck in $([int]$sw.Elapsed.TotalSeconds) s" }
   else { Bad "ck build failed, see $LogDir\build.log"; Get-Content (Join-Path $LogDir 'build.log') -Tail 8 | ForEach-Object { Write-Host "        $_" } }
