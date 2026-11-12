@@ -3,14 +3,14 @@
 //! Privacy (SEC-07): only idle time and session state; never keystrokes, screens or files.
 //! Linux: an active graphical logind session whose IdleHint is "no", else other processes' CPU above 30 %.
 //! macOS: HID idle time under 60 s (ioreg IOHIDSystem). Windows: not yet (always idle).
-//! `CK_PRESENCE=off` disables it; virtual nodes never probe.
+//! Off by default (PCs work even while someone uses them); `CK_PRESENCE=on` turns it on. Virtual nodes never probe.
 //! Test hook: `CK_PRESENCE_FAKE=/path/file` makes `busy()` read "busy" or "idle" from that file.
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
 pub fn enabled() -> bool {
-    std::env::var("CK_PRESENCE").map_or(true, |v| v != "off")
+    std::env::var("CK_PRESENCE").is_ok_and(|v| v == "on")
 }
 
 pub fn busy() -> bool {

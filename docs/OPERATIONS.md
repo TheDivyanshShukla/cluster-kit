@@ -31,7 +31,7 @@ API tokens for scripts: `CK_USER=<name> ck token --head <head-ip>`. It asks for 
 | Submit and follow a job | Jobs, New | `ck run ...`, `ck job ls`, `ck run attach <id>` |
 | Who did what | Events | `ck job show <id>` |
 
-A student using a PC (keyboard or mouse in the last 5 minutes) makes it "in use": it gets no new chunks until it has been idle again for 5 minutes. Running chunks finish.
+By default every PC takes work, even while someone uses it. To give students priority, start agents with `CK_PRESENCE=on`: then a PC someone uses (keyboard or mouse in the last minute) is "in use" and gets no new chunks until it has been idle again for 5 minutes. Running chunks finish.
 
 ## 3. When something breaks
 
