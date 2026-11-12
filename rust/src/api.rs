@@ -729,7 +729,7 @@ pub fn node_views(ctx: &Ctx) -> Vec<sched::NodeView> {
         .filter_map(|(wid, w)| {
             let id = &w.hello.as_ref()?.node_id;
             let n = ctx.store.node(id)?;
-            Some(sched::NodeView { wid: *wid, node_id: id.clone(), attrs: org.attrs(&n, Some((w.threads, w.cpu))), takes_tasks: takes_tasks(&w.state), job: w.inflight.first().map(|f| f.0), inflight: w.inflight.len() })
+            Some(sched::NodeView { wid: *wid, node_id: id.clone(), attrs: org.attrs(&n, Some((w.threads, w.cpu))), takes_tasks: takes_tasks(&w.state), job: w.inflight.first().map(|f| f.0) })
         })
         .collect();
     v.sort_by_key(|n| n.wid);
@@ -2219,8 +2219,7 @@ fn adv_bd(b: &Value) -> adv::Bd {
     let f = |k: &str| b["pc_seconds"][k].as_f64().unwrap_or(0.0);
     adv::Bd {
         wall: b["wall_s"].as_f64().unwrap_or(0.0), compute: f("compute"), dispatch: f("dispatch_wait"), tail: f("tail_idle"), recompute: f("recompute"), failover: f("failover_pause"), other: f("other"),
-        chunk_p50: b["chunk_s"]["p50"].as_f64().unwrap_or(0.0), chunks: b["per_pc"].as_array().map_or(0, |a| a.iter().map(|p| p["chunks"].as_u64().unwrap_or(0)).sum()),
-        stragglers: b["stragglers"].as_array().map_or(vec![], |a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()),
+        chunks: b["per_pc"].as_array().map_or(0, |a| a.iter().map(|p| p["chunks"].as_u64().unwrap_or(0)).sum()),
     }
 }
 
@@ -2271,7 +2270,7 @@ fn adv_gather(ctx: &Ctx) -> adv::AdvObs {
         }
         let spec = ctx.store.spec(r.id);
         o.jobs.push(adv::AdvJob {
-            id: r.id, running: run, user: r.submitter.clone(), wait: if run { head::wait_reason(ctx, r.id).map(String::from) } else { None }, failed, error: r.error.clone(), finished_ms: r.finished_ms.unwrap_or(0),
+            running: run, user: r.submitter.clone(), wait: if run { head::wait_reason(ctx, r.id).map(String::from) } else { None }, failed, error: r.error.clone(),
             blobs: spec.as_ref().map_or(0, |s| s.blobs.len()), blob_mode: spec.map(|s| s.blob_mode).unwrap_or_default(), bd: if run || recent { head::breakdown(ctx, r.id).map(|b| adv_bd(&b)) } else { None },
         });
     }
@@ -2290,14 +2289,12 @@ fn adv_gather(ctx: &Ctx) -> adv::AdvObs {
     o.best_head = head::candidates(ctx).into_iter().find(|c| c["role"] == "candidate" && c["eligible"] == true).and_then(|c| Some((c["node_id"].as_str()?.to_string(), c["host"].as_str()?.to_string(), c["score"].as_f64()?)));
     o.disk = adv_disk();
     {
-        let (labs, heads, bad) = crate::hier::advice_facts(ctx);
         let v = crate::hier::json(ctx);
         o.hier = adv::HierObs {
-            mode: crate::hier::mode(), labs, heads,
+            mode: crate::hier::mode(), labs: crate::hier::advice_labs(&v),
             bad: v["labs"].as_array().into_iter().flatten().filter(|l| l["pinned"].is_string() && matches!(l["state"].as_str(), Some("partitioned" | "released" | "absent"))).map(|l| (l["lab"].as_str().unwrap_or("").to_string(), l["state"].as_str().unwrap_or("").to_string())).collect(),
             leaves_1h: o.events.get("labhead.leave").copied().unwrap_or(0), partitions_1h: o.events.get("labhead.partition").copied().unwrap_or(0),
         };
-        let _ = bad;
     }
     let pw = power_settings(ctx);
     (o.power_mode, o.keep_awake) = (pw.mode, pw.keep_awake);

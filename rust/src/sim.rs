@@ -180,7 +180,9 @@ pub struct Out {
     pub ideal_s: f64,
     pub n: u64,
     pub done: u64,
+    #[allow(dead_code)] // read by the sim tests (nothing left behind when finished)
     pub pending: u64,
+    #[allow(dead_code)]
     pub inflight: u64,
     pub tasks: u64,
     pub failures: u64,
@@ -923,7 +925,7 @@ enum HK {
     Arr { pc: usize, ep: u32, c: u64 }, // a request (c = 0) or a chunk result reaches the PC's head
     Fin { pc: usize, ep: u32, c: u64 },
     Req { lab: usize },                 // lease request reaches the root
-    Rep { lab: usize, l: usize },       // lease report reaches the root
+    Rep { l: usize },                   // lease report reaches the root
     Grant { lab: usize, l: usize },     // lease (or NONE) reaches the lab head
     Fence { lab: usize },               // root gives up on a silent lab head: its unreported leases go back to the pool
     Kill { lab: usize },
@@ -1115,7 +1117,7 @@ impl HSim<'_> {
             ls.nch += 1;
             if ls.done >= ls.units - 1e-6 {
                 let at = self.cutd(lab, fin + s.wan); // one merged report for the whole lease
-                self.push(at, HK::Rep { lab, l: lease });
+                self.push(at, HK::Rep { l: lease });
             }
         }
         while let Some(&l) = self.labs[lab].pool.front() {

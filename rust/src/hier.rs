@@ -364,7 +364,6 @@ struct LabHead {
     addr: String,
     port: u16,
     out: Option<Arc<Mutex<Out>>>,
-    drain: bool,
     inflight: usize,
     standby: bool,
     pcs: usize,
@@ -394,7 +393,7 @@ fn tick(ctx: &Arc<Ctx>) {
         let st = ctx.sh.0.lock().unwrap();
         let labs = st.workers.iter().filter_map(|(wid, w)| {
             let l = lab_of(w)?;
-            Some(LabHead { wid: *wid, node: node_of(w), lab: l.lab.clone(), addr: w.addr.clone(), port: l.port, out: w.out.clone(), drain: w.drain, inflight: w.inflight.len(), standby: is_standby(w), pcs: w.lab_pcs.len() })
+            Some(LabHead { wid: *wid, node: node_of(w), lab: l.lab.clone(), addr: w.addr.clone(), port: l.port, out: w.out.clone(), inflight: w.inflight.len(), standby: is_standby(w), pcs: w.lab_pcs.len() })
         });
         let direct = st.workers.values().filter(|w| lab_of(w).is_none() && w.hello.is_some()).map(|w| (node_of(w), w.addr.clone(), w.out.clone(), w.hello.as_ref().is_some_and(|h| h.virtual_node)));
         (labs.collect(), direct.collect())
@@ -726,15 +725,11 @@ pub fn json(ctx: &Ctx) -> Value {
     })
 }
 
-/// What the advisor needs: (labs with their PC counts at the root, lab heads connected, lab heads partitioned or released).
-pub fn advice_facts(ctx: &Ctx) -> (Vec<(String, usize)>, usize, usize) {
-    let v = json(ctx);
-    let labs: Vec<(String, usize)> = v["labs"].as_array().into_iter().flatten().map(|l| {
+/// What the advisor needs from `json(ctx)`: every lab with its PC count (at the root plus behind its lab head).
+pub fn advice_labs(v: &Value) -> Vec<(String, usize)> {
+    v["labs"].as_array().into_iter().flatten().map(|l| {
         (l["lab"].as_str().unwrap_or("").to_string(), l["pcs_at_root"].as_u64().unwrap_or(0) as usize + l["head"]["pcs"].as_u64().unwrap_or(0) as usize)
-    }).collect();
-    let heads = v["labs"].as_array().into_iter().flatten().filter(|l| l["head"].is_object()).count();
-    let bad = v["labs"].as_array().into_iter().flatten().filter(|l| matches!(l["state"].as_str(), Some("partitioned" | "released" | "absent")) && l["pinned"].is_string()).count();
-    (labs, heads, bad)
+    }).collect()
 }
 
 #[cfg(test)]
@@ -801,7 +796,7 @@ mod lease_tests {
         {
             let mut st = c.sh.0.lock().unwrap();
             let gone = st.workers.remove(&1).unwrap().inflight;
-            st.orphans.insert("lab1".into(), Orphan { since: Instant::now(), lab: "A".into(), addr: "x".into(), leases: gone });
+            st.orphans.insert("lab1".into(), Orphan { since: Instant::now(), lab: "A".into(), leases: gone });
         }
         expire_orphans(&c);
         assert_eq!(c.sh.0.lock().unwrap().orphans.len(), 1, "still within lab_silence_s");
@@ -822,7 +817,7 @@ mod lease_tests {
         {
             let mut st = c.sh.0.lock().unwrap();
             let gone = st.workers.remove(&1).unwrap().inflight;
-            st.orphans.insert("lab1".into(), Orphan { since: Instant::now(), lab: "A".into(), addr: "x".into(), leases: gone });
+            st.orphans.insert("lab1".into(), Orphan { since: Instant::now(), lab: "A".into(), leases: gone });
         }
         lab_worker(&c, 2, "lab1"); // the same lab head, new connection
         lab_leases(&c, 2, &[(job, 0, 100, false), (999, 0, 5, false)]);

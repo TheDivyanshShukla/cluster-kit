@@ -24,7 +24,6 @@ pub struct NodeView {
     pub takes_tasks: bool,
     /// job it currently works for (has chunks in flight), if any
     pub job: Option<u64>,
-    pub inflight: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -373,7 +372,7 @@ mod tests {
         for _ in 0..500 {
             let nj = 1 + r(5);
             let jobs: Vec<JobView> = (1..=nj).map(|id| JobView { id, priority: r(3) as u8, selector: Selector::default(), has_work: r(4) != 0, user: ["", "a", "b"][r(3) as usize].into() }).collect();
-            let nodes: Vec<NodeView> = (0..1 + r(12)).map(|w| NodeView { wid: w, node_id: format!("n{w}"), attrs: Default::default(), takes_tasks: r(6) != 0, job: [None, Some(1 + r(7))][r(2) as usize], inflight: 0 }).collect();
+            let nodes: Vec<NodeView> = (0..1 + r(12)).map(|w| NodeView { wid: w, node_id: format!("n{w}"), attrs: Default::default(), takes_tasks: r(6) != 0, job: [None, Some(1 + r(7))][r(2) as usize] }).collect();
             for n in &nodes {
                 assert_eq!(pick_job(n.wid, &nodes, &jobs, &[]), reference(n.wid, &nodes, &jobs));
             }
@@ -389,7 +388,6 @@ mod tests {
             attrs: attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             takes_tasks: true,
             job: None,
-            inflight: 0,
         }
     }
     fn job(id: u64, priority: u8, sel: &str) -> JobView {
@@ -404,7 +402,6 @@ mod tests {
             let w = nodes[i].wid;
             let p = pick_job(w, nodes, jobs, rs);
             nodes[i].job = p;
-            nodes[i].inflight = p.is_some() as usize;
         }
     }
     fn count(nodes: &[NodeView], j: u64) -> usize {
@@ -460,7 +457,6 @@ mod tests {
         let mut nodes: Vec<_> = (1..=4).map(|i| nv(i, &[])).collect();
         for n in &mut nodes {
             n.job = Some(1);
-            n.inflight = 2;
         }
         // equal priority newcomer of another user (SCH-04): the nodes even out at their chunk boundaries, 2 and 2
         let jobs = [job(1, 2, ""), job(2, 2, "")];
@@ -485,7 +481,6 @@ mod tests {
         let mut nodes: Vec<_> = (1..=4).map(|i| nv(i, &[])).collect();
         for n in &mut nodes {
             n.job = Some(1);
-            n.inflight = 1;
         }
         let jobs = [job(1, 2, ""), job(2, 0, ""), job(3, 0, "")];
         settle(&mut nodes, &jobs, &[]);

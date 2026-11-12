@@ -173,9 +173,7 @@ pub struct Bd {
     pub recompute: f64,
     pub failover: f64,
     pub other: f64,
-    pub chunk_p50: f64,
     pub chunks: u64,
-    pub stragglers: Vec<String>,
 }
 
 impl Bd {
@@ -186,14 +184,12 @@ impl Bd {
 
 #[derive(Clone, Debug, Default)]
 pub struct AdvJob {
-    pub id: u64,
     pub running: bool,
     pub user: String,
     /// quota | priority | no_pcs
     pub wait: Option<String>,
     pub failed: bool,
     pub error: Option<String>,
-    pub finished_ms: i64,
     pub blobs: usize,
     pub blob_mode: String,
     pub bd: Option<Bd>,
@@ -240,7 +236,6 @@ pub struct HierObs {
     pub mode: u8,
     /// (lab, PCs in it) for every lab the root knows PCs of
     pub labs: Vec<(String, usize)>,
-    pub heads: usize,
     /// Labs with a pinned lab head that is partitioned, released or absent: (lab, state)
     pub bad: Vec<(String, String)>,
     /// `labhead.leave` / `labhead.partition` events in the last hour
@@ -786,10 +781,10 @@ mod tests {
         AdvNode { id: id.into(), host: format!("h-{id}"), state: state.into(), online: true, busy, losses_24h: losses }
     }
     fn bd(dispatch: f64) -> Bd {
-        Bd { wall: 100.0, compute: 1000.0 - dispatch, dispatch, chunks: 500, chunk_p50: 0.2, ..Default::default() }
+        Bd { wall: 100.0, compute: 1000.0 - dispatch, dispatch, chunks: 500, ..Default::default() }
     }
     fn job() -> AdvJob {
-        AdvJob { id: 1, running: true, user: "ann".into(), ..Default::default() }
+        AdvJob { running: true, user: "ann".into(), ..Default::default() }
     }
     fn ids(v: &[Suggestion]) -> Vec<&str> {
         v.iter().map(|s| s.id.as_str()).collect()
@@ -846,7 +841,7 @@ mod tests {
     fn standby_disk_eco_quota_blob_fail_log_rules() {
         let mut o = AdvObs { nodes: (0..6).map(|i| node(&i.to_string(), "active", false, 0)).collect(), power_mode: "off".into(), keep_awake: 2, disk: Some((92.0, 3.0)), ..Default::default() };
         o.jobs.push(AdvJob { wait: Some("quota".into()), ..job() });
-        o.jobs.push(AdvJob { id: 2, failed: true, error: Some("output over the cap".into()), ..Default::default() });
+        o.jobs.push(AdvJob { failed: true, error: Some("output over the cap".into()), ..Default::default() });
         o.warns.push(("blob.corrupt".into(), 2, "bad".into()));
         let s = advise(&o, 0);
         for want in ["no_standby", "disk", "quota_wait:ann", "job_fail:output_cap", "log:blob.corrupt"] {
@@ -854,7 +849,7 @@ mod tests {
         }
         assert!(!ids(&s).contains(&"eco"), "a job is running, no eco advice");
         o.jobs.clear();
-        o.jobs.push(AdvJob { id: 3, running: true, blobs: 1, blob_mode: "direct".into(), ..job() });
+        o.jobs.push(AdvJob { running: true, blobs: 1, blob_mode: "direct".into(), ..job() });
         o.jobs.truncate(1);
         o.jobs[0].running = true;
         let s = advise(&o, 0);

@@ -129,7 +129,6 @@ pub struct Worker {
 pub struct Orphan {
     pub since: Instant,
     pub lab: String,
-    pub addr: String,
     pub leases: Vec<(u64, u64, u64)>,
 }
 
@@ -563,7 +562,6 @@ fn node_views(st: &State) -> Vec<NodeView> {
             attrs: w.attrs.clone(),
             takes_tasks: can_work(w),
             job: w.inflight.last().map(|t| t.0), // the job it was fed last: where the PC is being steered
-            inflight: w.inflight.len(),
         })
         .collect()
 }
@@ -753,7 +751,7 @@ fn take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8>)> {
         if !can_work(w) {
             return None;
         }
-        let me = NodeView { wid, node_id: String::new(), attrs: w.attrs.clone(), takes_tasks: true, job: w.inflight.last().map(|t| t.0), inflight: w.inflight.len() };
+        let me = NodeView { wid, node_id: String::new(), attrs: w.attrs.clone(), takes_tasks: true, job: w.inflight.last().map(|t| t.0) };
         let mut counts: HashMap<u64, usize> = HashMap::new();
         let mut busy = 0;
         for (i, o) in st.workers.iter() {
@@ -1887,7 +1885,7 @@ fn serve_worker(mut s: TcpStream, ctx: Arc<Ctx>, hello: &[u8], wid: u64) -> io::
         let primary_left = !st.workers.values().any(|o| lab_of(o).is_some_and(|l| l.lab == lab) && !crate::hier::is_standby(o));
         crate::hier::lab_head_gone(lab, &n.0, primary_left); // a standby lab head takes over from here
         if silent && !gone.is_empty() && crate::hier::on() {
-            st.orphans.insert(n.0.clone(), Orphan { since: Instant::now(), lab: lab_of(w).map(|l| l.lab.clone()).unwrap_or_default(), addr: addr.clone(), leases: std::mem::take(&mut gone) });
+            st.orphans.insert(n.0.clone(), Orphan { since: Instant::now(), lab: lab_of(w).map(|l| l.lab.clone()).unwrap_or_default(), leases: std::mem::take(&mut gone) });
             event(&ctx, "labhead.partition", "head", &format!("lab head {} of lab {} is silent: its leases are kept for {} s", n.1, lab_of(w).map_or("", |l| l.lab.as_str()), crate::tune::get("lab_silence_s")));
         } else {
             event(&ctx, "labhead.leave", "head", &format!("lab head {} of lab {} is gone ({} leases back in the queue)", n.1, lab_of(w).map_or("", |l| l.lab.as_str()), gone.len()));
