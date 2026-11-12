@@ -1,26 +1,34 @@
-// Cluster Kit lab-PC provisioning stick. ESP32-S3 or ESP32-S2 (native USB) acting as a USB keyboard.
-// Plug it into an Ubuntu PC that is logged in to its desktop (US keyboard layout): it opens a terminal and types one line
-// that downloads scripts/provision.sh from the repo and runs it with sudo. Typing takes about 3 s, so unplug right after
-// and move to the next PC; the script keeps running in that terminal and prints DONE when finished.
+// Cluster Kit lab-PC provisioning stick. Xiao ESP32-S3 (or ESP32-S2 / DevKit) acting as a USB keyboard.
 //
-// SAFETY: it types ONLY while pin GPIO4 is tied to GND (leave a jumper wire there in the lab). Without the jumper the LED
-// blinks red and nothing is typed, so flashing it or plugging it into your own computer is harmless.
+// Plug it in: it types the setup line by itself. Plug it into a logged-in lab PC, unplug after ~5 s, move on.
+// Pick the PC type with a button held while you plug the stick in (or tap RESET while holding it):
+//   no button ............ Ubuntu (default)
+//   BTN_LINUX held ....... Ubuntu: Ctrl+Alt+T, then the download line, run with sudo
+//   BTN_WIN held ......... Windows: Win+R, PowerShell as Administrator (UAC: accept, default is Yes)
+// Button wiring: one leg to the pin below, the other leg to any GND pad. On the Xiao: BTN_WIN = D3 (GPIO4),
+// BTN_LINUX = D4 (GPIO5). Change the two numbers below if you wire them elsewhere.
 //
-// Arduino IDE / arduino-cli: board "ESP32S3 Dev Module" (or ESP32S2), USB Mode = "USB-OTG (TinyUSB)", USB CDC On Boot = Disabled.
+// Status light: blue = starting, amber = typing, green = done (safe to unplug). The red glow on the board is its power LED.
+//
+// Board: ESP32-S3 (Xiao or DevKit) with USB Mode "USB-OTG (TinyUSB)" and CDC On Boot disabled (hid/flash.sh sets these).
 // Copy config.example.h to config.h and fill it in (config.h is git-ignored: it holds the sudo password).
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 #include "config.h"
 
 USBHIDKeyboard Keyboard;
-const int ARM_PIN = 4;  // jumper GPIO4 to GND to arm
-const int OS_PIN = 5;   // the stick cannot see the OS: jumper GPIO5 to GND for Windows, leave open for Ubuntu
+const int BTN_WIN = 4;    // GPIO4 = D3 on the Xiao: hold while plugging in for Windows
+const int BTN_LINUX = 5;  // GPIO5 = D4 on the Xiao: hold while plugging in for Ubuntu (also the default)
 const char *URL_SH = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.sh";
 const char *URL_PS = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.ps1";
 
+// Status light. Boards with an RGB LED get the colour; a plain LED (Xiao: GPIO21) lights for any colour.
 void led(uint8_t r, uint8_t g, uint8_t b) {
 #ifdef RGB_BUILTIN
   neopixelWrite(RGB_BUILTIN, r, g, b);
+#elif defined(LED_BUILTIN)
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, (r || g || b) ? HIGH : LOW);
 #endif
 }
 
@@ -31,22 +39,18 @@ void typeText(const String &s) {
   }
 }
 
-bool armed = false;
-
 void setup() {
-  pinMode(ARM_PIN, INPUT_PULLUP);
-  pinMode(OS_PIN, INPUT_PULLUP);
+  pinMode(BTN_WIN, INPUT_PULLUP);
+  pinMode(BTN_LINUX, INPUT_PULLUP);
   USB.productName("CK Provision");  // hid/flash.sh looks for this name on the USB bus
   USB.manufacturerName("Cluster Kit");
   Keyboard.begin();
   USB.begin();
   led(0, 0, 40);  // blue: starting
   delay(1500);
-  armed = digitalRead(ARM_PIN) == LOW;
-  if (!armed) return;  // loop() blinks red
+  bool windows = digitalRead(BTN_WIN) == LOW && digitalRead(BTN_LINUX) == HIGH;  // both held (or neither): Ubuntu
+  delay(3500);  // the PC enumerates the keyboard
 
-  delay(4500);  // the PC enumerates the keyboard
-  bool windows = digitalRead(OS_PIN) == LOW;
   Keyboard.press(KEY_LEFT_SHIFT);  // wake a blanked screen
   delay(60);
   Keyboard.releaseAll();
@@ -84,11 +88,5 @@ void setup() {
 }
 
 void loop() {
-  if (!armed) {
-    led(40, 0, 0);
-    delay(300);
-    led(0, 0, 0);
-    delay(1200);
-  }
-  delay(100);
+  delay(1000);  // nothing more to do: it typed once after power-up; plug it again to run again
 }
