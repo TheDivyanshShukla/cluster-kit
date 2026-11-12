@@ -36,7 +36,12 @@ fn probe() -> bool {
     match run("loginctl", &["list-sessions", "--no-legend"]) {
         Some(list) => {
             let ids = session_ids(&list);
-            let shown = ids.iter().any(|id| run("loginctl", &["show-session", id, "-p", "Type", "-p", "Active", "-p", "IdleHint"]).is_some_and(|t| session_busy(&t)));
+            // IdleHint stays "no" forever when screen blanking is off (common on lab PCs), so a graphical session that
+            // looks active is checked against the real keyboard/mouse idle time where the desktop exposes it.
+            let shown = ids.iter().any(|id| {
+                run("loginctl", &["show-session", id, "-p", "Type", "-p", "Active", "-p", "IdleHint", "-p", "User"])
+                    .is_some_and(|t| session_busy(&t) && input_idle_ms(&t).map_or(true, |ms| ms < 60_000))
+            });
             shown || other_cpu_busy()
         }
         None => other_cpu_busy(),
@@ -46,6 +51,28 @@ fn probe() -> bool {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn probe() -> bool {
     false
+}
+
+/// Milliseconds since the last keyboard/mouse input in the session of `User=UID` (from `loginctl show-session`), read from
+/// GNOME's idle monitor on that user's session bus. None when not GNOME or the bus refuses us (agent runs as another user).
+/// ponytail: GNOME only (Ubuntu's default); KDE/X11 desktops fall back to IdleHint.
+#[cfg(target_os = "linux")]
+fn input_idle_ms(show: &str) -> Option<u64> {
+    let uid = show.lines().find_map(|l| l.strip_prefix("User="))?.trim();
+    let o = Command::new("gdbus")
+        .args(["call", "--session", "--dest", "org.gnome.Mutter.IdleMonitor", "--object-path", "/org/gnome/Mutter/IdleMonitor/Core", "--method", "org.gnome.Mutter.IdleMonitor.GetIdletime"])
+        .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path=/run/user/{uid}/bus"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    o.status.success().then(|| idle_reply_ms(&String::from_utf8_lossy(&o.stdout))).flatten()
+}
+
+/// `(uint64 90967,)` from gdbus.
+#[allow(dead_code)]
+fn idle_reply_ms(out: &str) -> Option<u64> {
+    out.split("uint64").nth(1)?.trim_start().split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
 }
 
 /// Other processes' summed CPU above 30 % of the whole PC, from the change since the previous probe.
@@ -123,6 +150,8 @@ mod tests {
         let io = "    | |   \"HIDIdleTime\" = 4123456789\n    | |   \"Other\" = 1\n";
         assert_eq!(hid_idle_ns(io), Some(4_123_456_789));
         assert_eq!(hid_idle_ns("nothing"), None);
+        assert_eq!(idle_reply_ms("(uint64 90967,)\n"), Some(90_967));
+        assert_eq!(idle_reply_ms("Error: no such name"), None);
     }
 
     #[test]

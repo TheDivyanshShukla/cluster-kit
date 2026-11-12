@@ -22,7 +22,7 @@
 	const WAIT: Record<string, string> = {
 		quota: 'waiting: you are at your quota',
 		priority: 'waiting: higher priority jobs hold the PCs',
-		no_pcs: 'waiting: no PC can run it now',
+		no_pcs: 'waiting: no free PC (PCs someone is using are skipped)',
 		'': 'waiting for its turn'
 	};
 	const id = $derived(Number(page.params.id));
@@ -211,7 +211,7 @@
 			{/if}
 			<ProgressBar value={progress(job)} label="Job progress" tone={job.state === 'failed' ? 'bg-bad' : job.state === 'done' ? 'bg-ok' : 'bg-primary'} />
 			<p class="num text-muted-foreground mt-2 text-xs" aria-live="polite">
-				{count(job.done)} of {count(job.total)} numbers · {Math.round(progress(job) * 100)}%{job.state === 'queued' ? ` · ${WAIT[job.wait_reason ?? ''] ?? 'waiting for its turn'}` : ''}
+				{count(job.done)} of {count(job.total)} numbers · {Math.round(progress(job) * 100)}%{job.state === 'queued' || job.wait_reason ? ` · ${WAIT[job.wait_reason ?? ''] ?? 'waiting for its turn'}` : ''}
 			</p>
 			{#if etaWords}<p class="mt-1 flex items-center gap-1.5 text-[13px] font-medium" aria-live="polite"><Clock class="text-muted-foreground size-4" aria-hidden="true" />{etaWords[0].toUpperCase() + etaWords.slice(1)}</p>{/if}
 			<dl class="border-line mt-4 grid grid-cols-2 gap-px overflow-hidden rounded-lg border bg-[var(--line)]">
@@ -225,7 +225,9 @@
 		</Panel>
 
 		<Panel title="Where the time went" tab="time" scroll={false} pad={false}>
-			{#if bdState === 'ok' && bd}
+			{#if bdState === 'ok' && bd && bd.per_pc.length === 0 && job.state === 'running'}
+				<p class="text-muted-foreground px-4 py-6 text-center">No PC has run a part yet{job.wait_reason ? `: ${WAIT[job.wait_reason]}` : ''}. The breakdown fills in as parts finish.</p>
+			{:else if bdState === 'ok' && bd}
 				<BreakdownPanel b={bd} />
 			{:else if bdState === 'loading'}
 				<div class="bg-raised m-3 h-32 animate-pulse rounded-lg" aria-busy="true"></div>
