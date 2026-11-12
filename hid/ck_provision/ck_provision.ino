@@ -32,11 +32,15 @@ void led(uint8_t r, uint8_t g, uint8_t b) {
 #endif
 }
 
+// Types slowly with each key held down for a while: quick press/release pairs got keys dropped, doubled and
+// changed on the PC ("curlo", "thtps", a stray space in the URL). About 40 ms per character; the line is ~400 characters.
 void typeText(const String &s) {
   for (size_t i = 0; i < s.length(); i++) {
     led(i & 1, 0, 0);  // fast blink while typing
-    Keyboard.write(s[i]);
-    delay(12);  // some PCs drop keys when typed faster: 6 ms failed on some lab machines
+    Keyboard.press(s[i]);
+    delay(25);
+    Keyboard.releaseAll();
+    delay(20);
   }
   led(0, 0, 0);
 }
