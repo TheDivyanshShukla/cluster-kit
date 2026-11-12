@@ -106,6 +106,13 @@ function Have-Msvc {
   $vw = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
   (Test-Path $vw) -and [bool](& $vw -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
 }
+$Rebuilt = $false
+# a running ck.exe locks the file: stop the worker and head tasks and any hand-started copy before the build replaces it
+function Stop-Ck {
+  foreach ($t in 'ck-worker', 'ck-head') { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue }
+  Get-Process ck -ErrorAction SilentlyContinue | Stop-Process -Force
+  Start-Sleep 2
+}
 function Build-Ck([string[]]$extra) {
   & cargo build --release --manifest-path (Join-Path $Dir 'rust\Cargo.toml') @extra *>> (Join-Path $LogDir 'build.log')
   $LASTEXITCODE -eq 0
@@ -124,9 +131,10 @@ else {
     }
     if (-not (Have-Msvc)) { Bad 'C++ build tools (MSVC) are missing and could not be installed. Install "Visual Studio Build Tools" with the "Desktop development with C++" workload from https://visualstudio.microsoft.com/visual-cpp-build-tools/, then run this script again' }
   }
+  Stop-Ck
   $built = Build-Ck @()
   if (-not $built) { Write-Host '   again without GPU support'; $built = Build-Ck @('--no-default-features') }
-  if ($built -and (Test-Path $Bin)) { Set-Content $Stamp $zipHash; Fixed "built ck in $([int]$sw.Elapsed.TotalSeconds) s" }
+  if ($built -and (Test-Path $Bin)) { Set-Content $Stamp $zipHash; $script:Rebuilt = $true; Fixed "built ck in $([int]$sw.Elapsed.TotalSeconds) s" }
   else { Bad "ck build failed, see $LogDir\build.log"; Get-Content (Join-Path $LogDir 'build.log') -Tail 8 | ForEach-Object { Write-Host "        $_" } }
 }
 
@@ -170,6 +178,8 @@ if (Test-Path $Bin) {
       Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
       Get-Process ck -ErrorAction SilentlyContinue | Stop-Process -Force  # copies started by hand would hold the ports
       Start-Sleep 2; Start-ScheduledTask -TaskName $name; Fixed "task $name installed and started"
+    } elseif ($script:Rebuilt) {
+      Stop-Ck; Start-ScheduledTask -TaskName $name; Fixed "task $name restarted on the new build"
     } elseif ((Get-ScheduledTask -TaskName $name).State -ne 'Running') { Start-ScheduledTask -TaskName $name; Fixed "task $name started" }
     else { Ok "task $name is running" }
   }
