@@ -4,11 +4,12 @@
 // Pick the PC type with a button held while you plug the stick in (or tap RESET while holding it):
 //   plug in, then press B (BOOT) once within ~6 s ...... Windows: Win+R, PowerShell as Administrator (UAC: accept)
 //   press B twice ...................................... Ubuntu: Ctrl+Alt+T, then the download line, run with sudo
-//   press nothing ...................................... Ubuntu (default)
+//   press nothing ...................................... Windows (default)
 // Do NOT hold B while plugging in: that enters the chip's download mode. Plug in, wait for the blue light, then press.
 // R is the reset line and cannot be read by the sketch; B (GPIO0) is free once the board is running.
 //
-// Status light: blue = starting, amber = typing, green = done (safe to unplug). The red glow on the board is its power LED.
+// Status light (the orange user LED, GPIO21): slow blink = counting B presses (6 s); fast blink = typing;
+// solid 2 s = done, safe to unplug; off = idle. The red glow on the board is its power LED, not ours.
 //
 // Board: ESP32-S3 (Xiao or DevKit) with USB Mode "USB-OTG (TinyUSB)" and CDC On Boot disabled (hid/flash.sh sets these).
 // Copy config.example.h to config.h and fill it in (config.h is git-ignored: it holds the sudo password).
@@ -17,7 +18,7 @@
 #include "config.h"
 
 USBHIDKeyboard Keyboard;
-const int MODE_PIN = 0;  // B (BOOT) button on the Xiao: 1 press = Windows, 2 presses = Ubuntu (default)
+const int MODE_PIN = 0;  // B (BOOT) button on the Xiao: 1 press or none = Windows (default), 2 presses = Ubuntu
 const char *URL_SH = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.sh";
 const char *URL_PS = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.ps1";
 
@@ -33,9 +34,11 @@ void led(uint8_t r, uint8_t g, uint8_t b) {
 
 void typeText(const String &s) {
   for (size_t i = 0; i < s.length(); i++) {
+    led(i & 1, 0, 0);  // fast blink while typing
     Keyboard.write(s[i]);
-    delay(6);  // some hosts drop keys when typed faster
+    delay(12);  // some PCs drop keys when typed faster: 6 ms failed on some lab machines
   }
+  led(0, 0, 0);
 }
 
 void setup() {
@@ -44,7 +47,7 @@ void setup() {
   USB.manufacturerName("Cluster Kit");
   Keyboard.begin();
   USB.begin();
-  led(0, 0, 40);  // blue: starting; count B presses while the PC enumerates the keyboard
+  // count B presses while the PC enumerates the keyboard; the LED blinks slowly during this window
   int presses = 0;
   bool last = HIGH;
   uint32_t t0 = millis();
@@ -55,9 +58,11 @@ void setup() {
       delay(60);  // debounce
     }
     last = now;
+    led((millis() / 500) & 1, 0, 0);
     delay(5);
   }
-  bool windows = presses == 1;
+  led(0, 0, 0);
+  bool windows = presses != 2;  // default (no press) and 1 press: Windows; 2 presses: Ubuntu
 
   Keyboard.press(KEY_LEFT_SHIFT);  // wake a blanked screen
   delay(60);
@@ -69,9 +74,9 @@ void setup() {
     Keyboard.press('r');
     delay(120);
     Keyboard.releaseAll();
-    delay(1200);
+    delay(1800);  // the Run box must be open before the text goes in
     String cmd = String("powershell -NoProfile -ExecutionPolicy Bypass -c \"Start-Process powershell -Verb RunAs -ArgumentList '-NoExit -ExecutionPolicy Bypass -Command iex (irm ") + URL_PS + ")'\"";
-    led(40, 25, 0);
+    led(1, 0, 0);
     typeText(cmd);
     Keyboard.write(KEY_RETURN);
     delay(4000);
@@ -82,7 +87,7 @@ void setup() {
     Keyboard.press('t');
     delay(120);
     Keyboard.releaseAll();
-    led(40, 25, 0);  // amber: typing
+    led(1, 0, 0);  // amber: typing
     delay(3500);     // wait for the terminal window
 
     // leading space: keeps the line out of the shell history (Ubuntu default HISTCONTROL=ignoreboth).
@@ -92,7 +97,9 @@ void setup() {
     Keyboard.write(KEY_RETURN);
   }
   delay(300);
-  led(0, 40, 0);  // green: typed, safe to unplug
+  led(1, 0, 0);  // solid 2 s: typed, safe to unplug
+  delay(2000);
+  led(0, 0, 0);
 }
 
 void loop() {
