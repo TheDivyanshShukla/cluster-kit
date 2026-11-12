@@ -2,11 +2,11 @@
 //
 // Plug it in: it types the setup line by itself. Plug it into a logged-in lab PC, unplug after ~5 s, move on.
 // Pick the PC type with a button held while you plug the stick in (or tap RESET while holding it):
-//   no button ............ Ubuntu (default)
-//   BTN_LINUX held ....... Ubuntu: Ctrl+Alt+T, then the download line, run with sudo
-//   BTN_WIN held ......... Windows: Win+R, PowerShell as Administrator (UAC: accept, default is Yes)
-// Button wiring: one leg to the pin below, the other leg to any GND pad. On the Xiao: BTN_WIN = D3 (GPIO4),
-// BTN_LINUX = D4 (GPIO5). Change the two numbers below if you wire them elsewhere.
+//   plug in, then press B (BOOT) once within ~6 s ...... Windows: Win+R, PowerShell as Administrator (UAC: accept)
+//   press B twice ...................................... Ubuntu: Ctrl+Alt+T, then the download line, run with sudo
+//   press nothing ...................................... Ubuntu (default)
+// Do NOT hold B while plugging in: that enters the chip's download mode. Plug in, wait for the blue light, then press.
+// R is the reset line and cannot be read by the sketch; B (GPIO0) is free once the board is running.
 //
 // Status light: blue = starting, amber = typing, green = done (safe to unplug). The red glow on the board is its power LED.
 //
@@ -17,8 +17,7 @@
 #include "config.h"
 
 USBHIDKeyboard Keyboard;
-const int BTN_WIN = 4;    // GPIO4 = D3 on the Xiao: hold while plugging in for Windows
-const int BTN_LINUX = 5;  // GPIO5 = D4 on the Xiao: hold while plugging in for Ubuntu (also the default)
+const int MODE_PIN = 0;  // B (BOOT) button on the Xiao: 1 press = Windows, 2 presses = Ubuntu (default)
 const char *URL_SH = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.sh";
 const char *URL_PS = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.ps1";
 
@@ -40,16 +39,25 @@ void typeText(const String &s) {
 }
 
 void setup() {
-  pinMode(BTN_WIN, INPUT_PULLUP);
-  pinMode(BTN_LINUX, INPUT_PULLUP);
+  pinMode(MODE_PIN, INPUT_PULLUP);
   USB.productName("CK Provision");  // hid/flash.sh looks for this name on the USB bus
   USB.manufacturerName("Cluster Kit");
   Keyboard.begin();
   USB.begin();
-  led(0, 0, 40);  // blue: starting
-  delay(1500);
-  bool windows = digitalRead(BTN_WIN) == LOW && digitalRead(BTN_LINUX) == HIGH;  // both held (or neither): Ubuntu
-  delay(3500);  // the PC enumerates the keyboard
+  led(0, 0, 40);  // blue: starting; count B presses while the PC enumerates the keyboard
+  int presses = 0;
+  bool last = HIGH;
+  uint32_t t0 = millis();
+  while (millis() - t0 < 6000) {
+    bool now = digitalRead(MODE_PIN);
+    if (last == HIGH && now == LOW) {
+      presses++;
+      delay(60);  // debounce
+    }
+    last = now;
+    delay(5);
+  }
+  bool windows = presses == 1;
 
   Keyboard.press(KEY_LEFT_SHIFT);  // wake a blanked screen
   delay(60);
