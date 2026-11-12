@@ -18,10 +18,11 @@ $Bin = Join-Path $Dir 'rust\target\release\ck.exe'
 $Stamp = Join-Path $Dir 'rust\target\release\.ck-built'
 $LogDir = Join-Path $env:ProgramData 'cluster-kit'
 $Failed = 0
+$Problems = @()
 function Step($t) { Write-Host "`n== $t" }
 function Ok($t) { Write-Host "  ok      $t" -ForegroundColor Green }
 function Fixed($t) { Write-Host "  fixed   $t" -ForegroundColor Yellow }
-function Bad($t) { Write-Host "  FAIL    $t" -ForegroundColor Red; $script:Failed++ }
+function Bad($t) { Write-Host "  FAIL    $t" -ForegroundColor Red; $script:Failed++; $script:Problems += $t }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Start-Transcript -Path (Join-Path $LogDir 'provision.log') -Append | Out-Null
 
@@ -50,6 +51,30 @@ New-Item -Path $au -Force | Out-Null; Set-ItemProperty -Path $au -Name NoAutoReb
 Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name ScreenSaveActive -Value 0
 $q = (powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 2>&1 | Out-String)
 if ($q -match 'Current AC Power Setting Index: 0x00000000') { Ok 'sleep, screen blanking and lock screen are off' } else { Bad 'could not confirm that sleep is off' }
+
+Step 'git'
+$env:Path = "$env:ProgramFiles\Git\cmd;$env:Path"
+function Have-Git { [bool](Get-Command git -ErrorAction SilentlyContinue) }
+if (-not (Have-Git)) {
+  if (Get-Command winget -ErrorAction SilentlyContinue) {
+    Write-Host '   installing Git with winget (1 to 3 minutes)'
+    winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements *>> (Join-Path $LogDir 'git.log')
+    $env:Path = "$env:ProgramFiles\Git\cmd;$env:Path"
+  }
+  if (-not (Have-Git) -and $online) {
+    # no winget (or it failed): take the Git for Windows installer straight from its GitHub release
+    try {
+      $rel = Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' -UseBasicParsing
+      $asset = $rel.assets | Where-Object { $_.name -match '^Git-.*-64-bit\.exe$' } | Select-Object -First 1
+      $exe = Join-Path $env:TEMP $asset.name
+      Invoke-WebRequest $asset.browser_download_url -OutFile $exe -UseBasicParsing
+      Start-Process $exe -ArgumentList '/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-' -Wait
+      $env:Path = "$env:ProgramFiles\Git\cmd;$env:Path"
+    } catch { Write-Host "   git installer download failed: $($_.Exception.Message)" }
+  }
+}
+if (Have-Git) { Ok ((git --version) | Out-String).Trim() }
+else { Bad 'git is not installed and could not be installed. Install it by hand from https://git-scm.com/download/win (or run: winget install Git.Git), then run this script again' }
 
 Step 'cluster-kit in the Desktop folder'
 $zipHash = ''
@@ -160,6 +185,10 @@ if (Test-Path $Bin) {
 Step 'result'
 $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1).IPAddress
 Write-Host "   $env:COMPUTERNAME   $ip   build $(if (Test-Path $Stamp) { (Get-Content $Stamp -Raw).Trim() } else { 'none' })"
-if ($Failed -eq 0) { Write-Host '   DONE: all good, move to the next PC' -ForegroundColor Green } else { Write-Host "   $Failed PROBLEM(S): scroll up, details in $LogDir" -ForegroundColor Red }
+if ($Failed -eq 0) { Write-Host '   DONE: all good, move to the next PC' -ForegroundColor Green }
+else {
+  Write-Host "   $Failed PROBLEM(S), each one above and in $LogDir\provision.log:" -ForegroundColor Red
+  $i = 0; foreach ($p in $Problems) { $i++; Write-Host "   $i. $p" -ForegroundColor Red }
+}
 [Console]::Beep(880, 200)
 Stop-Transcript | Out-Null
