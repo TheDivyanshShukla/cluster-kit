@@ -8,7 +8,7 @@
 // Do NOT hold B while plugging in: that enters the chip's download mode. Plug in, wait for the blue light, then press.
 // R is the reset line and cannot be read by the sketch; B (GPIO0) is free once the board is running.
 //
-// Status light (the orange user LED, GPIO21): slow blink = counting B presses (6 s); fast blink = typing;
+// Status light (the orange user LED, GPIO21): slow blink = counting B presses (2.5 s); fast blink = typing;
 // solid 2 s = done, safe to unplug; off = idle. The red glow on the board is its power LED, not ours.
 //
 // Board: ESP32-S3 (Xiao or DevKit) with USB Mode "USB-OTG (TinyUSB)" and CDC On Boot disabled (hid/flash.sh sets these).
@@ -55,7 +55,7 @@ void setup() {
   int presses = 0;
   bool last = HIGH;
   uint32_t t0 = millis();
-  while (millis() - t0 < 6000) {
+  while (millis() - t0 < 2500) {
     bool now = digitalRead(MODE_PIN);
     if (last == HIGH && now == LOW) {
       presses++;
