@@ -262,5 +262,21 @@ done
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+    def test_windows_run_command_fits_and_keeps_the_initial_window_open(self):
+        sketch = (ROOT / 'hid/ck_provision/ck_provision.ino').read_text()
+        begin = sketch.index('    String cmd = String("powershell')
+        command = sketch[begin:sketch.index('\n', begin)]
+        cpp = self.base / 'windows-command.cpp'
+        cpp.write_text('#include <string>\n#include <iostream>\nusing String = std::string;\n'
+                       'const char *URL_PS = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.ps1";\n'
+                       'int main() {\n' + command + '\nstd::cout << cmd;\n}\n')
+        binary = self.base / 'windows-command'
+        subprocess.run(['c++', str(cpp), '-o', str(binary)], check=True, capture_output=True)
+        generated = subprocess.check_output([str(binary)], text=True)
+        self.assertLessEqual(len(generated), 259, generated)
+        self.assertIn('-NoExit', generated.split('-Command', 1)[0])
+        self.assertNotIn('Start-Process', generated)
+
+
 if __name__ == '__main__':
     unittest.main()

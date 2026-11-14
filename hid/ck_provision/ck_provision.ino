@@ -99,16 +99,22 @@ void setup() {
   delay(800);
   if (windows) {
     // Win+R opens a visible Administrator PowerShell; the person approves UAC.
+    // Keep the command below the classic Run limit and the initial console open.
     // Save the provisioning script to disk and respect the existing execution policy.
     Keyboard.press(KEY_LEFT_GUI);
     Keyboard.press('r');
     delay(120);
     Keyboard.releaseAll();
     delay(1800);  // the Run box must be open before the text goes in
-    String cmd = String("powershell -NoProfile -Command \"Start-Process powershell -Verb RunAs -ArgumentList '-NoExit -NoProfile -Command $p=Join-Path $env:TEMP ck-provision.ps1; try { Invoke-WebRequest -UseBasicParsing -ErrorAction Stop ") + URL_PS + " -OutFile $p; & $p } catch { Write-Error $_ }'\"";
+    String cmd = String("powershell -NoExit -NoProfile -Command \"$p=$env:TEMP+'/ck.ps1';try{Invoke-WebRequest -UseBasicParsing ") + URL_PS + " -OutFile $p -ErrorAction Stop;& $p}catch{$_}\"";
     led(1, 0, 0);
     typeText(cmd);
-    Keyboard.write(KEY_RETURN);
+    // Run's Ctrl+Shift+Enter requests Administrator rights; UAC is approved by the person.
+    Keyboard.press(KEY_LEFT_CTRL);
+    Keyboard.press(KEY_LEFT_SHIFT);
+    Keyboard.press(KEY_RETURN);
+    delay(120);
+    Keyboard.releaseAll();
   } else {
     Keyboard.press(KEY_LEFT_CTRL);  // Ctrl+Alt+T: GNOME terminal
     Keyboard.press(KEY_LEFT_ALT);

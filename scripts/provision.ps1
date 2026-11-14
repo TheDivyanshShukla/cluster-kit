@@ -26,8 +26,7 @@ function Fixed($t) { Write-Host "  fixed   $t" -ForegroundColor Yellow }
 function Bad($t) { Write-Host "  FAIL    $t" -ForegroundColor Red; $script:Failed++; $script:Problems += $t }
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $admin) {
-  Write-Error 'Run provision-windows.cmd as Administrator and approve the normal UAC prompt.'
-  exit 1
+  throw 'Administrator rights missing. Run provision-windows.cmd as Administrator and approve UAC.'
 }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Start-Transcript -Path (Join-Path $LogDir 'provision.log') -Append | Out-Null
