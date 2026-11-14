@@ -817,6 +817,7 @@ mod tests {
         assert!(JOB_MEM.lock().unwrap().contains(&(4242, 300)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn cmd_exit_codes() {
         let e = cmd("echo oops >&2; exit 75", 0, 1).unwrap_err();
@@ -826,6 +827,15 @@ mod tests {
         assert!(run_cmd(b"/no/such/program-x", 1, 1, 0, 1, 0, None).is_err());
         // mixed pieces: retry only if every failing piece said 75
         assert_eq!(run_cmd_par(1, b"sh -c 'exit 75' x", 0, 4, None).unwrap_err().0, true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_exit_codes() {
+        let e = run_cmd_in(b"echo oops 1>&2& exit /b 75", 7, 1, 0, 1, 0, Some(b""), None).unwrap_err();
+        assert!(e.0 && e.1.contains("75") && e.1.contains("oops"), "{e:?}");
+        let e = run_cmd_in(b"echo last 1>&2& exit /b 3", 7, 1, 0, 1, 0, Some(b""), None).unwrap_err();
+        assert!(!e.0 && e.1 == "exit 3: last", "{e:?}");
     }
 
     #[cfg(unix)]
