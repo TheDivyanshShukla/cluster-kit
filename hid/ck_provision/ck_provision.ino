@@ -1,6 +1,6 @@
 // Cluster Kit lab-PC provisioning stick. Xiao ESP32-S3 (or ESP32-S2 / DevKit) acting as a USB keyboard.
 //
-// Plug it in: it types the setup line by itself. Plug it into a logged-in lab PC, unplug after ~5 s, move on.
+// Plug it in: it types the setup line by itself. Plug it into a logged-in lab PC, unplug after the typing light finishes (the bootstrap line takes about 40 s), move on.
 // Pick the PC type with a button held while you plug the stick in (or tap RESET while holding it):
 //   plug in, then press B (BOOT) once within ~6 s ...... Windows: Win+R, PowerShell as Administrator (UAC: accept)
 //   press B twice ...................................... Ubuntu: Ctrl+Alt+T, then the download line, run with sudo
@@ -16,10 +16,21 @@
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 #include "config.h"
+#include "ubuntu_bootstrap.h"
+
+#ifndef CK_TARGET_OS
+#define CK_TARGET_OS 0  // 0: button selection, 1: Ubuntu only, 2: Windows only
+#endif
+#ifndef CK_BRANCH_NAME
+#define CK_BRANCH_NAME main
+#endif
+#define CK_STRING_(value) #value
+#define CK_STRING(value) CK_STRING_(value)
+#define CK_PROVISION_BRANCH CK_STRING(CK_BRANCH_NAME)
 
 USBHIDKeyboard Keyboard;
 const int MODE_PIN = 0;  // B (BOOT) button on the Xiao: 1 press or none = Windows (default), 2 presses = Ubuntu
-const char *URL_SH = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.sh";
+const char *URL_SH = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/" CK_PROVISION_BRANCH "/scripts/provision.sh";
 const char *URL_PS = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.ps1";
 
 // Status light. Boards with an RGB LED get the colour; a plain LED (Xiao: GPIO21) lights for any colour.
@@ -45,9 +56,24 @@ void typeText(const String &s) {
   led(0, 0, 0);
 }
 
+// Quote configuration values as one shell argument, including embedded apostrophes.
+String shellQuote(const char *value) {
+  String out = "'";
+  while (*value) {
+    if (*value == '\'') out += "'\"'\"'";
+    else out += *value;
+    value++;
+  }
+  return out + "'";
+}
+
 void setup() {
   pinMode(MODE_PIN, INPUT_PULLUP);
-  USB.productName("CK Provision");  // hid/flash.sh looks for this name on the USB bus
+  #if CK_TARGET_OS == 1
+  USB.productName("CK Provision Ubuntu");
+#else
+  USB.productName("CK Provision");
+#endif  // hid/flash.sh looks for this name on the USB bus
   USB.manufacturerName("Cluster Kit");
   Keyboard.begin();
   USB.begin();
@@ -66,7 +92,7 @@ void setup() {
     delay(5);
   }
   led(0, 0, 0);
-  bool windows = presses != 2;  // default (no press) and 1 press: Windows; 2 presses: Ubuntu
+  bool windows = CK_TARGET_OS == 2 || (CK_TARGET_OS == 0 && presses != 2);  // default (no press) and 1 press: Windows; 2 presses: Ubuntu
 
   Keyboard.press(KEY_LEFT_SHIFT);  // wake a blanked screen
   delay(60);
@@ -94,9 +120,9 @@ void setup() {
     led(1, 0, 0);  // amber: typing
     delay(3500);     // wait for the terminal window
 
-    // leading space: keeps the line out of the shell history (Ubuntu default HISTCONTROL=ignoreboth).
-    // The script goes into a private mktemp file (other users cannot swap it before sudo runs it); curl, else wget.
-    String cmd = String(" f=$(mktemp) && (curl -fsSL ") + URL_SH + " || wget -qO- " + URL_SH + ") > $f && [ -s $f ] && echo '" PASS "' | sudo -S -p '' env CK_ADMIN_KEY='" ADMIN_KEY "'" HEAD_ENV " bash $f";
+    // Authenticate first: the root bootstrap can install/repair curl before any download.
+    // Leading space keeps this command out of Ubuntu's default shell history.
+    String cmd = String(" printf '%s\\n' ") + shellQuote(PASS) + " | sudo -S -p '' -v && sudo -n env CK_FLEET=open CK_AUTH=off CK_REPLACE=1 CK_FOLLOW=1 CK_ROLE=worker CK_BRANCH=" + shellQuote(CK_PROVISION_BRANCH) + " CK_ADMIN_KEY=" + shellQuote(ADMIN_KEY) + HEAD_ENV + " bash -c " + shellQuote(UBUNTU_BOOTSTRAP) + " ck-bootstrap " + shellQuote(URL_SH);
     typeText(cmd);
     Keyboard.write(KEY_RETURN);
   }

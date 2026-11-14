@@ -6,6 +6,104 @@
 #                         CK_FLEET      open | secured (default open)      CK_JOIN_CODE  for a secured fleet
 #                         CK_BRANCH     git branch (default main)           CK_ADMIN_KEY  ssh public key line to allow in
 #                         CK_ROLE=head  also run the head here as a service  CK_AUTH  off (default): no login, no token
+
+# These helpers can be checked without executing machine provisioning.
+ck_apt() { apt-get -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -y "$@"; }
+ck_install_packages() {
+  ck_apt update || echo "apt index update failed; trying cached package lists" >&2
+  ck_apt install "$@" && return 0
+  dpkg --configure -a || echo "dpkg still needs dependency repair" >&2
+  ck_apt --fix-broken install || return 1
+  dpkg --configure -a || return 1
+  ck_apt update || echo "apt index update failed after repair" >&2
+  ck_apt --fix-missing install "$@"
+}
+
+ck_git_sync() {
+  local dir=$1 repo=$2 branch=$3 stage backup item
+  if [ ! -d "$dir/.git" ]; then
+    mkdir -p "$(dirname "$dir")" || return 1
+    stage=$(mktemp -d "${dir}.clone.XXXXXX") || return 1
+    git clone --single-branch --branch "$branch" "$repo" "$stage/repo" || return 1
+    if [ -d "$dir" ]; then
+      backup=$(mktemp -d "${dir}.before-git.XXXXXX") || return 1
+      mv "$dir" "$backup/cluster-kit" || return 1
+      echo "Previous folder saved in $backup/cluster-kit"
+    fi
+    mv "$stage/repo" "$dir" || return 1
+    rmdir "$stage"
+    if [ -n "${backup:-}" ]; then
+      for item in ck-data rust/target; do
+        if [ -d "$backup/cluster-kit/$item" ]; then
+          mkdir -p "$(dirname "$dir/$item")"
+          mv "$backup/cluster-kit/$item" "$dir/$item" || return 1
+          if [ "$item" = rust/target ]; then rm -f "$dir/rust/target/release/.ck-built"; fi
+        fi
+      done
+    fi
+    return 0
+  fi
+  [ -z "$(git -C "$dir" status --porcelain --untracked-files=no)" ] || {
+    echo "Local tracked edits in $dir; refusing to overwrite them" >&2; return 1;
+  }
+  # Single-branch clones need a fetch mapping before Git can track a newly deployed branch.
+  if ! git -C "$dir" config --get-all remote.origin.fetch | grep -Fx -e '+refs/heads/*:refs/remotes/origin/*' -e "+refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null; then
+    git -C "$dir" config --add remote.origin.fetch "+refs/heads/$branch:refs/remotes/origin/$branch" || return 1
+  fi
+  git -C "$dir" fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || return 1
+  if [ "$(git -C "$dir" branch --show-current)" != "$branch" ]; then
+    git -C "$dir" merge-base --is-ancestor HEAD FETCH_HEAD || {
+      echo "Current branch has commits outside $branch; refusing to discard them" >&2; return 1;
+    }
+    if git -C "$dir" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$dir" merge-base --is-ancestor "$branch" FETCH_HEAD || return 1
+      git -C "$dir" checkout "$branch" || return 1
+    else
+      git -C "$dir" checkout -b "$branch" --track "origin/$branch" || return 1
+    fi
+  fi
+  git -C "$dir" merge --ff-only "origin/$branch"
+
+}
+
+ck_stop_existing() {
+  # The visible launcher explicitly requests replacing all local ck instances.
+  systemctl stop ck-worker ck-head ck-agent 2>/dev/null || true
+  pkill -TERM -x ck 2>/dev/null || [ "$?" -eq 1 ] || return 1
+  local n
+  for n in {1..10}; do pgrep -x ck >/dev/null || return 0; sleep 1; done
+  pkill -KILL -x ck 2>/dev/null || [ "$?" -eq 1 ] || return 1
+  sleep 1
+  ! pgrep -x ck >/dev/null
+}
+
+ck_banner() {
+  local user=$1 ip ips
+  ips=$(hostname -I 2>/dev/null)
+  printf '\n\033[1;36m============================================================\n'
+  printf '  CLUSTER KIT WORKER  |  %s\n' "$(hostname)"
+  printf '============================================================\n'
+  if command -v figlet >/dev/null 2>&1; then figlet -f small "$(hostname)"; fi
+  if [ -n "$ips" ]; then
+    for ip in $ips; do
+      printf '\n  IP: %s\n' "$ip"
+      if command -v figlet >/dev/null 2>&1; then figlet -f small "$ip"; fi
+      printf '  SSH: ssh %s@%s\n' "$user" "$ip"
+    done
+  else
+    printf '  IP: unavailable — check the network connection\n'
+  fi
+  if ss -ltnH 'sport = :22' 2>/dev/null | grep -q .; then
+    printf '\n  SSH: listening on port 22\n'
+  else
+    printf '\n  SSH: NOT listening — see the repair errors above\n'
+  fi
+  printf '  Fleet: %s | Authentication: %s | Head: %s\n' "${CK_FLEET:-open}" "${CK_AUTH:-off}" "${CK_HEAD_IP:-LAN discovery}"
+  printf '============================================================\033[0m\n\n'
+}
+
+# Provisioning starts here
+
 [ "$(id -u)" = 0 ] || exec sudo -E bash "$0" "$@"
 LOG=/var/log/ck-provision.log
 if [ -z "${CK_LOGGED:-}" ]; then  # run again with everything copied to the log
@@ -34,6 +132,7 @@ U=${SUDO_USER:-}
 UID_=$(id -u "$U"); UH=$(getent passwd "$U" | cut -d: -f6); DIR=$UH/Desktop/cluster-kit; BIN=$DIR/rust/target/release/ck
 as_user() { sudo -u "$U" -H env "PATH=$UH/.cargo/bin:$PATH" "XDG_RUNTIME_DIR=/run/user/$UID_" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_/bus" "$@"; }
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
+ck_banner "$U"
 echo "Cluster Kit provisioning $(date '+%F %T') on $(hostname) for user $U"
 
 step "clock and network"
@@ -57,6 +156,26 @@ else
     retry 3 online && { ONLINE=1; fixed "DNS did not resolve; added public DNS servers"; }
   fi
   [ $ONLINE = 1 ] || bad "github.com unreachable: downloads skipped, the PC keeps what it already has"
+fi
+
+step "tools"
+declare -A PKG=([git]=git [curl]=curl [cc]=build-essential [pkg-config]=pkg-config [python3]=python3 [gsettings]=libglib2.0-bin [sshd]=openssh-server [certs]=ca-certificates [figlet]=figlet [ss]=iproute2 [pgrep]=procps)
+have() { case $1 in sshd) [ -x /usr/sbin/sshd ] ;; certs) [ -s /etc/ssl/certs/ca-certificates.crt ] ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+missing() { local k out=""; for k in "${!PKG[@]}"; do have "$k" || out="$out ${PKG[$k]}"; done; echo "$out"; }
+APT="apt-get -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -y -qq"
+need=$(missing)
+if [ -n "$need" ]; then
+  if [ $ONLINE = 1 ]; then
+    echo "   installing:$need"
+    # shellcheck disable=SC2086
+    ck_install_packages $need || bad "package repair failed; see apt/dpkg output above"
+    need=$(missing)
+    [ -z "$need" ] && fixed "installed what was missing" || bad "still missing:$need"
+  else
+    bad "offline, missing:$need"
+  fi
+else
+  ok "git curl compiler python3 ssh server certificates"
 fi
 
 step "no sleep, no screen lock, no timeouts"
@@ -99,27 +218,6 @@ if command -v nmcli >/dev/null 2>&1 && nmcli -t -f TYPE device 2>/dev/null | gre
   systemctl reload NetworkManager 2>/dev/null; fixed "Wi-Fi power saving off"
 fi
 
-step "tools"
-declare -A PKG=([git]=git [curl]=curl [cc]=build-essential [pkg-config]=pkg-config [python3]=python3 [gsettings]=libglib2.0-bin [sshd]=openssh-server [certs]=ca-certificates)
-have() { case $1 in sshd) [ -x /usr/sbin/sshd ] ;; certs) [ -s /etc/ssl/certs/ca-certificates.crt ] ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
-missing() { local k out=""; for k in "${!PKG[@]}"; do have "$k" || out="$out ${PKG[$k]}"; done; echo "$out"; }
-APT="apt-get -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -y -qq"
-need=$(missing)
-if [ -n "$need" ]; then
-  if [ $ONLINE = 1 ]; then
-    echo "   installing:$need"
-    $APT update || echo "   (apt update reported errors, using the cached lists)"
-    # shellcheck disable=SC2086
-    $APT install $need || { dpkg --configure -a; $APT -f install; for p in $need; do $APT install --fix-missing "$p"; done; }
-    need=$(missing)
-    [ -z "$need" ] && fixed "installed what was missing" || bad "still missing:$need"
-  else
-    bad "offline, missing:$need"
-  fi
-else
-  ok "git curl compiler python3 ssh server certificates"
-fi
-
 step "ssh and firewall"
 if have sshd; then
   ssh-keygen -A >/dev/null 2>&1  # host keys, only the missing ones
@@ -150,19 +248,21 @@ fi
 step "cluster-kit in $DIR"
 as_user mkdir -p "$UH/Desktop" "$DIR"
 if find "$DIR" ! -user "$U" -print -quit 2>/dev/null | grep -q .; then chown -R "$U": "$DIR"; fixed "files were owned by another user (a root run); fixed"; fi
-git_sync() {  # works on a fresh folder, a folder copied without .git, a clone, and (after the retry below) a damaged clone
-  [ -d "$DIR/.git" ] || as_user git -C "$DIR" init -q || return 1
-  as_user git -C "$DIR" remote set-url origin "$REPO" 2>/dev/null || as_user git -C "$DIR" remote add origin "$REPO"
-  as_user git -C "$DIR" fetch -q --depth 1 origin "$BRANCH" && as_user git -C "$DIR" checkout -q -f -B "$BRANCH" FETCH_HEAD
+git_sync() {
+  as_user bash -c "$(declare -f ck_git_sync); ck_git_sync \"\$@\"" _ "$DIR" "$REPO" "$BRANCH"
 }
 if [ $ONLINE = 1 ]; then
-  if retry 3 git_sync; then
-    ok "on the latest $BRANCH"
-  else
-    as_user rm -rf "$DIR/.git"
-    retry 2 git_sync && fixed "the git data was damaged; rebuilt it" || bad "git update failed"
-  fi
+  if git_sync; then ok "on the latest $BRANCH"
+  else bad "git update failed; existing files were preserved"; exit 1; fi
+else
+  bad "cannot update the worker while offline"; exit 1
 fi
+if [ "${CK_REPLACE:-0}" = 1 ]; then
+  step "replacing existing ck instances"
+  ck_stop_existing || { bad "old ck process did not stop"; exit 1; }
+  systemctl disable ck-head ck-agent >/dev/null 2>&1 || true
+fi
+
 have_cargo() { as_user cargo --version >/dev/null 2>&1; }
 if ! have_cargo && [ $ONLINE = 1 ]; then
   as_user rustup default stable >/dev/null 2>&1 || retry 3 as_user bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' >/dev/null 2>&1
@@ -170,10 +270,11 @@ if ! have_cargo && [ $ONLINE = 1 ]; then
 fi
 COMMIT=$(as_user git -C "$DIR" rev-parse --short HEAD 2>/dev/null)
 STAMP=$DIR/rust/target/release/.ck-built
-if [ -x "$BIN" ] && [ -n "$COMMIT" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$COMMIT" ]; then
+BUILD_ID="$COMMIT:$(uname -s):$(uname -m)"
+if [ -x "$BIN" ] && [ -n "$COMMIT" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$BUILD_ID" ]; then
   ok "ck is built at $COMMIT"
 elif ! have_cargo; then
-  [ -x "$BIN" ] && ok "using the ck that is already here (no Rust to rebuild it)" || bad "no ck binary and no Rust to build one"
+  bad "Rust is unavailable; refusing to start an out-of-date worker"; exit 1
 else
   free_kb() { df -Pk "$UH" | awk 'NR==2{print $4}'; }
   if [ "$(free_kb)" -lt 3000000 ]; then  # the build needs about 3 GB
@@ -183,14 +284,14 @@ else
   J=$(nproc); MEM=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
   [ "$MEM" -lt 4096 ] && [ "$J" -gt 2 ] && J=2   # a big parallel build runs a small PC out of memory
   [ "$MEM" -lt 1800 ] && J=1
-  cb() { as_user env CARGO_BUILD_JOBS="$J" cargo build --release --manifest-path "$DIR/rust/Cargo.toml" "$@" >> /var/log/ck-build.log 2>&1; }
+  cb() { as_user env CARGO_BUILD_JOBS="$J" cargo build --release --locked --manifest-path "$DIR/rust/Cargo.toml" "$@" >> /var/log/ck-build.log 2>&1; }
   echo "   building ck at $COMMIT with $J job(s): 1 to 5 minutes (the ESP stick can be unplugged now)"
   SECONDS=0
   if cb || { echo "   again after clearing incremental data"; rm -rf "$DIR/rust/target/release/incremental"; cb; } || { echo "   again without GPU support"; cb --no-default-features; }; then
-    echo "$COMMIT" | as_user tee "$STAMP" > /dev/null
+    echo "$BUILD_ID" | as_user tee "$STAMP" > /dev/null
     fixed "built ck $COMMIT in ${SECONDS}s"
   else
-    bad "ck build failed; last lines of /var/log/ck-build.log:"; tail -8 /var/log/ck-build.log | sed 's/^/        /'
+    bad "ck build failed; last lines of /var/log/ck-build.log:"; tail -8 /var/log/ck-build.log | sed 's/^/        /'; exit 1
   fi
 fi
 for l in "export CK_PRESENCE=off" "export CK_AUTH=${CK_AUTH:-off}" "export CK_FLEET=$FLEET" "export PATH=\$PATH:$DIR/rust/target/release"; do
@@ -233,9 +334,10 @@ if [ -x "$BIN" ]; then
     systemctl start ck-worker && fixed "worker service started" || bad "ck-worker would not start: $(systemctl status ck-worker -n 3 --no-pager 2>&1 | tail -3)"
   fi
   echo "$BUILT" | as_user tee "$DIR/rust/target/release/.ck-started" > /dev/null
+  SINCE=$(systemctl show ck-worker -p ActiveEnterTimestamp --value)
   LASTLINE=""
   for _ in $(seq 1 30); do
-    LASTLINE=$(journalctl -u ck-worker -n 300 -o cat 2>/dev/null | grep -E 'connected to head|lost head|cannot reach head|looking for head' | tail -1)
+    LASTLINE=$(journalctl -u ck-worker --since "${SINCE:-today}" -n 300 -o cat 2>/dev/null | grep -E 'connected to head|lost head|cannot reach head|looking for head' | tail -1)
     case $LASTLINE in *"connected to head"*) break ;; esac
     sleep 1
   done
@@ -250,5 +352,10 @@ fi
 step "result"
 echo "   $(hostname)   $(hostname -I | awk '{print $1}')   commit ${COMMIT:-none}   worker: $(systemctl is-active ck-worker 2>/dev/null)"
 if [ $FAILED = 0 ]; then printf '   %sDONE: all good, move to the next PC%s\n' "$G" "$N"; else printf '   %s%s PROBLEM(S): scroll up, details in %s%s\n' "$R" "$FAILED" "$LOG" "$N"; fi
+ck_banner "$U"
+if [ "${CK_FOLLOW:-0}" = 1 ] && systemctl is-active --quiet ck-worker; then
+  echo "Live worker log below: 'connected to head' confirms a connection. Ctrl+C closes this view; the worker keeps running."
+  journalctl -u ck-worker --since "${SINCE:-today}" -f -o cat
+fi
 printf '\a'
 exit $((FAILED > 255 ? 255 : FAILED))

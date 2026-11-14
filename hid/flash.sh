@@ -1,15 +1,27 @@
 #!/usr/bin/env bash
 # Flash the Cluster Kit HID stick. Any ESP32-S3 or ESP32-S2 board, any USB port, from a Mac or a Linux PC:
-#   hid/flash.sh [serial-port]
+#   hid/flash.sh [--os ubuntu|windows|auto] [serial-port]
+# CK_PROVISION_BRANCH selects the GitHub branch used by the Ubuntu bootstrap (default: main).
 # It finds the board, identifies the chip, builds ck_provision for that chip (the first build downloads the ESP32 core,
 # a few hundred MB), writes the whole flash image with esptool and checks the board comes back as a USB keyboard.
 # Needs: arduino-cli, and uv (or esptool on PATH).
 # If the board already runs the HID firmware no serial port shows up: hold BOOT, tap RESET (or hold BOOT while plugging
 # it in), then run this again.
-set -eu
+set -euo pipefail
 cd "$(dirname "$0")"
 SKETCH=ck_provision
-PORT=${1:-}
+PORT=""
+OS=auto
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --os) [ "$#" -ge 2 ] || { echo "--os needs ubuntu, windows, or auto" >&2; exit 1; }; OS=$2; shift 2 ;;
+    -*) echo "Unknown option: $1" >&2; exit 1 ;;
+    *) [ -z "$PORT" ] || { echo "Only one serial port is allowed" >&2; exit 1; }; PORT=$1; shift ;;
+  esac
+done
+case $OS in ubuntu) TARGET=1 ;; windows) TARGET=2 ;; auto) TARGET=0 ;; *) echo "Invalid OS: $OS" >&2; exit 1 ;; esac
+BRANCH=${CK_PROVISION_BRANCH:-main}
+case $BRANCH in *[!a-zA-Z0-9_./-]*|'') echo "Invalid provisioning branch" >&2; exit 1 ;; esac
 say() { printf '\n== %s\n' "$*"; }
 die() { printf '!! %s\n' "$*" >&2; exit 1; }
 
@@ -18,13 +30,13 @@ if command -v esptool >/dev/null 2>&1; then ESPTOOL="esptool"
 elif command -v uvx >/dev/null 2>&1; then ESPTOOL="uvx --quiet esptool"
 else die "esptool missing: install uv (https://docs.astral.sh/uv/) or run: pip install esptool"; fi
 # esptool 5 spells commands with hyphens, esptool 4 with underscores
-if $ESPTOOL --help 2>&1 | grep -q 'write-flash'; then CHIPID=chip-id; WRITE=write-flash; else CHIPID=chip_id; WRITE=write_flash; fi
+if $ESPTOOL --help 2>&1 | grep 'write-flash' >/dev/null; then CHIPID=chip-id; WRITE=write-flash; AFTER=no-reset; else CHIPID=chip_id; WRITE=write_flash; AFTER=no_reset; fi
 [ -f "$SKETCH/config.h" ] || die "$SKETCH/config.h is missing: copy $SKETCH/config.example.h to $SKETCH/config.h and fill it in"
 
 ports() { ls /dev/cu.usbmodem* /dev/cu.usbserial* /dev/cu.wchusbserial* /dev/cu.SLAB_USBtoUART* /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || true; }
 chip_of() {  # $1 = port; prints esp32s3 | esp32s2 | the raw chip name; returns 1 when the board does not answer
   local out name
-  out=$($ESPTOOL --port "$1" $CHIPID 2>&1) || return 1
+  out=$($ESPTOOL --port "$1" --after "$AFTER" $CHIPID 2>&1) || return 1
   name=$(printf '%s\n' "$out" | grep -oE 'ESP32(-[A-Z0-9]+)*' | head -1)
   case $name in *S3*) echo esp32s3 ;; *S2*) echo esp32s2 ;; *) echo "${name:-unknown}" ;; esac
 }
@@ -60,31 +72,26 @@ CT=$(ls "$HOME"/Library/Arduino15/packages/builtin/tools/ctags/*/ctags 2>/dev/nu
 if [ -n "$CT" ] && ! "$CT" --version >/dev/null 2>&1; then
   mv "$CT" "$CT.x86" && printf '#!/bin/sh\nexit 0\n' > "$CT" && chmod +x "$CT" && echo "   ctags cannot run here: using a no-op"
 fi
-BIN=build/$CHIP/$SKETCH.ino.merged.bin
+OUT=build/$OS/$CHIP
+BIN=$OUT/$SKETCH.ino.merged.bin
 rm -f "$BIN"
-arduino-cli compile --fqbn "$FQBN" --output-dir "build/$CHIP" "$SKETCH" | tail -4
+arduino-cli compile --fqbn "$FQBN" --build-property "compiler.cpp.extra_flags=-DCK_TARGET_OS=$TARGET -DCK_BRANCH_NAME=$BRANCH" --output-dir "$OUT" "$SKETCH"
 [ -s "$BIN" ] || die "build produced no $BIN (see the compiler output above)"
 
 say "flashing $(wc -c < "$BIN" | tr -d ' ') bytes"
 ok=""
 for baud in 921600 460800 115200; do
-  if $ESPTOOL --chip "$CHIP" --port "$PORT" --baud $baud $WRITE 0x0 "$BIN"; then ok=1; break; fi
+  if $ESPTOOL --chip "$CHIP" --port "$PORT" --baud $baud --after "$AFTER" $WRITE 0x0 "$BIN"; then ok=1; break; fi
   echo "   $baud baud failed, trying slower"
   for _ in 1 2 3 4 5 6 7 8; do [ -e "$PORT" ] && break; sleep 1; done  # the port vanishes while the board re-enumerates
 done
 [ -n "$ok" ] || die "flashing failed at every speed: hold BOOT, tap RESET, run again"
 
-say "checking it comes back as a USB keyboard"
-seen=""
-for _ in $(seq 1 15); do
-  if { ioreg -p IOUSB -l -w0 2>/dev/null; cat /sys/bus/usb/devices/*/product 2>/dev/null; } | grep -q 'CK Provision'; then seen=1; break; fi
-  sleep 1
-done
-[ -n "$seen" ] && echo "   yes: 'CK Provision' is on the USB bus" || echo "   not seen yet (some hosts hide it from this check); try unplugging and plugging it in again"
+say "flash verified; board left in download mode to avoid typing into the flashing computer"
 
 echo
 case $PORT in
   *usbserial*|*wchusbserial*|*SLAB*|*ttyUSB*) echo "NOTE: you flashed through the UART bridge port. Plug the PC into the OTHER USB-C port (the one labelled USB), that one is the keyboard." ;;
 esac
-echo "Done. The LED blinks red until a jumper wire joins GPIO4 and GND; with the jumper in, plugging it into a logged-in Ubuntu PC types the setup line."
+echo "Done: $OS firmware, Ubuntu provisioning branch $BRANCH. Unplug and move it to the target PC; wait until the typing light finishes before removing it."
 echo "To flash again: hold BOOT, tap RESET (or hold BOOT while plugging in), run hid/flash.sh."
