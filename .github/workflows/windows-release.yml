@@ -1,0 +1,67 @@
+name: Windows worker release
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'rust/**'
+      - 'scripts/provision.ps1'
+      - 'scripts/tests/windows*.ps1'
+      - '.github/workflows/windows-release.yml'
+permissions:
+  contents: write
+concurrency:
+  group: windows-worker-release
+  cancel-in-progress: false
+jobs:
+  windows:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    env:
+      RUSTFLAGS: '-C target-feature=+crt-static'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Provisioning regressions on Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          & .\scripts\tests\windows_provision.tests.ps1
+          & .\scripts\tests\windows_release.tests.ps1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust tests
+        run: cargo test --locked --manifest-path rust/Cargo.toml --no-default-features --target x86_64-pc-windows-msvc
+      - name: Build standalone Windows x64 worker
+        run: cargo build --locked --manifest-path rust/Cargo.toml --release --no-default-features --target x86_64-pc-windows-msvc
+      - name: Smoke test packaged binary and create manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item rust/target/x86_64-pc-windows-msvc/release/ck.exe dist/ck-windows-x86_64.exe
+          $env:CK_PORT = '17900'
+          $env:CK_DATA = Join-Path $env:RUNNER_TEMP 'ck-release-smoke'
+          $env:CK_AUTH = 'off'
+          $env:CK_FLEET = 'open'
+          $proc = Start-Process -FilePath (Resolve-Path dist/ck-windows-x86_64.exe) -ArgumentList 'head','--no-local-worker' -PassThru -RedirectStandardOutput dist/smoke.log -RedirectStandardError dist/smoke-error.log
+          try {
+            $ready = $false
+            foreach ($i in 1..60) {
+              if ($proc.HasExited) { throw "Head exited: $(Get-Content dist/smoke-error.log -Raw)" }
+              try { $null = Invoke-RestMethod http://127.0.0.1:17902/api/v1/ha; $ready = $true; break } catch { Start-Sleep -Seconds 1 }
+            }
+            if (-not $ready) { throw 'Packaged Windows head did not respond to its API' }
+          } finally { if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force } }
+          @{
+            commit = $env:GITHUB_SHA
+            target = 'x86_64-pc-windows-msvc'
+            sha256 = (Get-FileHash dist/ck-windows-x86_64.exe -Algorithm SHA256).Hash.ToLower()
+          } | ConvertTo-Json | Set-Content dist/windows-manifest.json -Encoding utf8
+      - name: Publish tested immutable Windows release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "windows-$env:GITHUB_SHA"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { exit 0 }
+          gh release create $tag dist/ck-windows-x86_64.exe dist/windows-manifest.json --target $env:GITHUB_SHA --title "Windows worker $($env:GITHUB_SHA.Substring(0, 10))" --notes 'Windows x64 CPU worker for Windows 10 and 11. Static C runtime; Rust, Visual Studio Build Tools and winget are not required on the target PC. SHA-256 and source commit are recorded in windows-manifest.json.'
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release publication failed' }

@@ -99,15 +99,15 @@ Copy or clone this folder to every PC, then:
 - **Python engine:** installs uv, then the pinned Python 3.12.13 and packages from `uv.lock`.
 - **Rust engine:** installs Rust and builds `ck`. Use `kit setup py` to skip Rust.
 - **Sleep:** setup also offers to disable sleep on that PC.
-- **Windows and Rust:** building needs the MSVC build tools. If the build fails, setup prints the `winget` command that installs them.
+- **Windows:** setup downloads a tested x64 CPU worker with a verified SHA-256 checksum. Building from source is optional and needs Rust and MSVC.
 - **Ubuntu PCs:** what to copy, packages, offline builds and ports are in [docs/UBUNTU.md](docs/UBUNTU.md).
 - **Many Ubuntu PCs, fast:** `sudo bash scripts/provision.sh` does everything on one PC and repairs what it finds wrong: no sleep or screen lock, packages, ssh, the folder in `~/Desktop/cluster-kit`, the build, and a `ck-worker` service that starts at boot and joins the head. Run it again any time. An ESP32-S3/S2 stick can type it for you: flash it with `hid/flash.sh` (see the header of [hid/ck_provision/ck_provision.ino](hid/ck_provision/ck_provision.ino)), plug it into a logged-in PC, unplug after typing finishes (USB-paced; wait for the done light).
 
 ### Visible Windows 10 / 11 worker
 
-Use the saved repository files: right-click `scripts\provision-windows.cmd` and choose **Run as administrator**, then approve UAC. It uses built-in Windows PowerShell 5.1, installs Git, Rust/MSVC and OpenSSH as needed, builds the worker, configures the cluster firewall rules, and starts the scheduled worker at boot. The final console shows hostname, IPv4 addresses, SSH commands and live worker logs. Set `CK_FOLLOW=0` to finish without following logs.
+Use the saved repository files: right-click `scripts\provision-windows.cmd` and choose **Run as administrator**, then approve UAC. It uses built-in Windows PowerShell 5.1, downloads a tested Windows x64 CPU worker, installs OpenSSH as needed, configures the cluster firewall rules, and starts the scheduled worker at boot. The normal path needs no Git, Rust, MSVC, winget or compiler-installation reboot. The final console shows hostname, IPv4 addresses, SSH commands and live worker logs. Set `CK_FOLLOW=0` to finish without following logs.
 
-Git and MSVC installation do not require a working `winget`: direct official installers are used as fallbacks. The MSVC fallback checks Microsoft's signature, installs the C++ workload and recommended SDK components, and reports if a restart is required. Source staging uses a unique folder under `%ProgramData%\cluster-kit`, avoiding user TEMP short-path problems. Builds are skipped until source and compiler prerequisites are ready.
+Windows releases are compiled with a static C runtime and tested on Windows CI before publication. Setup checks the source commit and SHA-256 manifest before stopping or replacing the existing worker. Downloads use a unique staging folder under `%ProgramData%\cluster-kit`, avoiding user TEMP short-path problems. Set `CK_BUILD_SOURCE=1` for an optional developer build (including GPU support); only that path installs Git, Rust and Microsoft C++ Build Tools, with direct official installers when winget is unavailable.
 
 The launcher respects the existing script execution policy and makes no Defender exclusions. Managed PCs may require an administrator-approved signed script. Antivirus acceptance and live Windows behaviour have to be verified on the target PC. Logs are in `%ProgramData%\cluster-kit`.
 

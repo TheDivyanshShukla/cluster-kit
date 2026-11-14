@@ -16,7 +16,9 @@ jobs:
         if: runner.os == 'Windows'
         working-directory: .
         shell: powershell
-        run: '& .\scripts\tests\windows_provision.tests.ps1'
+        run: |
+          & .\scripts\tests\windows_provision.tests.ps1
+          & .\scripts\tests\windows_release.tests.ps1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

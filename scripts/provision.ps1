@@ -4,6 +4,7 @@
 # Settings (environment variables): CK_HEAD_IP   pin the head (default: workers find it by broadcast)
 #   CK_BRANCH (main)   CK_ADMIN_KEY (an ssh public key line to allow in)   CK_ROLE=head (also run the head here)
 #   CK_AUTH (off = open mode: no login, no token)   CK_FLEET (open)
+#   CK_BUILD_SOURCE (1 = optional developer build; default downloads the tested Windows x64 worker)
 #   CK_FOLLOW (1 = show live worker logs after setup; default 1, Ctrl+C closes the view)
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'  # downloads are much faster without the progress bar
@@ -43,6 +44,47 @@ function Sync-CkSource($stage, $destination, $branch) {
   robocopy $roots[0].FullName $destination /E /XD target ck-data /NFL /NDL /NJH /NJS /NP | Out-Null  # keep the built binary and local data
   if ($LASTEXITCODE -ge 8) { throw "Source copy failed with robocopy exit code $LASTEXITCODE" }
   $hash
+}
+
+function Stop-Ck {
+  foreach ($t in 'ck-worker', 'ck-head') { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue }
+  Get-Process ck -ErrorAction SilentlyContinue | Stop-Process -Force
+  Start-Sleep 2
+}
+
+# A lab PC needs the worker, not a multi-GB development toolchain. Releases are built and tested on Windows CI.
+function Install-CkRelease($stage, $bin, $stamp) {
+  $releases = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases?per_page=20" -UseBasicParsing -ErrorAction Stop
+  $release = @($releases) | Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -cmatch '^windows-[0-9a-f]{40}$' } | Select-Object -First 1
+  if (-not $release) { throw 'No tested Windows release is available yet. Rerun setup after the Windows release build completes.' }
+  $tag = $release.tag_name
+  $base = "https://github.com/$Repo/releases/download/$tag"
+  $manifest = Invoke-RestMethod "$base/windows-manifest.json" -UseBasicParsing -ErrorAction Stop
+  if ($manifest.commit -cne $tag.Substring(8) -or $manifest.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or $manifest.target -cne 'x86_64-pc-windows-msvc') {
+    throw 'Windows release manifest has invalid identity, target or checksum'
+  }
+  if ((Test-Path -LiteralPath $bin) -and (Get-FileHash -LiteralPath $bin -Algorithm SHA256 -ErrorAction Stop).Hash -eq $manifest.sha256) {
+    Set-Content -LiteralPath $stamp -Value $manifest.commit -ErrorAction Stop
+    return $false
+  }
+  New-Item -ItemType Directory -Force -Path $stage -ErrorAction Stop | Out-Null
+  $download = Join-Path $stage 'ck-windows-x86_64.exe'
+  Write-Host "   downloading tested Windows worker ($($manifest.commit.Substring(0, 10)))"
+  Invoke-WebRequest "$base/ck-windows-x86_64.exe" -OutFile $download -UseBasicParsing -ErrorAction Stop
+  if ((Get-FileHash -LiteralPath $download -Algorithm SHA256 -ErrorAction Stop).Hash -ne $manifest.sha256) {
+    throw 'Windows worker checksum mismatch; existing worker has not been stopped or replaced'
+  }
+  $header = [IO.File]::ReadAllBytes($download)
+  if ($header.Length -lt 2 -or $header[0] -ne 77 -or $header[1] -ne 90) { throw 'Download is not a Windows executable' }
+  New-Item -ItemType Directory -Force -Path (Split-Path $bin) -ErrorAction Stop | Out-Null
+  $next = $bin + '.new'
+  Copy-Item -LiteralPath $download -Destination $next -Force -ErrorAction Stop
+  Stop-Ck
+  # Replace atomically on the destination volume, retaining the previous binary as a recovery copy.
+  if (Test-Path -LiteralPath $bin) { [IO.File]::Replace($next, $bin, ($bin + '.previous')) }
+  else { [IO.File]::Move($next, $bin) }
+  Set-Content -LiteralPath $stamp -Value $manifest.commit -ErrorAction Stop
+  return $true
 }
 
 function Install-Msvc {
@@ -111,6 +153,8 @@ Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name ScreenSaveActive -Val
 $q = (powercfg /query SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 2>&1 | Out-String)
 if ($q -match 'Current AC Power Setting Index: 0x00000000') { Ok 'sleep, screen blanking and lock screen are off' } else { Bad 'could not confirm that sleep is off' }
 
+$Rebuilt = $false
+if ($env:CK_BUILD_SOURCE -eq '1') {
 Step 'git'
 $env:Path = "$env:ProgramFiles\Git\cmd;$env:Path"
 function Have-Git { [bool](Get-Command git -ErrorAction SilentlyContinue) }
@@ -164,13 +208,8 @@ function Have-Msvc {
   $vw = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
   (Test-Path $vw) -and [bool](& $vw -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
 }
-$Rebuilt = $false
 # a running ck.exe locks the file: stop the worker and head tasks and any hand-started copy before the build replaces it
-function Stop-Ck {
-  foreach ($t in 'ck-worker', 'ck-head') { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue }
-  Get-Process ck -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep 2
-}
+
 function Build-Ck([string[]]$extra) {
   & cargo build --release --manifest-path (Join-Path $Dir 'rust\Cargo.toml') @extra *>> (Join-Path $LogDir 'build.log')
   $LASTEXITCODE -eq 0
@@ -191,6 +230,20 @@ else {
     Bad "ck build failed, see $LogDir\build.log"
     Get-Content -LiteralPath (Join-Path $LogDir 'build.log') -Tail 40 | ForEach-Object { Write-Host "        $_" }
   }
+}
+
+# End optional source build
+} else {
+  Step 'tested Windows worker (no Rust, MSVC or winget needed)'
+  if ($Branch -ne 'main') { Bad 'Prebuilt Windows workers follow main. Set CK_BUILD_SOURCE=1 to build another branch.' }
+  elseif ($online) {
+    try {
+      $script:Rebuilt = Install-CkRelease $StageDir $Bin $Stamp
+      if ($script:Rebuilt) { Fixed 'verified Windows worker installed; no compiler or reboot needed' }
+      else { Ok 'installed Windows worker checksum matches the tested release' }
+    } catch { Bad "Windows worker download failed: $($_.Exception.Message)" }
+  } elseif (Test-Path -LiteralPath $Bin) { Ok 'offline: keeping the existing Windows worker' }
+  else { Bad 'offline and no Windows worker is installed' }
 }
 
 Step 'firewall and ssh'
@@ -231,13 +284,13 @@ if (Test-Path $Bin) {
     if (-not $same) {
       Register-ScheduledTask -TaskName $name -Action $act -Trigger (New-ScheduledTaskTrigger -AtStartup) -Settings $set -User 'SYSTEM' -RunLevel Highest -Force | Out-Null
       Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-      Get-Process ck -ErrorAction SilentlyContinue | Stop-Process -Force  # copies started by hand would hold the ports
       Start-Sleep 2; Start-ScheduledTask -TaskName $name; Fixed "task $name installed and started"
     } elseif ($script:Rebuilt) {
-      Stop-Ck; Start-ScheduledTask -TaskName $name; Fixed "task $name restarted on the new build"
+      Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName $name; Fixed "task $name restarted on the new build"
     } elseif ((Get-ScheduledTask -TaskName $name).State -ne 'Running') { Start-ScheduledTask -TaskName $name; Fixed "task $name started" }
     else { Ok "task $name is running" }
   }
+  if (-not (Get-ScheduledTask -TaskName 'ck-worker' -ErrorAction SilentlyContinue)) { Stop-Ck }
   Install-Task 'ck-worker' "worker$HeadArg"
   if ($env:CK_ROLE -eq 'head') { Install-Task 'ck-head' 'head --no-local-worker' }
   $line = ''

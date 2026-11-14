@@ -115,7 +115,7 @@ try {
     $SourceReady = $true
     $Bin = Join-Path $root 'missing.exe'; $Stamp = Join-Path $root 'missing.stamp'; $zipHash = ''
     $start = $source.IndexOf('$cur = if (Test-Path $Stamp)')
-    $end = $source.IndexOf("Step 'firewall and ssh'", $start)
+    $end = $source.IndexOf('# End optional source build', $start)
     . ([scriptblock]::Create($source.Substring($start, $end - $start)))
     Assert ($script:lastProblem -match 'MSVC|C\+\+') 'Missing MSVC not reported'
     Write-Host 'PASS: cargo and worker replacement gated on prerequisites'
@@ -123,6 +123,7 @@ try {
     . ([scriptblock]::Create($source.Substring($start, $end - $start)))
     Assert ($script:lastProblem -match 'source') 'Bad source must block the build'
     Write-Host 'PASS: failed source sync blocks cargo'
+    $global:LASTEXITCODE = 0  # native-command mocks must not make Windows PowerShell report test failure
 } finally {
     $env:TEMP = $originalTemp
     Remove-Item -LiteralPath $root -Recurse -Force
