@@ -276,6 +276,7 @@ done
         self.assertLessEqual(len(generated), 259, generated)
         self.assertIn('-NoExit', generated.split('-Command', 1)[0])
         self.assertNotIn('Start-Process', generated)
+        self.assertIn('-ExecutionPolicy RemoteSigned', generated.split('-Command', 1)[0])
 
 
 if __name__ == '__main__':

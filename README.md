@@ -109,6 +109,8 @@ Use the saved repository files: right-click `scripts\provision-windows.cmd` and 
 
 The launcher respects the existing script execution policy and makes no Defender exclusions. Managed PCs may require an administrator-approved signed script. Antivirus acceptance and live Windows behaviour have to be verified on the target PC. Logs are in `%ProgramData%\cluster-kit`.
 
+The Windows HID stick opens Administrator PowerShell with a **process-only `RemoteSigned` policy**. UAC must be approved manually. It does not persist an execution-policy change, alter Defender, or override Group Policy; policies requiring signatures still require an approved signed script. Startup errors stay visible.
+
 ### Visible Ubuntu worker
 
 Run `bash ~/Desktop/cluster-kit/scripts/worker-ubuntu.sh` in an Ubuntu terminal. It repairs missing packages (including interrupted dpkg and broken apt dependencies), enables SSH, updates the current Git branch without overwriting tracked edits, rebuilds if necessary, and replaces old local `ck` processes, including an old local head. The replacement worker starts at boot in open mode with no join code. Sleep, display blanking and automatic locking are disabled.

