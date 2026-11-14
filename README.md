@@ -109,7 +109,7 @@ Run `bash ~/Desktop/cluster-kit/scripts/worker-ubuntu.sh` in an Ubuntu terminal.
 
 The terminal shows the hostname, large IP addresses, SSH connection commands and live worker logs. `connected to head` confirms that PC joined; an IP banner alone does not. Ctrl+C closes the log view while the service keeps running. SSH still uses the PC's normal account authentication or your configured public key.
 
-For an Ubuntu-only ESP32 stick: `CK_PROVISION_BRANCH=feature/general-purpose bash hid/flash.sh --os ubuntu SERIAL_PORT`. The first typed command authenticates sudo and installs curl/certificates before downloading the setup script. Leave it plugged into the target until typing finishes (about 40 seconds). Flashing leaves the stick in download mode: unplug it from the flashing computer and plug it into a logged-in Ubuntu PC to run. The script and firmware must use a branch already pushed to GitHub.
+For an Ubuntu-only ESP32 stick: `CK_PROVISION_BRANCH=main bash hid/flash.sh --os ubuntu SERIAL_PORT`. The first typed command authenticates sudo and installs curl/certificates before downloading the setup script. Leave it plugged into the target until typing finishes (about 40 seconds). Flashing leaves the stick in download mode: unplug it from the flashing computer and plug it into a logged-in Ubuntu PC to run. The script and firmware must use a branch already pushed to GitHub.
 
 ## Run
 
