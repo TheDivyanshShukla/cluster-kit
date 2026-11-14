@@ -95,6 +95,14 @@ pub const CAP_SIGNED: u64 = 1;
 pub const CAP_BLOBS: u64 = 2;
 pub const CAPS: u64 = CAP_SIGNED | CAP_BLOBS;
 
+/// A standby that connects again replaces its earlier link: one node is one standby. Two links for one node counted it
+/// twice towards durability, and the console (lists keyed by node id) failed on the repeated id in /api/v1/ha. Dropping
+/// the old link drops its sender, which ends that link's writer thread.
+fn add_link(links: &mut Vec<Link>, new: Link) {
+    links.retain(|l| l.node != new.node);
+    links.push(new);
+}
+
 struct Link {
     id: u64,
     node: String,
@@ -514,7 +522,7 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
         let replay: Vec<Entry> = if snapshot { vec![] } else { g.ring.iter().filter(|e| e.seq > seq).cloned().collect() };
         g.next_link += 1;
         let lid = g.next_link;
-        g.links.push(Link { id: lid, node: h.node_id.clone(), peer, tx, acked: if snapshot { 0 } else { seq }, caps });
+        add_link(&mut g.links, Link { id: lid, node: h.node_id.clone(), peer, tx, acked: if snapshot { 0 } else { seq }, caps });
         g.ring_until = Some(Instant::now() + Duration::from_secs(120));
         sync_status(ctx, &g);
         let first = hello_entry(&g, lid, if snapshot { "snapshot" } else { "replay" });
@@ -1103,6 +1111,13 @@ mod tests {
         assert!(should_promote(2, 9.0));
         assert!(!refused_promote(0, 0.2) && refused_promote(0, 0.6), "a refusing primary PC: take over after 0.5 s");
         assert!(!refused_promote(1, 2.0) && refused_promote(1, 2.6), "second standby waits one step longer");
+        // a standby that reconnects replaces its old link instead of being listed twice
+        let mk = |id: u64, node: &str| Link { id, node: node.into(), peer: "p".into(), tx: mpsc::channel().0, acked: id, caps: 0 };
+        let mut links = vec![];
+        for (id, node) in [(1, "a"), (2, "b"), (3, "a")] {
+            add_link(&mut links, mk(id, node));
+        }
+        assert_eq!(links.iter().map(|l| (l.id, l.node.as_str())).collect::<Vec<_>>(), vec![(2, "b"), (3, "a")]);
         assert!(has_quorum(0, 0));
         assert!(!has_quorum(5, 10));
         assert!(has_quorum(6, 10));
