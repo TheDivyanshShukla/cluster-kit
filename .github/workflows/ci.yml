@@ -12,6 +12,11 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
+      - name: Windows PowerShell 5.1 provisioning regressions
+        if: runner.os == 'Windows'
+        working-directory: .
+        shell: powershell
+        run: '& .\scripts\tests\windows_provision.tests.ps1'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

@@ -24,12 +24,69 @@ function Step($t) { Write-Host "`n== $t" }
 function Ok($t) { Write-Host "  ok      $t" -ForegroundColor Green }
 function Fixed($t) { Write-Host "  fixed   $t" -ForegroundColor Yellow }
 function Bad($t) { Write-Host "  FAIL    $t" -ForegroundColor Red; $script:Failed++; $script:Problems += $t }
+# Keep staging independent of user TEMP (which can contain stale short paths).
+function Sync-CkSource($stage, $destination, $branch) {
+  New-Item -ItemType Directory -Force -Path $stage -ErrorAction Stop | Out-Null
+  $zip = Join-Path $stage 'source.zip'
+  $unpack = Join-Path $stage 'source'
+  Write-Host "   downloading source to $zip"
+  Invoke-WebRequest "https://github.com/$Repo/archive/refs/heads/$branch.zip" -OutFile $zip -UseBasicParsing -ErrorAction Stop
+  $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256 -ErrorAction Stop).Hash.Substring(0, 10).ToLower()
+  # .NET extraction uses literal paths, including spaces/brackets, on Windows PowerShell 5.1.
+  Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+  [IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpack)
+  $roots = @(Get-ChildItem -LiteralPath $unpack -Directory -ErrorAction Stop)
+  if ($roots.Count -ne 1 -or -not (Test-Path -LiteralPath (Join-Path $roots[0].FullName 'rust/Cargo.toml'))) {
+    throw 'Downloaded archive does not contain the expected cluster-kit source'
+  }
+  New-Item -ItemType Directory -Force -Path $destination -ErrorAction Stop | Out-Null
+  robocopy $roots[0].FullName $destination /E /XD target ck-data /NFL /NDL /NJH /NJS /NP | Out-Null  # keep the built binary and local data
+  if ($LASTEXITCODE -ge 8) { throw "Source copy failed with robocopy exit code $LASTEXITCODE" }
+  $hash
+}
+
+function Install-Msvc {
+  if (Have-Msvc) { return $true }
+  if (-not $online) { Write-Host '   offline: cannot install MSVC'; return $false }
+  if (Get-Command winget -ErrorAction SilentlyContinue) {
+    try {
+      Write-Host '   trying winget for Microsoft C++ Build Tools'
+      winget install --id Microsoft.VisualStudio.2022.BuildTools -e --silent --accept-package-agreements --accept-source-agreements --override '--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended' *>> (Join-Path $LogDir 'msvc.log')
+    } catch { Write-Host "   winget failed: $($_.Exception.Message)" }
+    if (Have-Msvc) { return $true }
+  }
+  try {
+    Write-Host '   downloading Microsoft Build Tools directly (winget is not required)'
+    Write-Host '   installing C++ tools and Windows SDK: several GB, allow 10 to 20 minutes'
+    New-Item -ItemType Directory -Force -Path $StageDir -ErrorAction Stop | Out-Null
+    $installer = Join-Path $StageDir 'vs_BuildTools.exe'
+    Invoke-WebRequest 'https://aka.ms/vs/17/release/vs_BuildTools.exe' -OutFile $installer -UseBasicParsing -ErrorAction Stop
+    $signature = Get-AuthenticodeSignature -FilePath $installer
+    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
+      throw 'Build Tools installer does not have a valid Microsoft signature'
+    }
+    $process = Start-Process -FilePath $installer -ArgumentList '--passive', '--wait', '--norestart', '--add', 'Microsoft.VisualStudio.Workload.VCTools', '--includeRecommended' -Wait -PassThru -ErrorAction Stop
+    if ($process.ExitCode -eq 3010) {
+      Write-Host '   Microsoft Build Tools requires a restart. Restart Windows and run setup again.' -ForegroundColor Yellow
+      return $false
+    }
+    if ($process.ExitCode -ne 0) { throw "Build Tools installer exited with code $($process.ExitCode); see the dd_* setup logs in TEMP" }
+    if (-not (Have-Msvc)) { throw 'Installer finished, but the required MSVC workload is still missing' }
+    return $true
+  } catch {
+    Write-Host "   MSVC installation failed: $($_.Exception.Message)" -ForegroundColor Red
+    return $false
+  }
+}
+
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $admin) {
   throw 'Administrator rights missing. Run provision-windows.cmd as Administrator and approve UAC.'
 }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Start-Transcript -Path (Join-Path $LogDir 'provision.log') -Append | Out-Null
+$StageDir = Join-Path $LogDir ('setup-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $StageDir -ErrorAction Stop | Out-Null
 Write-Host "Cluster Kit provisioning $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $env:COMPUTERNAME as $env:USERNAME"
 
 Step 'network'
@@ -68,8 +125,9 @@ if (-not (Have-Git)) {
     try {
       $rel = Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' -UseBasicParsing
       $asset = $rel.assets | Where-Object { $_.name -match '^Git-.*-64-bit\.exe$' } | Select-Object -First 1
-      $exe = Join-Path $env:TEMP $asset.name
-      Invoke-WebRequest $asset.browser_download_url -OutFile $exe -UseBasicParsing
+      if (-not $asset) { throw 'Git release did not include a 64-bit Windows installer' }
+      $exe = Join-Path $StageDir $asset.name
+      Invoke-WebRequest $asset.browser_download_url -OutFile $exe -UseBasicParsing -ErrorAction Stop
       Start-Process $exe -ArgumentList '/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-' -Wait
       $env:Path = "$env:ProgramFiles\Git\cmd;$env:Path"
     } catch { Write-Host "   git installer download failed: $($_.Exception.Message)" }
@@ -80,26 +138,24 @@ else { Bad 'git is not installed and could not be installed. Install it by hand 
 
 Step 'cluster-kit in the Desktop folder'
 $zipHash = ''
+$SourceReady = Test-Path -LiteralPath (Join-Path $Dir 'rust/Cargo.toml')
 if ($online) {
-  $zip = Join-Path $env:TEMP 'ck-main.zip'; $tmp = Join-Path $env:TEMP 'ck-main'
   try {
-    Invoke-WebRequest "https://github.com/$Repo/archive/refs/heads/$Branch.zip" -OutFile $zip -UseBasicParsing
-    $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.Substring(0, 10).ToLower()
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    Expand-Archive -Path $zip -DestinationPath $tmp -Force
-    $src = Get-ChildItem $tmp | Select-Object -First 1
-    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
-    robocopy $src.FullName $Dir /E /XD target ck-data /NFL /NDL /NJH /NJS /NP | Out-Null  # keep the built binary and local data
-    if ($LASTEXITCODE -lt 8) { Ok "folder is on the latest $Branch ($zipHash)" } else { Bad "copy to $Dir failed" }
-    $global:LASTEXITCODE = 0
-  } catch { Bad "download failed: $($_.Exception.Message)" }
+    $zipHash = Sync-CkSource $StageDir $Dir $Branch
+    $SourceReady = $true
+    Ok "folder is on the latest $Branch ($zipHash)"
+  } catch {
+    $SourceReady = $false
+    Bad "source download/extraction failed: $($_.Exception.Message). Staging: $StageDir"
+  }
 } else { Bad 'offline: using the folder as it is' }
 
 Step 'Rust and the build tools'
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 function Have-Cargo { [bool](Get-Command cargo -ErrorAction SilentlyContinue) }
 if (-not (Have-Cargo) -and $online) {
-  $init = Join-Path $env:TEMP 'rustup-init.exe'
+  New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+  $init = Join-Path $StageDir 'rustup-init.exe'
   Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile $init -UseBasicParsing
   & $init -y --profile minimal 2>&1 | Out-Null
   if (Have-Cargo) { Fixed 'installed Rust' } else { Bad 'Rust install failed' }
@@ -120,24 +176,21 @@ function Build-Ck([string[]]$extra) {
   $LASTEXITCODE -eq 0
 }
 $cur = if (Test-Path $Stamp) { (Get-Content $Stamp -Raw).Trim() } else { '' }
-if ((Test-Path $Bin) -and $zipHash -and $cur -eq $zipHash) { Ok "ck is built ($zipHash)" }
+if (-not $SourceReady) { Bad 'source is not ready; skipping the build' }
+elseif ((Test-Path $Bin) -and $zipHash -and $cur -eq $zipHash) { Ok "ck is built ($zipHash)" }
 elseif (-not (Have-Cargo)) { if (Test-Path $Bin) { Ok 'using the ck that is already here (no Rust to rebuild it)' } else { Bad 'no ck.exe and no Rust to build one' } }
+elseif (-not (Install-Msvc)) { Bad 'C++ build tools (MSVC) are not ready; skipping cargo. See installation errors above; restart and rerun if requested.' }
 else {
   Write-Host '   building ck: 2 to 10 minutes (the ESP stick can be unplugged now)'
   $sw = [Diagnostics.Stopwatch]::StartNew()
-  # Rust on Windows links with the MSVC C++ tools (and bundled SQLite compiles C): install them before building
-  if (-not (Have-Msvc)) {
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-      Write-Host '   the C++ build tools are missing: installing them (several GB, 10 to 20 minutes)'
-      winget install --id Microsoft.VisualStudio.2022.BuildTools -e --silent --accept-package-agreements --accept-source-agreements --override '--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended' *>> (Join-Path $LogDir 'msvc.log')
-    }
-    if (-not (Have-Msvc)) { Bad 'C++ build tools (MSVC) are missing and could not be installed. Install "Visual Studio Build Tools" with the "Desktop development with C++" workload from https://visualstudio.microsoft.com/visual-cpp-build-tools/, then run this script again' }
-  }
   Stop-Ck
   $built = Build-Ck @()
   if (-not $built) { Write-Host '   again without GPU support'; $built = Build-Ck @('--no-default-features') }
   if ($built -and (Test-Path $Bin)) { Set-Content $Stamp $zipHash; $script:Rebuilt = $true; Fixed "built ck in $([int]$sw.Elapsed.TotalSeconds) s" }
-  else { Bad "ck build failed, see $LogDir\build.log"; Get-Content (Join-Path $LogDir 'build.log') -Tail 8 | ForEach-Object { Write-Host "        $_" } }
+  else {
+    Bad "ck build failed, see $LogDir\build.log"
+    Get-Content -LiteralPath (Join-Path $LogDir 'build.log') -Tail 40 | ForEach-Object { Write-Host "        $_" }
+  }
 }
 
 Step 'firewall and ssh'

@@ -107,6 +107,8 @@ Copy or clone this folder to every PC, then:
 
 Use the saved repository files: right-click `scripts\provision-windows.cmd` and choose **Run as administrator**, then approve UAC. It uses built-in Windows PowerShell 5.1, installs Git, Rust/MSVC and OpenSSH as needed, builds the worker, configures the cluster firewall rules, and starts the scheduled worker at boot. The final console shows hostname, IPv4 addresses, SSH commands and live worker logs. Set `CK_FOLLOW=0` to finish without following logs.
 
+Git and MSVC installation do not require a working `winget`: direct official installers are used as fallbacks. The MSVC fallback checks Microsoft's signature, installs the C++ workload and recommended SDK components, and reports if a restart is required. Source staging uses a unique folder under `%ProgramData%\cluster-kit`, avoiding user TEMP short-path problems. Builds are skipped until source and compiler prerequisites are ready.
+
 The launcher respects the existing script execution policy and makes no Defender exclusions. Managed PCs may require an administrator-approved signed script. Antivirus acceptance and live Windows behaviour have to be verified on the target PC. Logs are in `%ProgramData%\cluster-kit`.
 
 The Windows HID stick opens Administrator PowerShell with a **process-only `RemoteSigned` policy**. UAC must be approved manually. It does not persist an execution-policy change, alter Defender, or override Group Policy; policies requiring signatures still require an approved signed script. Startup errors stay visible.
