@@ -95,12 +95,20 @@ pub const CAP_SIGNED: u64 = 1;
 pub const CAP_BLOBS: u64 = 2;
 pub const CAPS: u64 = CAP_SIGNED | CAP_BLOBS;
 
-/// A standby that connects again replaces its earlier link: one node is one standby. Two links for one node counted it
-/// twice towards durability, and the console (lists keyed by node id) failed on the repeated id in /api/v1/ha. Dropping
-/// the old link drops its sender, which ends that link's writer thread.
-fn add_link(links: &mut Vec<Link>, new: Link) {
-    links.retain(|l| l.node != new.node);
-    links.push(new);
+/// (node, acked, lag) per standby for /api/v1/ha, one row per node. A PC can hold two links for a while (two standby
+/// processes with one node id, or a reconnect before the old link is dropped); listing the node twice made the console
+/// fail on the repeated id. The link that has acknowledged most stands for the node. Replacing the older link instead
+/// was tried and is wrong: two live processes then evict each other for ever, each rejoin costing a snapshot.
+fn standby_rows(links: &[Link], last: u64) -> Vec<(String, u64, u64)> {
+    let mut rows: Vec<(String, u64, u64)> = vec![];
+    for l in links {
+        match rows.iter_mut().find(|r| r.0 == l.node) {
+            Some(r) if l.acked > r.1 => (r.1, r.2) = (l.acked, last.saturating_sub(l.acked)),
+            Some(_) => {}
+            None => rows.push((l.node.clone(), l.acked, last.saturating_sub(l.acked))),
+        }
+    }
+    rows
 }
 
 struct Link {
@@ -157,7 +165,7 @@ fn sync_status(ctx: &Ctx, g: &Inner) {
     s.role = if g.candidate { "candidate" } else { "primary" }.into();
     s.epoch = g.epoch;
     s.last_seq = g.last;
-    s.standbys = g.links.iter().map(|l| (l.node.clone(), l.acked, g.last.saturating_sub(l.acked))).collect();
+    s.standbys = standby_rows(&g.links, g.last);
     s.mixed = g.links.iter().filter(|l| l.caps & CAP_SIGNED == 0).map(|l| format!("standby {} ({}) runs an older version without signed beacons: upgrade it", l.node, l.peer)).collect();
     s.membership = g.members.len();
     lag_log(&s.standbys, g.connected, g.members.len());
@@ -522,7 +530,7 @@ pub fn serve_standby(ctx: &Ctx, s: TcpStream, hello: &[u8], sk: Option<[u8; 32]>
         let replay: Vec<Entry> = if snapshot { vec![] } else { g.ring.iter().filter(|e| e.seq > seq).cloned().collect() };
         g.next_link += 1;
         let lid = g.next_link;
-        add_link(&mut g.links, Link { id: lid, node: h.node_id.clone(), peer, tx, acked: if snapshot { 0 } else { seq }, caps });
+        g.links.push(Link { id: lid, node: h.node_id.clone(), peer, tx, acked: if snapshot { 0 } else { seq }, caps });
         g.ring_until = Some(Instant::now() + Duration::from_secs(120));
         sync_status(ctx, &g);
         let first = hello_entry(&g, lid, if snapshot { "snapshot" } else { "replay" });
@@ -1111,13 +1119,11 @@ mod tests {
         assert!(should_promote(2, 9.0));
         assert!(!refused_promote(0, 0.2) && refused_promote(0, 0.6), "a refusing primary PC: take over after 0.5 s");
         assert!(!refused_promote(1, 2.0) && refused_promote(1, 2.6), "second standby waits one step longer");
-        // a standby that reconnects replaces its old link instead of being listed twice
-        let mk = |id: u64, node: &str| Link { id, node: node.into(), peer: "p".into(), tx: mpsc::channel().0, acked: id, caps: 0 };
-        let mut links = vec![];
-        for (id, node) in [(1, "a"), (2, "b"), (3, "a")] {
-            add_link(&mut links, mk(id, node));
-        }
-        assert_eq!(links.iter().map(|l| (l.id, l.node.as_str())).collect::<Vec<_>>(), vec![(2, "b"), (3, "a")]);
+        // two links of one node are one row in the status, with the better acknowledgement
+        let mk = |id: u64, node: &str, acked: u64| Link { id, node: node.into(), peer: "p".into(), tx: mpsc::channel().0, acked, caps: 0 };
+        let links = vec![mk(1, "a", 5), mk(2, "b", 9), mk(3, "a", 8)];
+        assert_eq!(standby_rows(&links, 10), vec![("a".to_string(), 8, 2), ("b".to_string(), 9, 1)]);
+        assert_eq!(links.len(), 3, "both links stay connected");
         assert!(has_quorum(0, 0));
         assert!(!has_quorum(5, 10));
         assert!(has_quorum(6, 10));
