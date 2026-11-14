@@ -205,7 +205,10 @@ pub fn chunk_len(p: ChunkPolicy, fixed_chunk: u64, total: u64, remaining: u64, n
         ChunkPolicy::Fixed => fixed(),
         ChunkPolicy::Guided => guided(),
         ChunkPolicy::Adaptive if node_rate > 0.0 && fleet_rate > 0.0 => {
-            if (remaining as f64) < 2.0 * fleet_rate * target_secs() { guided() } else { (node_rate * target_secs()) as u64 }
+            // tail: half of this PC's speed-weighted share of what is left, so on mixed hardware every PC finishes together
+            // (an equal remaining/2n split left the fast PCs idle while the slow ones ran the last chunks: 5 % tail_idle on
+            // 56 PCs with i3s among i5s). Equal rates give exactly remaining/2n, as before.
+            if (remaining as f64) < 2.0 * fleet_rate * target_secs() { ((remaining as f64) * (node_rate / fleet_rate).min(1.0) / 2.0) as u64 } else { (node_rate * target_secs()) as u64 }
         }
         ChunkPolicy::Adaptive => fixed(),
     };
@@ -818,6 +821,16 @@ mod chunk_cap_tests {
         let capped = chunk_len(ChunkPolicy::Adaptive, 10, 1_000_000, 1_000_000, 100_000.0, 1_000.0, 4, 1, u64::MAX);
         assert!(big > 10 && capped == 10);
         assert_eq!(chunk_len(ChunkPolicy::Fixed, 10, 1_000, 1_000, 0.0, 0.0, 4, 1, u64::MAX), 10);
+    }
+
+    #[test]
+    fn tail_chunks_follow_speed() {
+        // fleet = 3 fast (3000/s) + 1 slow (1000/s) = 10_000/s; 12_000 left is in the tail (< 2 x 10_000 x 1 s)
+        let fast = chunk_len(ChunkPolicy::Adaptive, 0, 1_000_000, 12_000, 3000.0, 10_000.0, 4, 1, u64::MAX);
+        let slow = chunk_len(ChunkPolicy::Adaptive, 0, 1_000_000, 12_000, 1000.0, 10_000.0, 4, 1, u64::MAX);
+        assert_eq!((fast, slow), (1800, 600)); // same time on each PC: 0.6 s
+        // a stale rate above the fleet total never asks for more than half of what is left
+        assert_eq!(chunk_len(ChunkPolicy::Adaptive, 0, 1_000_000, 12_000, 50_000.0, 10_000.0, 4, 1, u64::MAX), 6000);
     }
 }
 
