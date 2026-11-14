@@ -1,0 +1,66 @@
+name: Linux worker release
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'rust/**'
+      - 'scripts/provision.sh'
+      - 'scripts/tests/test_ubuntu_provision.py'
+      - '.github/workflows/linux-release.yml'
+permissions:
+  contents: write
+concurrency:
+  group: linux-worker-release
+  cancel-in-progress: false
+jobs:
+  linux:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Provisioning regressions
+        run: uv run --no-project python -m unittest discover -s scripts/tests -v
+      - name: Static Linux toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Test and build portable CPU worker
+        run: |
+          cargo test --locked --manifest-path rust/Cargo.toml --no-default-features --target x86_64-unknown-linux-musl
+          cargo build --locked --manifest-path rust/Cargo.toml --release --no-default-features --target x86_64-unknown-linux-musl
+      - name: Package and smoke test standalone worker
+        run: |
+          mkdir dist
+          cp rust/target/x86_64-unknown-linux-musl/release/ck dist/ck-linux-x86_64
+          CK_PORT=17900 CK_DATA="$RUNNER_TEMP/ck-release-smoke" CK_AUTH=off CK_FLEET=open dist/ck-linux-x86_64 head --no-local-worker > dist/smoke.log 2>&1 &
+          smoke_pid=$!
+          trap 'kill "$smoke_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:17902/api/v1/ha > /dev/null; then ready=1; break; fi
+            kill -0 "$smoke_pid" || { cat dist/smoke.log; exit 1; }
+            sleep 1
+          done
+          test "$ready" = 1
+          uv run --no-project python - <<'PYTHON'
+          import hashlib,json,os,pathlib
+          binary = pathlib.Path('dist/ck-linux-x86_64')
+          pathlib.Path('dist/linux-manifest.json').write_text(json.dumps({
+              'commit': os.environ['GITHUB_SHA'],
+              'target': 'x86_64-unknown-linux-musl',
+              'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()
+          }))
+          PYTHON
+      - name: Publish tested immutable Linux release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="linux-$GITHUB_SHA"
+          if gh release view "$tag" > /dev/null 2>&1; then exit 0; fi
+          gh release create "$tag" dist/ck-linux-x86_64 dist/linux-manifest.json --target "$GITHUB_SHA" --title "Linux worker ${GITHUB_SHA:0:10}" --notes 'Static Linux x86_64 CPU worker. Built with musl for compatibility with older Ubuntu; no Rust, compiler or system SQLite needed. SHA-256 and source commit recorded in linux-manifest.json.'

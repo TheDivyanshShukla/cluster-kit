@@ -10,6 +10,7 @@
 # These helpers can be checked without executing machine provisioning.
 ck_apt() { apt-get -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -y "$@"; }
 ck_install_packages() {
+  if [ "${CK_FORCE_APT_UNLOCK:-0}" = 1 ]; then ck_unlock_apt || return 1; fi
   ck_apt update || echo "apt index update failed; trying cached package lists" >&2
   ck_apt install "$@" && return 0
   dpkg --configure -a || echo "dpkg still needs dependency repair" >&2
@@ -18,6 +19,67 @@ ck_install_packages() {
   ck_apt update || echo "apt index update failed after repair" >&2
   ck_apt --fix-missing install "$@"
 }
+
+# Force-delete package lock files only after their users have exited.
+ck_unlock_apt() {
+  command -v fuser >/dev/null 2>&1 || { echo "fuser unavailable; leaving apt locks in place" >&2; return 0; }
+  local waited=0 limit=${CK_APT_LOCK_WAIT:-600}
+  local locks=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+  while fuser "${locks[@]}" >/dev/null 2>&1; do
+    [ "$waited" -lt "$limit" ] || { echo "package manager is still running; refusing to delete its locks" >&2; return 1; }
+    sleep 2; waited=$((waited + 2))
+  done
+  rm -f "${locks[@]}"
+}
+
+ck_download() {
+  curl --retry 2 --connect-timeout 15 -fsSL "$1" -o "$2" ||
+    wget -qO "$2" "$1" ||
+    python3 -c 'import sys,urllib.request; urllib.request.urlretrieve(sys.argv[1],sys.argv[2])' "$1" "$2"
+}
+
+# Validate and smoke-test a staged release before stopping or replacing a worker.
+ck_install_release() (
+  local repo=$1 bin=$2 stamp=$3 stage tag metadata commit digest target output
+  [ "$(uname -m)" = x86_64 ] || { echo "No Linux release for this architecture" >&2; return 1; }
+  stage=$(mktemp -d) || return 1
+  trap 'rm -rf "$stage"' EXIT
+  ck_download "https://api.github.com/repos/$repo/releases?per_page=20" "$stage/releases.json" || return 1
+  tag=$(python3 - "$stage/releases.json" <<'JSON'
+import json,re,sys
+for release in json.load(open(sys.argv[1])):
+    tag = release.get('tag_name', '')
+    if not release.get('draft') and not release.get('prerelease') and re.fullmatch(r'linux-[0-9a-f]{40}', tag):
+        print(tag)
+        break
+else:
+    sys.exit('No tested Linux release is available')
+JSON
+  ) || return 1
+  local base="https://github.com/$repo/releases/download/$tag"
+  ck_download "$base/linux-manifest.json" "$stage/manifest.json" || return 1
+  metadata=$(python3 - "$stage/manifest.json" "$tag" <<'JSON'
+import json,re,sys
+m = json.load(open(sys.argv[1]))
+if m.get('commit') != sys.argv[2][6:] or m.get('target') != 'x86_64-unknown-linux-musl' or not re.fullmatch(r'[0-9a-f]{64}', m.get('sha256', '')):
+    sys.exit('Invalid Linux release manifest')
+print(m['commit'], m['sha256'], m['target'])
+JSON
+  ) || return 1
+  read -r commit digest target <<< "$metadata"
+  ck_download "$base/ck-linux-x86_64" "$stage/ck" || return 1
+  echo "$digest  $stage/ck" | sha256sum -c - >/dev/null || return 1
+  chmod 755 "$stage/ck" || return 1
+  output=$("$stage/ck" 2>&1) || true
+  case $output in *"usage: ck "*) ;; *) echo "Linux release will not run on this PC; using a source build" >&2; return 1 ;; esac
+  mkdir -p "$(dirname "$bin")" || return 1
+  cp "$stage/ck" "$bin.new" || return 1
+  if [ "${CK_REPLACE:-0}" = 1 ]; then
+    ck_stop_existing || { rm -f "$bin.new"; return 1; }
+  fi
+  mv -f "$bin.new" "$bin" || return 1
+  printf '%s\n' "release:$commit:$target" > "$stamp"
+)
 
 ck_git_sync() {
   local dir=$1 repo=$2 branch=$3 stage backup item
@@ -114,6 +176,7 @@ fi
 set -u
 REPO=${CK_REPO:-https://github.com/TheDivyanshShukla/cluster-kit.git}
 BRANCH=${CK_BRANCH:-main}
+CK_FORCE_APT_UNLOCK=${CK_FORCE_APT_UNLOCK:-1}
 HEAD_IP=${CK_HEAD_IP:-}
 FLEET=${CK_FLEET:-open}
 FAILED=0
@@ -159,7 +222,7 @@ else
 fi
 
 step "tools"
-declare -A PKG=([git]=git [curl]=curl [cc]=build-essential [pkg-config]=pkg-config [python3]=python3 [gsettings]=libglib2.0-bin [sshd]=openssh-server [certs]=ca-certificates [figlet]=figlet [ss]=iproute2 [pgrep]=procps)
+declare -A PKG=([git]=git [curl]=curl [python3]=python3 [gsettings]=libglib2.0-bin [sshd]=openssh-server [certs]=ca-certificates [figlet]=figlet [ss]=iproute2 [pgrep]=procps)
 have() { case $1 in sshd) [ -x /usr/sbin/sshd ] ;; certs) [ -s /etc/ssl/certs/ca-certificates.crt ] ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
 missing() { local k out=""; for k in "${!PKG[@]}"; do have "$k" || out="$out ${PKG[$k]}"; done; echo "$out"; }
 APT="apt-get -o DPkg::Lock::Timeout=600 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -y -qq"
@@ -175,7 +238,7 @@ if [ -n "$need" ]; then
     bad "offline, missing:$need"
   fi
 else
-  ok "git curl compiler python3 ssh server certificates"
+  ok "git curl python3 ssh server certificates"
 fi
 
 step "no sleep, no screen lock, no timeouts"
@@ -257,41 +320,52 @@ if [ $ONLINE = 1 ]; then
 else
   bad "cannot update the worker while offline"; exit 1
 fi
-if [ "${CK_REPLACE:-0}" = 1 ]; then
-  step "replacing existing ck instances"
-  ck_stop_existing || { bad "old ck process did not stop"; exit 1; }
-  systemctl disable ck-head ck-agent >/dev/null 2>&1 || true
-fi
-
-have_cargo() { as_user cargo --version >/dev/null 2>&1; }
-if ! have_cargo && [ $ONLINE = 1 ]; then
-  as_user rustup default stable >/dev/null 2>&1 || retry 3 as_user bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' >/dev/null 2>&1
-  have_cargo && fixed "installed Rust" || bad "Rust install failed"
-fi
 COMMIT=$(as_user git -C "$DIR" rev-parse --short HEAD 2>/dev/null)
 STAMP=$DIR/rust/target/release/.ck-built
-BUILD_ID="$COMMIT:$(uname -s):$(uname -m)"
-if [ -x "$BIN" ] && [ -n "$COMMIT" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$BUILD_ID" ]; then
-  ok "ck is built at $COMMIT"
-elif ! have_cargo; then
-  bad "Rust is unavailable; refusing to start an out-of-date worker"; exit 1
+if [ "${CK_BUILD_SOURCE:-0}" != 1 ] && [ "$BRANCH" = main ] && ck_install_release "${CK_RELEASE_REPO:-TheDivyanshShukla/cluster-kit}" "$BIN" "$STAMP"; then
+  chown "$U": "$BIN" "$STAMP"
+  if [ "${CK_REPLACE:-0}" = 1 ]; then systemctl disable ck-head ck-agent >/dev/null 2>&1 || true; fi
+  fixed "installed verified Linux CPU release (no Rust or compiler needed)"
 else
-  free_kb() { df -Pk "$UH" | awk 'NR==2{print $4}'; }
-  if [ "$(free_kb)" -lt 3000000 ]; then  # the build needs about 3 GB
-    apt-get clean; journalctl --vacuum-size=100M >/dev/null 2>&1; rm -rf "$UH"/Desktop/cluster-kit.old-*
-    [ "$(free_kb)" -ge 3000000 ] && fixed "freed disk space for the build" || bad "only $(( $(free_kb) / 1024 )) MB free; the build needs about 3000"
+  step "source build (release unavailable, incompatible, or explicitly disabled)"
+  if ! have cc || ! have pkg-config; then
+    ck_install_packages build-essential pkg-config || { bad "compiler packages unavailable"; exit 1; }
   fi
-  J=$(nproc); MEM=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
-  [ "$MEM" -lt 4096 ] && [ "$J" -gt 2 ] && J=2   # a big parallel build runs a small PC out of memory
-  [ "$MEM" -lt 1800 ] && J=1
-  cb() { as_user env CARGO_BUILD_JOBS="$J" cargo build --release --locked --manifest-path "$DIR/rust/Cargo.toml" "$@" >> /var/log/ck-build.log 2>&1; }
-  echo "   building ck at $COMMIT with $J job(s): 1 to 5 minutes (the ESP stick can be unplugged now)"
-  SECONDS=0
-  if cb || { echo "   again after clearing incremental data"; rm -rf "$DIR/rust/target/release/incremental"; cb; } || { echo "   again without GPU support"; cb --no-default-features; }; then
-    echo "$BUILD_ID" | as_user tee "$STAMP" > /dev/null
-    fixed "built ck $COMMIT in ${SECONDS}s"
+  if [ "${CK_REPLACE:-0}" = 1 ]; then
+    step "replacing existing ck instances"
+    ck_stop_existing || { bad "old ck process did not stop"; exit 1; }
+    systemctl disable ck-head ck-agent >/dev/null 2>&1 || true
+  fi
+
+  have_cargo() { as_user cargo --version >/dev/null 2>&1; }
+  if ! have_cargo && [ $ONLINE = 1 ]; then
+    as_user rustup default stable >/dev/null 2>&1 || retry 3 as_user bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal' >/dev/null 2>&1
+    have_cargo && fixed "installed Rust" || bad "Rust install failed"
+  fi
+  COMMIT=$(as_user git -C "$DIR" rev-parse --short HEAD 2>/dev/null)
+  BUILD_ID="$COMMIT:$(uname -s):$(uname -m)"
+  if [ -x "$BIN" ] && [ -n "$COMMIT" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$BUILD_ID" ]; then
+    ok "ck is built at $COMMIT"
+  elif ! have_cargo; then
+    bad "Rust is unavailable; refusing to start an out-of-date worker"; exit 1
   else
-    bad "ck build failed; last lines of /var/log/ck-build.log:"; tail -8 /var/log/ck-build.log | sed 's/^/        /'; exit 1
+    free_kb() { df -Pk "$UH" | awk 'NR==2{print $4}'; }
+    if [ "$(free_kb)" -lt 3000000 ]; then  # the build needs about 3 GB
+      apt-get clean; journalctl --vacuum-size=100M >/dev/null 2>&1; rm -rf "$UH"/Desktop/cluster-kit.old-*
+      [ "$(free_kb)" -ge 3000000 ] && fixed "freed disk space for the build" || bad "only $(( $(free_kb) / 1024 )) MB free; the build needs about 3000"
+    fi
+    J=$(nproc); MEM=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+    [ "$MEM" -lt 4096 ] && [ "$J" -gt 2 ] && J=2   # a big parallel build runs a small PC out of memory
+    [ "$MEM" -lt 1800 ] && J=1
+    cb() { as_user env CARGO_BUILD_JOBS="$J" cargo build --release --locked --manifest-path "$DIR/rust/Cargo.toml" "$@" >> /var/log/ck-build.log 2>&1; }
+    echo "   building ck at $COMMIT with $J job(s): 1 to 5 minutes (the ESP stick can be unplugged now)"
+    SECONDS=0
+    if cb || { echo "   again after clearing incremental data"; rm -rf "$DIR/rust/target/release/incremental"; cb; } || { echo "   again without GPU support"; cb --no-default-features; }; then
+      echo "$BUILD_ID" | as_user tee "$STAMP" > /dev/null
+      fixed "built ck $COMMIT in ${SECONDS}s"
+    else
+      bad "ck build failed; last lines of /var/log/ck-build.log:"; tail -8 /var/log/ck-build.log | sed 's/^/        /'; exit 1
+    fi
   fi
 fi
 for l in "export CK_PRESENCE=off" "export CK_AUTH=${CK_AUTH:-off}" "export CK_FLEET=$FLEET" "export PATH=\$PATH:$DIR/rust/target/release"; do

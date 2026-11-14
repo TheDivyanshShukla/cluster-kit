@@ -101,7 +101,7 @@ Copy or clone this folder to every PC, then:
 - **Sleep:** setup also offers to disable sleep on that PC.
 - **Windows:** setup downloads a tested x64 CPU worker with a verified SHA-256 checksum. Building from source is optional and needs Rust and MSVC.
 - **Ubuntu PCs:** what to copy, packages, offline builds and ports are in [docs/UBUNTU.md](docs/UBUNTU.md).
-- **Many Ubuntu PCs, fast:** `sudo bash scripts/provision.sh` does everything on one PC and repairs what it finds wrong: no sleep or screen lock, packages, ssh, the folder in `~/Desktop/cluster-kit`, the build, and a `ck-worker` service that starts at boot and joins the head. Run it again any time. An ESP32-S3/S2 stick can type it for you: flash it with `hid/flash.sh` (see the header of [hid/ck_provision/ck_provision.ino](hid/ck_provision/ck_provision.ino)), plug it into a logged-in PC, unplug after typing finishes (USB-paced; wait for the done light).
+- **Many Ubuntu PCs, fast:** `sudo bash scripts/provision.sh` does everything on one PC and repairs what it finds wrong: no sleep or screen lock, packages, ssh, the folder in `~/Desktop/cluster-kit`, a verified Linux CPU release (or source build fallback), and a `ck-worker` service that starts at boot and joins the head. Run it again any time. An ESP32-S3/S2 stick can type it for you: flash it with `hid/flash.sh` (see the header of [hid/ck_provision/ck_provision.ino](hid/ck_provision/ck_provision.ino)), plug it into a logged-in PC, unplug after typing finishes (USB-paced; wait for the done light).
 
 ### Visible Windows 10 / 11 worker
 
@@ -113,13 +113,15 @@ The launcher respects the existing script execution policy and makes no Defender
 
 The Windows HID stick opens Administrator PowerShell with a **process-only `RemoteSigned` policy**. UAC must be approved manually. It does not persist an execution-policy change, alter Defender, or override Group Policy; policies requiring signatures still require an approved signed script. Startup errors stay visible.
 
+Linux releases use a static musl runtime for older Ubuntu compatibility. Setup tests the downloaded executable before replacing the worker; unavailable or incompatible releases fall back to a local build. Set `CK_BUILD_SOURCE=1` to always build, including optional GPU support.
+
 ### Visible Ubuntu worker
 
-Run `bash ~/Desktop/cluster-kit/scripts/worker-ubuntu.sh` in an Ubuntu terminal. It repairs missing packages (including interrupted dpkg and broken apt dependencies), enables SSH, updates the current Git branch without overwriting tracked edits, rebuilds if necessary, and replaces old local `ck` processes, including an old local head. The replacement worker starts at boot in open mode with no join code. Sleep, display blanking and automatic locking are disabled.
+Run `bash ~/Desktop/cluster-kit/scripts/worker-ubuntu.sh` in an Ubuntu terminal. It repairs missing packages (including interrupted dpkg and broken apt dependencies), enables SSH, updates the current Git branch without overwriting tracked edits, installs a SHA-256-verified static Linux x86_64 CPU release or builds from source when unavailable or incompatible, and replaces old local `ck` processes, including an old local head. The replacement worker starts at boot in open mode with no join code. Sleep, display blanking and automatic locking are disabled.
 
 The terminal shows the hostname, large IP addresses, SSH connection commands and live worker logs. `connected to head` confirms that PC joined; an IP banner alone does not. Ctrl+C closes the log view while the service keeps running. SSH still uses the PC's normal account authentication or your configured public key.
 
-For an Ubuntu-only ESP32 stick: `CK_PROVISION_BRANCH=main bash hid/flash.sh --os ubuntu SERIAL_PORT`. The first typed command authenticates sudo and installs curl/certificates before downloading the setup script. Leave it plugged into the target until typing finishes (USB-paced; wait for the done light). Flashing leaves the stick in download mode: unplug it from the flashing computer and plug it into a logged-in Ubuntu PC to run. The script and firmware must use a branch already pushed to GitHub.
+For an Ubuntu-only ESP32 stick: `CK_PROVISION_BRANCH=main bash hid/flash.sh --os ubuntu SERIAL_PORT`. The Ubuntu stick types at USB speed, decodes a Base64 payload and verifies its SHA-256 before execution. A damaged payload is rejected; replug to retry. The payload authenticates sudo once and downloads setup using curl, wget or Python, installing curl/certificates only if all three fail. Setup removes apt/dpkg lock files only after their owners exit (set `CK_FORCE_APT_UNLOCK=0` to skip removal), then repairs interrupted package state. The verification wrapper itself must also arrive intact. Leave it plugged into the target until typing finishes (USB-paced; wait for the done light). Flashing leaves the stick in download mode: unplug it from the flashing computer and plug it into a logged-in Ubuntu PC to run. The script and firmware must use a branch already pushed to GitHub.
 
 ## Run
 

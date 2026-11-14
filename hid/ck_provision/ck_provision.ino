@@ -17,6 +17,7 @@
 #include "USBHIDKeyboard.h"
 #include "config.h"
 #include "ubuntu_bootstrap.h"
+#include "checked_command.h"
 
 #ifndef CK_TARGET_OS
 #define CK_TARGET_OS 0  // 0: button selection, 1: Ubuntu only, 2: Windows only
@@ -46,11 +47,14 @@ void led(uint8_t r, uint8_t g, uint8_t b) {
 // Send at the USB endpoint rate: the installed Arduino USBHID::SendReport waits for
 // transfer completion and the HID endpoint polls every 1 ms. Keep separate press
 // and release reports so identical consecutive characters register independently.
-void typeText(const String &s) {
+// Ubuntu terminals can need extra settling time for both key states.
+void typeText(const String &s, unsigned keyDelayMs = 0) {
   for (size_t i = 0; i < s.length(); i++) {
     led(i & 1, 0, 0);  // fast blink while typing
     Keyboard.press(s[i]);
+    if (keyDelayMs) delay(keyDelayMs);
     Keyboard.releaseAll();
+    if (keyDelayMs) delay(keyDelayMs);
   }
   led(0, 0, 0);
 }
@@ -124,10 +128,10 @@ void setup() {
     led(1, 0, 0);  // amber: typing
     delay(3500);     // wait for the terminal window
 
-    // Authenticate first: the root bootstrap can install/repair curl before any download.
+    // Authenticate first, then download with system tools outside the Conda PATH.
     // Leading space keeps this command out of Ubuntu's default shell history.
-    String cmd = String(" printf '%s\\n' ") + shellQuote(PASS) + " | sudo -S -p '' -v && sudo -n env CK_FLEET=open CK_AUTH=off CK_REPLACE=1 CK_FOLLOW=1 CK_ROLE=worker CK_BRANCH=" + shellQuote(CK_PROVISION_BRANCH) + " CK_ADMIN_KEY=" + shellQuote(ADMIN_KEY) + HEAD_ENV + " bash -c " + shellQuote(UBUNTU_BOOTSTRAP) + " ck-bootstrap " + shellQuote(URL_SH);
-    typeText(cmd);
+    String cmd = String(" printf '%s\\n' ") + shellQuote(PASS) + " | sudo -S -p '' /usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin CK_FLEET=open CK_AUTH=off CK_REPLACE=1 CK_FOLLOW=1 CK_ROLE=worker CK_BRANCH=" + shellQuote(CK_PROVISION_BRANCH) + " CK_ADMIN_KEY=" + shellQuote(ADMIN_KEY) + HEAD_ENV + " /bin/bash -c " + shellQuote(UBUNTU_BOOTSTRAP) + " ck-bootstrap " + shellQuote(URL_SH);
+    typeText(checkedCommand(cmd));
     Keyboard.write(KEY_RETURN);
   }
   delay(300);

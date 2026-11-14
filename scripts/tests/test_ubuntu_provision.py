@@ -1,5 +1,6 @@
 """Provisioning logic runs against temporary repos and fake OS commands, never this host."""
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import tempfile
@@ -98,43 +99,74 @@ ck_banner lab-9
         for value in ('lab-9', '192.168.1.9', '10.0.0.9', 'SSH: listening', 'ssh lab-9@192.168.1.9'):
             self.assertIn(value, result.stdout)
 
-    def test_firmware_bootstrap_installs_curl_before_download(self):
-        header = ROOT / 'hid/ck_provision/ubuntu_bootstrap.h'
-        self.assertTrue(header.exists(), 'Firmware needs a dependency-free bootstrap')
-        code = header.read_text().split('R"CK(')[1].split(')CK"')[0]
+    def test_firmware_bootstrap_uses_existing_downloaders_and_rejects_failures(self):
+        code = (ROOT / 'hid/ck_provision/ubuntu_bootstrap.h').read_text().split('R"CK(')[1].split(')CK"')[0]
         commands = self.base / 'commands'
         commands.mkdir()
-        # A restricted PATH makes curl genuinely missing until the fake package manager installs it.
-        for name in ('mktemp', 'rm', 'bash'):
-            target = subprocess.run(['which', name], text=True, capture_output=True, check=True).stdout.strip()
+        for name in ('mktemp', 'rm'):
+            target = subprocess.check_output(['which', name], text=True).strip()
             (commands / name).symlink_to(target)
-        curl = commands / 'curl'
         payload = '#!/bin/bash\nprintf "downloaded-script-ran\\n"\n'
-        (commands / 'apt-get').write_text(f'''#!/bin/bash
-printf 'apt %s\\n' "$*" >> "$HOME/calls"
-case " $* " in
-  *' --fix-broken install '*) : > "$HOME/repaired" ;;
-  *' install curl ca-certificates '*)
-    if [ ! -e "$HOME/failed-once" ]; then : > "$HOME/failed-once"; exit 1; fi
-    cat > '{curl}' <<'CURL'
-#!/bin/bash
-printf 'download\\n' >> "$HOME/calls"
-while [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then shift; printf '%s' '{payload}' > "$1"; exit 0; fi; shift; done
-exit 1
-CURL
-    chmod +x '{curl}' ;;
-esac
-'''.replace('    cat >', '    /bin/cat >').replace('    chmod +x', '    /bin/chmod +x'))
-        (commands / 'dpkg').write_text('#!/bin/bash\nprintf "dpkg %s\\n" "$*" >> "$HOME/calls"\n[ -f "$HOME/repaired" ]\n')
-        for item in ('apt-get', 'dpkg'):
-            (commands / item).chmod(0o755)
-        result = subprocess.run(['/bin/bash', '-c', code, 'ck-bootstrap', 'https://example.invalid/provision.sh'], cwd=self.base, env=dict(self.env, PATH=str(commands)), text=True, capture_output=True)
+        (commands / 'curl').write_text('#!/bin/bash\nprintf "curl\\n" >> "$HOME/calls"\n'
+            'while [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then shift; break; fi; shift; done\n'
+            'printf %s ' + shlex.quote(payload) + ' > "$1"\n'
+            '[ "$MODE" = curl ]\n')
+        (commands / 'wget').write_text('#!/bin/bash\nprintf "wget\\n" >> "$HOME/calls"\n'
+            'printf %s ' + shlex.quote(payload) + ' > "$2"\n'
+            '[ "$MODE" = wget ]\n')
+        for name in ('curl', 'wget'):
+            (commands / name).chmod(0o755)
+        for mode, expected_calls in (('curl', ['curl']), ('wget', ['curl', 'wget']), ('fail', ['curl', 'wget'])):
+            with self.subTest(mode=mode):
+                (self.base / 'calls').write_text('')
+                result = subprocess.run(['/bin/bash', '-c', code, 'ck-bootstrap', 'https://example.invalid/provision.sh'],
+                    env=dict(self.env, PATH=str(commands), MODE=mode), text=True, capture_output=True)
+                self.assertEqual((self.base / 'calls').read_text().splitlines(), expected_calls)
+                if mode == 'fail':
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn('downloaded-script-ran', result.stdout)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('downloaded-script-ran', result.stdout)
+
+    def test_release_download_is_verified_before_replacing_worker(self):
+        import hashlib
+        import json
+        commit = 'a' * 40
+        payload = b'#!/bin/sh\necho "usage: ck head|worker" >&2\nexit 1\n'
+        (self.base / 'release-bin').write_bytes(payload)
+        (self.base / 'releases.json').write_text(json.dumps([{'tag_name': 'linux-' + commit, 'draft': False, 'prerelease': False}]))
+        manifest = {'commit': commit, 'target': 'x86_64-unknown-linux-musl', 'sha256': hashlib.sha256(payload).hexdigest()}
+        (self.base / 'manifest.json').write_text(json.dumps(manifest))
+        code = r'''
+uname() { echo x86_64; }
+ck_download() { case "$1" in *'releases?per_page='*) cp releases.json "$2" ;; *manifest.json) cp manifest.json "$2" ;; *) cp release-bin "$2" ;; esac; }
+ck_stop_existing() { touch stopped; }
+CK_REPLACE=1
+ck_install_release TheDivyanshShukla/cluster-kit installed/ck installed/stamp
+'''
+        result = self.shell(code)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('downloaded-script-ran', result.stdout)
-        calls = (self.base / 'calls').read_text()
-        self.assertIn('dpkg --configure -a', calls)
-        self.assertIn('--fix-broken install', calls)
-        self.assertLess(calls.index('install curl ca-certificates'), calls.index('download'))
+        self.assertEqual((self.base / 'installed/ck').read_bytes(), payload)
+        self.assertIn(commit, (self.base / 'installed/stamp').read_text())
+        (self.base / 'stopped').unlink()
+        (self.base / 'release-bin').write_bytes(b'bad download')
+        result = self.shell(code)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.base / 'stopped').exists())
+        self.assertEqual((self.base / 'installed/ck').read_bytes(), payload)
+
+    def test_apt_unlock_refuses_to_remove_files_while_owned(self):
+        result = self.shell(r'''
+fuser() { return 0; }
+sleep() { :; }
+rm() { echo unsafe-delete; }
+CK_APT_LOCK_WAIT=0
+ck_unlock_apt
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('unsafe-delete', result.stdout)
+        self.assertIn('package manager is still running', result.stderr)
 
     def test_flash_selects_ubuntu_and_branch_without_reset(self):
         import shutil
@@ -193,7 +225,7 @@ done
         sketch = (ROOT / 'hid/ck_provision/ck_provision.ino').read_text()
         quote = sketch[sketch.index('String shellQuote('):sketch.index('void setup()')]
         begin = sketch.index('    String cmd = String(" printf')
-        command = sketch[begin:sketch.index('    typeText(cmd);', begin)]
+        command = sketch[begin:sketch.index('    typeText(', begin)]
         cpp = self.base / 'command.cpp'
         cpp.write_text('#include <string>\n#include <iostream>\nusing String = std::string;\n'
                        '#define PASS "fixture apostrophe\' password"\n#define ADMIN_KEY ""\n'
@@ -206,6 +238,12 @@ done
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
         generated = subprocess.run([str(binary)], capture_output=True, text=True, check=True).stdout
         self.assertNotIn('\n', generated)
+        self.assertLess(len(generated), 1000)
+        self.assertNotIn('install_curl()', generated)
+        self.assertIn('/usr/bin/env PATH=/usr/sbin:/usr/bin:/sbin:/bin', generated)
+        self.assertIn('/bin/bash -c', generated)
+        self.assertEqual(generated.count('sudo '), 1)
+        self.assertNotIn(' -v &&', generated)
         self.assertIn("printf '%s\\n'", generated)
         self.assertIn('CK_FOLLOW=1', generated)
         parsed = subprocess.run(['bash', '-n'], input=generated, capture_output=True, text=True)
@@ -261,6 +299,61 @@ done
         result = subprocess.run([str(binary)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+
+    def test_paced_typing_allows_host_to_observe_press_and_release(self):
+        sketch = (ROOT / 'hid/ck_provision/ck_provision.ino').read_text()
+        function = sketch[sketch.index('void typeText('):sketch.index('// Quote configuration')]
+        cpp = self.base / 'paced-typing.cpp'
+        cpp.write_text(r'''#include <string>
+#include <cassert>
+using String = std::string;
+unsigned clock_ms = 0;
+void delay(unsigned ms) { clock_ms += ms; }
+void led(int, int, int) {}
+struct {
+    std::string typed;
+    char held = 0;
+    unsigned changed = 0;
+    void press(char c) { assert(!held); assert(clock_ms - changed >= 8); held = c; changed = clock_ms; }
+    void releaseAll() { assert(clock_ms - changed >= 8); typed += held; held = 0; changed = clock_ms; }
+} Keyboard;
+''' + function + r'''
+int main() {
+    clock_ms = 8;
+    typeText("aaAA!!11", 8);
+    assert(Keyboard.typed == "aaAA!!11");
+    assert(!Keyboard.held);
+    assert(clock_ms - Keyboard.changed >= 8);
+}
+''')
+        binary = self.base / 'paced-typing'
+        built = subprocess.run(['c++', str(cpp), '-o', str(binary)], capture_output=True, text=True)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        result = subprocess.run([str(binary)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_checked_payload_runs_only_after_sha256_matches(self):
+        import base64
+        import hashlib
+        header = (ROOT / 'hid/ck_provision/checked_command.h').read_text()
+        helper = header[header.index('String checkedPayload('):header.index('String checkedCommand(')]
+        cpp = self.base / 'checked.cpp'
+        cpp.write_text('#include <string>\n#include <iostream>\nusing String = std::string;\n' + helper +
+            '\nint main(int argc, char **argv) { std::cout << checkedPayload(argv[1], argv[2]); }\n')
+        binary = self.base / 'checked'
+        built = subprocess.run(['c++', str(cpp), '-o', str(binary)], capture_output=True, text=True)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        payload = b'printf executed > "$HOME/executed"'
+        encoded = base64.b64encode(payload).decode()
+        digest = hashlib.sha256(payload).hexdigest()
+        for body, sha, runs in ((encoded, digest, True), (encoded[:-4], digest, False), (encoded, '0' * 64, False)):
+            marker = self.base / 'executed'
+            if marker.exists(): marker.unlink()
+            command = subprocess.check_output([str(binary), body, sha], text=True)
+            parsed = subprocess.run(['/bin/bash', '-n'], input=command, text=True, capture_output=True)
+            self.assertEqual(parsed.returncode, 0, parsed.stderr)
+            subprocess.run(['/bin/bash', '-c', command], env=self.env, capture_output=True)
+            self.assertEqual(marker.exists(), runs)
 
     def test_windows_run_command_fits_and_keeps_the_initial_window_open(self):
         sketch = (ROOT / 'hid/ck_provision/ck_provision.ino').read_text()
