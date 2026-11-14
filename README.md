@@ -103,6 +103,12 @@ Copy or clone this folder to every PC, then:
 - **Ubuntu PCs:** what to copy, packages, offline builds and ports are in [docs/UBUNTU.md](docs/UBUNTU.md).
 - **Many Ubuntu PCs, fast:** `sudo bash scripts/provision.sh` does everything on one PC and repairs what it finds wrong: no sleep or screen lock, packages, ssh, the folder in `~/Desktop/cluster-kit`, the build, and a `ck-worker` service that starts at boot and joins the head. Run it again any time. An ESP32-S3/S2 stick can type it for you: flash it with `hid/flash.sh` (see the header of [hid/ck_provision/ck_provision.ino](hid/ck_provision/ck_provision.ino)), plug it into a logged-in PC, unplug after typing finishes (USB-paced; wait for the done light).
 
+### Visible Windows 10 / 11 worker
+
+Use the saved repository files: right-click `scripts\provision-windows.cmd` and choose **Run as administrator**, then approve UAC. It uses built-in Windows PowerShell 5.1, installs Git, Rust/MSVC and OpenSSH as needed, builds the worker, configures the cluster firewall rules, and starts the scheduled worker at boot. The final console shows hostname, IPv4 addresses, SSH commands and live worker logs. Set `CK_FOLLOW=0` to finish without following logs.
+
+The launcher respects the existing script execution policy and makes no Defender exclusions. Managed PCs may require an administrator-approved signed script. Antivirus acceptance and live Windows behaviour have to be verified on the target PC. Logs are in `%ProgramData%\cluster-kit`.
+
 ### Visible Ubuntu worker
 
 Run `bash ~/Desktop/cluster-kit/scripts/worker-ubuntu.sh` in an Ubuntu terminal. It repairs missing packages (including interrupted dpkg and broken apt dependencies), enables SSH, updates the current Git branch without overwriting tracked edits, rebuilds if necessary, and replaces old local `ck` processes, including an old local head. The replacement worker starts at boot in open mode with no join code. Sleep, display blanking and automatic locking are disabled.

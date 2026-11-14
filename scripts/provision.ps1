@@ -1,9 +1,10 @@
 # Provision one Windows lab PC for Cluster Kit. Safe to run again: it checks every item and fixes only what is wrong.
-# Needs an ADMINISTRATOR PowerShell. The ESP32 stick in hid/ opens one and types:
-#   iex (irm https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.ps1)
+# Windows 10/11, Windows PowerShell 5.1. Run scripts/provision-windows.cmd as Administrator.
+# Runs a saved script under the existing execution policy; no Defender exclusions or policy bypass.
 # Settings (environment variables): CK_HEAD_IP   pin the head (default: workers find it by broadcast)
 #   CK_BRANCH (main)   CK_ADMIN_KEY (an ssh public key line to allow in)   CK_ROLE=head (also run the head here)
 #   CK_AUTH (off = open mode: no login, no token)   CK_FLEET (open)
+#   CK_FOLLOW (1 = show live worker logs after setup; default 1, Ctrl+C closes the view)
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'  # downloads are much faster without the progress bar
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -23,26 +24,14 @@ function Step($t) { Write-Host "`n== $t" }
 function Ok($t) { Write-Host "  ok      $t" -ForegroundColor Green }
 function Fixed($t) { Write-Host "  fixed   $t" -ForegroundColor Yellow }
 function Bad($t) { Write-Host "  FAIL    $t" -ForegroundColor Red; $script:Failed++; $script:Problems += $t }
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $admin) {
+  Write-Error 'Run provision-windows.cmd as Administrator and approve the normal UAC prompt.'
+  exit 1
+}
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Start-Transcript -Path (Join-Path $LogDir 'provision.log') -Append | Out-Null
-
-$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 Write-Host "Cluster Kit provisioning $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $env:COMPUTERNAME as $env:USERNAME"
-if (-not $admin) {
-  # not elevated: relaunch this same script in an Administrator PowerShell (UAC asks once), passing the CK_ settings along
-  $ScriptUrl = "https://raw.githubusercontent.com/$Repo/$Branch/scripts/provision.ps1"
-  $pass = ''
-  foreach ($v in 'CK_ADMIN_KEY', 'CK_FLEET', 'CK_AUTH', 'CK_ROLE', 'CK_HEAD_IP', 'CK_BRANCH') {
-    $val = [Environment]::GetEnvironmentVariable($v)
-    if ($val) { $pass += "`$env:$v='$val'; " }
-  }
-  Write-Host 'not running as Administrator: asking Windows for it (UAC). Click Yes in the prompt.'
-  try {
-    Start-Process powershell -Verb RunAs -ArgumentList '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', "$pass iex (irm '$ScriptUrl')"
-  } catch { Bad "could not start an Administrator PowerShell (UAC cancelled?): $($_.Exception.Message). Right-click PowerShell and choose Run as administrator, then run the command again" }
-  Stop-Transcript | Out-Null
-  return
-}
 
 Step 'network'
 function Test-Online { try { $c = New-Object Net.Sockets.TcpClient; $r = $c.BeginConnect('github.com', 443, $null, $null); $up = $r.AsyncWaitHandle.WaitOne(8000) -and $c.Connected; $c.Close(); $up } catch { $false } }
@@ -210,12 +199,26 @@ if (Test-Path $Bin) {
 } else { Bad 'no ck.exe, so no worker' }
 
 Step 'result'
-$ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1).IPAddress
-Write-Host "   $env:COMPUTERNAME   $ip   build $(if (Test-Path $Stamp) { (Get-Content $Stamp -Raw).Trim() } else { 'none' })"
+$ips = @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -ExpandProperty IPAddress -Unique)
+Write-Host ('=' * 72) -ForegroundColor Cyan
+Write-Host "   CLUSTER KIT | $env:COMPUTERNAME" -ForegroundColor Cyan
+foreach ($ip in $ips) {
+  Write-Host "   IP: $ip" -ForegroundColor Cyan
+  Write-Host "   SSH: ssh $env:USERNAME@$ip"
+}
+if (-not $ips.Count) { Bad 'no usable IPv4 address found' }
+Write-Host "   Build: $(if (Test-Path $Stamp) { (Get-Content $Stamp -Raw).Trim() } else { 'none' })"
+Write-Host "   Logs: $LogDir"
+Write-Host ('=' * 72) -ForegroundColor Cyan
 if ($Failed -eq 0) { Write-Host '   DONE: all good, move to the next PC' -ForegroundColor Green }
 else {
   Write-Host "   $Failed PROBLEM(S), each one above and in $LogDir\provision.log:" -ForegroundColor Red
   $i = 0; foreach ($p in $Problems) { $i++; Write-Host "   $i. $p" -ForegroundColor Red }
 }
-[Console]::Beep(880, 200)
+try { [Console]::Beep(880, 200) } catch { }
 Stop-Transcript | Out-Null
+$workerLog = Join-Path $LogDir 'ck-worker.log'
+if ((Opt $env:CK_FOLLOW '1') -eq '1' -and (Test-Path $workerLog)) {
+  Write-Host 'Live worker log; Ctrl+C closes this view. The scheduled worker keeps running.' -ForegroundColor Cyan
+  Get-Content -LiteralPath $workerLog -Tail 40 -Wait
+}
