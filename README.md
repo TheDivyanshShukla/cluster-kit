@@ -101,7 +101,7 @@ Copy or clone this folder to every PC, then:
 - **Sleep:** setup also offers to disable sleep on that PC.
 - **Windows and Rust:** building needs the MSVC build tools. If the build fails, setup prints the `winget` command that installs them.
 - **Ubuntu PCs:** what to copy, packages, offline builds and ports are in [docs/UBUNTU.md](docs/UBUNTU.md).
-- **Many Ubuntu PCs, fast:** `sudo bash scripts/provision.sh` does everything on one PC and repairs what it finds wrong: no sleep or screen lock, packages, ssh, the folder in `~/Desktop/cluster-kit`, the build, and a `ck-worker` service that starts at boot and joins the head. Run it again any time. An ESP32-S3/S2 stick can type it for you: flash it with `hid/flash.sh` (see the header of [hid/ck_provision/ck_provision.ino](hid/ck_provision/ck_provision.ino)), plug it into a logged-in PC, unplug after typing finishes (about 40 seconds).
+- **Many Ubuntu PCs, fast:** `sudo bash scripts/provision.sh` does everything on one PC and repairs what it finds wrong: no sleep or screen lock, packages, ssh, the folder in `~/Desktop/cluster-kit`, the build, and a `ck-worker` service that starts at boot and joins the head. Run it again any time. An ESP32-S3/S2 stick can type it for you: flash it with `hid/flash.sh` (see the header of [hid/ck_provision/ck_provision.ino](hid/ck_provision/ck_provision.ino)), plug it into a logged-in PC, unplug after typing finishes (USB-paced; wait for the done light).
 
 ### Visible Ubuntu worker
 
@@ -109,7 +109,7 @@ Run `bash ~/Desktop/cluster-kit/scripts/worker-ubuntu.sh` in an Ubuntu terminal.
 
 The terminal shows the hostname, large IP addresses, SSH connection commands and live worker logs. `connected to head` confirms that PC joined; an IP banner alone does not. Ctrl+C closes the log view while the service keeps running. SSH still uses the PC's normal account authentication or your configured public key.
 
-For an Ubuntu-only ESP32 stick: `CK_PROVISION_BRANCH=main bash hid/flash.sh --os ubuntu SERIAL_PORT`. The first typed command authenticates sudo and installs curl/certificates before downloading the setup script. Leave it plugged into the target until typing finishes (about 40 seconds). Flashing leaves the stick in download mode: unplug it from the flashing computer and plug it into a logged-in Ubuntu PC to run. The script and firmware must use a branch already pushed to GitHub.
+For an Ubuntu-only ESP32 stick: `CK_PROVISION_BRANCH=main bash hid/flash.sh --os ubuntu SERIAL_PORT`. The first typed command authenticates sudo and installs curl/certificates before downloading the setup script. Leave it plugged into the target until typing finishes (USB-paced; wait for the done light). Flashing leaves the stick in download mode: unplug it from the flashing computer and plug it into a logged-in Ubuntu PC to run. The script and firmware must use a branch already pushed to GitHub.
 
 ## Run
 

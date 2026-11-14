@@ -243,5 +243,24 @@ done
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+    def test_typing_preserves_repeated_keys_without_extra_delay(self):
+        sketch = (ROOT / 'hid/ck_provision/ck_provision.ino').read_text()
+        function = sketch[sketch.index('void typeText('):sketch.index('// Quote configuration')]
+        cpp = self.base / 'typing.cpp'
+        cpp.write_text('#include <string>\n#include <cassert>\nusing String = std::string;\n'
+                       'unsigned waited = 0; void delay(unsigned ms) { waited += ms; }\n'
+                       'void led(int, int, int) {}\n'
+                       'struct { std::string typed; char held = 0;\n'
+                       'void press(char c) { assert(!held); held = c; typed += c; }\n'
+                       'void releaseAll() { held = 0; } } Keyboard;\n'
+                       + function + '\nint main() { typeText("aaAA!!11");\n'
+                       'assert(Keyboard.typed == "aaAA!!11"); assert(!Keyboard.held);\n'
+                       'assert(waited == 0); }\n')
+        binary = self.base / 'typing'
+        subprocess.run(['c++', str(cpp), '-o', str(binary)], check=True, capture_output=True)
+        result = subprocess.run([str(binary)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()

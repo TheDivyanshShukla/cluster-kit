@@ -1,6 +1,6 @@
 // Cluster Kit lab-PC provisioning stick. Xiao ESP32-S3 (or ESP32-S2 / DevKit) acting as a USB keyboard.
 //
-// Plug it in: it types the setup line by itself. Plug it into a logged-in lab PC, unplug after the typing light finishes (the bootstrap line takes about 40 s), move on.
+// Plug it in: it types the setup line by itself. Plug it into a logged-in lab PC, unplug after the typing light finishes (USB-paced typing; wait for the done light), move on.
 // Pick the PC type with a button held while you plug the stick in (or tap RESET while holding it):
 //   plug in, then press B (BOOT) once within ~6 s ...... Windows: Win+R, PowerShell as Administrator (UAC: accept)
 //   press B twice ...................................... Ubuntu: Ctrl+Alt+T, then the download line, run with sudo
@@ -43,15 +43,14 @@ void led(uint8_t r, uint8_t g, uint8_t b) {
 #endif
 }
 
-// Types slowly with each key held down for a while: quick press/release pairs got keys dropped, doubled and
-// changed on the PC ("curlo", "thtps", a stray space in the URL). About 20 ms per character; the line is ~400 characters.
+// Send at the USB endpoint rate: the installed Arduino USBHID::SendReport waits for
+// transfer completion and the HID endpoint polls every 1 ms. Keep separate press
+// and release reports so identical consecutive characters register independently.
 void typeText(const String &s) {
   for (size_t i = 0; i < s.length(); i++) {
     led(i & 1, 0, 0);  // fast blink while typing
     Keyboard.press(s[i]);
-    delay(12);
     Keyboard.releaseAll();
-    delay(8);
   }
   led(0, 0, 0);
 }
