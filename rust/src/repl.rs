@@ -47,7 +47,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
-use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
@@ -899,7 +899,10 @@ fn connect(target: &str) -> io::Result<TcpStream> {
 /// Best effort: a signed beacon (see fence_key) with a higher epoch than the primary we follow means a standby promoted;
 /// follow that head. Unsigned beacons are ignored here (any host could forge one and make us copy its database).
 fn watch_beacons(epoch: Arc<AtomicU64>, head: Arc<Mutex<String>>, cur: Arc<Mutex<Option<TcpStream>>>, switch: Arc<Mutex<Option<String>>>) {
-    let Ok(sock) = UdpSocket::bind(("0.0.0.0", proto::disc_port())) else { return }; // agents on this PC may hold the port
+    let sock = match proto::discovery_socket(proto::disc_port()) {
+        Ok(s) => s,
+        Err(e) => return eprintln!("UDP {}: {e}; standby cannot hear higher epochs", proto::disc_port()),
+    };
     let mut buf = [0u8; 512];
     while let Ok((n, _)) = sock.recv_from(&mut buf) {
         let Ok(text) = std::str::from_utf8(&buf[..n]) else { continue };

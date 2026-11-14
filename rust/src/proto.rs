@@ -100,6 +100,16 @@ pub const KIND_LIST: u8 = 3; // list job (JOB-01): arg = command line, 0x00, the
 pub fn port() -> u16 {
     std::env::var("CK_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7700)
 }
+/// Every role on this PC must receive discovery broadcasts, including during standby promotion.
+/// Set reuse before binding; duplicating a socket would instead make the readers compete for packets.
+pub fn discovery_socket(port: u16) -> io::Result<UdpSocket> {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.bind(&std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port).into())?;
+    Ok(socket.into())
+}
 pub fn disc_port() -> u16 {
     port() + 1
 }
@@ -364,6 +374,42 @@ pub fn local_ip() -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_listeners_share_port_across_promotion() {
+        let standby = discovery_socket(0).unwrap();
+        let port = standby.local_addr().unwrap().port();
+        let head = discovery_socket(port).expect("promoted head must bind while standby still listens");
+        let worker = discovery_socket(port).expect("local worker must share discovery too");
+        drop(standby);
+        drop(worker);
+        head.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.send_to(b"ck/1 lab 127.0.0.1:7700 e=6", ("127.0.0.1", port)).unwrap();
+        let mut buf = [0; 512];
+        let (n, from) = head.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"ck/1 lab 127.0.0.1:7700 e=6");
+        assert_eq!(from, tx.local_addr().unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires an active IPv4 interface that supports LAN broadcasts"]
+    fn discovery_broadcast_reaches_every_role() {
+        let standby = discovery_socket(0).unwrap();
+        let port = standby.local_addr().unwrap().port();
+        let head = discovery_socket(port).unwrap();
+        let worker = discovery_socket(port).unwrap();
+        let tx = UdpSocket::bind("0.0.0.0:0").unwrap();
+        tx.set_broadcast(true).unwrap();
+        let beacon = b"ck/1 discovery-test 127.0.0.1:7700 e=6";
+        tx.send_to(beacon, ("255.255.255.255", port)).unwrap();
+        for socket in [standby, head, worker] {
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0; 512];
+            let (n, _) = socket.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], beacon);
+        }
+    }
 
     #[test]
     fn hello_round_trip_and_v1() {

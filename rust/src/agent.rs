@@ -89,12 +89,10 @@ static NO_DISC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 fn listen_once(relay: bool) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let s = match UdpSocket::bind(("0.0.0.0", disc_port())) {
+        let s = match discovery_socket(disc_port()) {
             Ok(s) => s,
             Err(e) => {
-                // ponytail: the head on this PC holds the port (it listens for higher epochs); use that head.
-                // Real fix if it matters: SO_REUSEADDR via a socket crate.
-                println!("UDP {}: {e}; a head on this PC holds it, using 127.0.0.1:{}", disc_port(), crate::proto::port());
+                println!("UDP {}: {e}; discovery unavailable, trying local head at 127.0.0.1:{}", disc_port(), crate::proto::port());
                 NO_DISC.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }

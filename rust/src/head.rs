@@ -1365,7 +1365,7 @@ fn fence_by_proof(ctx: &Ctx, proof: &str) {
 
 /// Listen for beacons; a higher epoch than ours fences this head: stop, close agents, restart as its standby.
 fn watch_epoch(ctx: Arc<Ctx>, name: String) {
-    let s = match UdpSocket::bind(("0.0.0.0", disc_port())) {
+    let s = match discovery_socket(disc_port()) {
         Ok(s) => s,
         Err(e) => return eprintln!("UDP {}: {e}; a higher epoch will not be noticed", disc_port()),
     };
