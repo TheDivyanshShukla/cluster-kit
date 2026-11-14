@@ -852,7 +852,10 @@ fn speculate_take(st: &mut State, wid: u64) -> Option<(u64, u64, u64, u8, Vec<u8
                 });
             }
         }
-        if let Some(&(job, a, b)) = sched::speculate(&infl, 1).first() {
+        // no-wait tail first (an idle PC copies the chunk that would finish last if it can finish it sooner), then the
+        // overdue rule for PCs whose own speed is not known yet
+        let me = node_rate(st, w, j.kind);
+        if let Some((job, a, b)) = sched::steal(&infl, me).or_else(|| sched::speculate(&infl, 1).first().copied()) {
             crate::say!("chunk.speculate", "job {job}: speculative copy of {a}..{b} on {} (original still running after {:.1}s)", w.addr,
                 infl.iter().find(|i| (i.a, i.b) == (a, b)).map_or(0.0, |i| i.age_secs));
             return Some((job, a, b, j.kind, j.arg.clone()));
@@ -1342,6 +1345,23 @@ fn higher_epoch(text: &str, name: &str, own: &str, mine: u64) -> Option<u64> {
     (n.trim() == name && addr != own && e > mine).then_some(e)
 }
 
+/// Address of another head of cluster `name` that beacons exactly our epoch: two heads ended a failover on the same
+/// number (both promoted from N at once), so "follow the higher epoch" can never settle it. Pure.
+fn tied_epoch(text: &str, name: &str, own: &str, mine: u64) -> Option<String> {
+    let rest = text.strip_prefix("ck/1 ")?.trim();
+    let rest = rest.strip_suffix(" relay").unwrap_or(rest).trim_end();
+    let (rest, e) = rest.rsplit_once(" e=")?;
+    let (n, addr) = rest.rsplit_once(' ')?;
+    (n.trim() == name && addr != own && e.trim().parse::<u64>().ok()? == mine).then(|| addr.to_string())
+}
+
+/// Tie-break for `tied_epoch`: the head with the larger address takes the next epoch at once; the other waits 5 s
+/// (five beacons) to be fenced by it and only then takes the next epoch itself, which is what happens when the peer runs
+/// a build without this rule and would otherwise keep its half of the PCs for ever. Pure.
+fn tie_takes_next(own: &str, peer: &str, tied_for: Duration) -> bool {
+    own > peer || tied_for >= Duration::from_secs(5)
+}
+
 static CLUSTER: OnceLock<String> = OnceLock::new();
 
 /// Round 4: CTRL for an agent: this head's epoch with a signed proof. The agent repeats the newest proof in its HELLO to any
@@ -1370,11 +1390,22 @@ fn watch_epoch(ctx: Arc<Ctx>, name: String) {
         Err(e) => return eprintln!("UDP {}: {e}; a higher epoch will not be noticed", disc_port()),
     };
     let mut b = [0u8; 512];
+    let mut tied: Option<Instant> = None; // since when another head has beaconed our own epoch
     while let Ok((n, _)) = s.recv_from(&mut b) {
         let Ok(t) = std::str::from_utf8(&b[..n]) else { continue };
         let own = local_ip().map_or(String::new(), |i| format!("{i}:{}", port()));
         // only a beacon signed with the cluster's fence key can fence this head (a plain "ck/1" one is forgeable)
         let signed = crate::repl::fence_key(&ctx.store).and_then(|k| crate::repl::fence_check(&k, t)).map(|(n, a, e)| format!("ck/1 {n} {a} e={e}"));
+        if let Some(peer) = signed.as_deref().and_then(|t| tied_epoch(t, &name, &own, crate::repl::epoch(&ctx))) {
+            let since = *tied.get_or_insert_with(Instant::now);
+            if !ctx.sh.0.lock().unwrap().halted && tie_takes_next(&own, &peer, since.elapsed()) {
+                let e = crate::repl::bump_epoch(&ctx);
+                tied = None;
+                crate::say!("ha.tie", "the head at {peer} beacons this head's epoch {}: two heads promoted at once. This head takes epoch {e}; the other one and its PCs follow", e - 1);
+                event(&ctx, "ha.tie", "head", &format!("epoch tie with {peer}: this head took epoch {e}"));
+            }
+            continue;
+        }
         if let Some(e) = signed.and_then(|t| higher_epoch(&t, &name, &own, crate::repl::epoch(&ctx))) {
             halt(&ctx);
             let addr = t.split_whitespace().nth(2).unwrap_or("").to_string();
@@ -2107,8 +2138,9 @@ fn feed(w: Arc<Mutex<Out>>, ctx: Arc<Ctx>, wid: u64, credits: mpsc::Receiver<()>
                     st = sh.0.lock().unwrap();
                     continue;
                 }
-                // 2 s timeout: an idle node re-checks for an overdue chunk to copy (watchdog also wakes it every 5 s)
-                st = sh.1.wait_timeout(st, Duration::from_secs(2)).unwrap().0;
+                // 250 ms timeout: an idle node re-checks soon for a tail chunk it can finish sooner (steal) or an overdue
+                // one; only idle nodes wait here, so the cost is a short lock per idle PC (watchdog also wakes it every 5 s)
+                st = sh.1.wait_timeout(st, Duration::from_millis(250)).unwrap().0;
             }
         };
         if mem > 0 {
@@ -3653,6 +3685,16 @@ mod tests {
         assert_eq!(higher_epoch("ck/1 other 10.0.0.2:7700 e=9", "lab", own, 2), None, "another cluster");
         assert_eq!(higher_epoch("ck/1 my lab 10.0.0.2:7700 e=4", "my lab", own, 1), Some(4));
         assert_eq!(higher_epoch("ck/1 lab 10.0.0.2:7700", "lab", own, 1), None, "old head without epoch");
+        // a tie: same epoch, another head of this cluster
+        assert_eq!(tied_epoch("ck/1 lab 10.0.0.2:7700 e=2", "lab", own, 2), Some("10.0.0.2:7700".to_string()));
+        assert_eq!(tied_epoch("ck/1 lab 10.0.0.2:7700 e=2 relay", "lab", own, 2), Some("10.0.0.2:7700".to_string()));
+        assert_eq!(tied_epoch("ck/1 lab 10.0.0.1:7700 e=2", "lab", own, 2), None, "our own beacon");
+        assert_eq!(tied_epoch("ck/1 lab 10.0.0.2:7700 e=3", "lab", own, 2), None, "higher is not a tie");
+        assert_eq!(tied_epoch("ck/1 other 10.0.0.2:7700 e=2", "lab", own, 2), None, "another cluster");
+        // exactly one of two heads with this rule moves first; the other only after 5 s (a peer without the rule)
+        let (a, b) = ("10.0.0.9:7700", "10.0.0.2:7700");
+        assert!(tie_takes_next(a, b, Duration::ZERO) && !tie_takes_next(b, a, Duration::ZERO));
+        assert!(!tie_takes_next(b, a, Duration::from_secs(4)) && tie_takes_next(b, a, Duration::from_secs(5)));
         let long = Duration::from_secs(11);
         assert!(!dispatch_ok("candidate", false, 0, Duration::ZERO) && dispatch_ok("candidate", true, 0, Duration::ZERO));
         assert!(dispatch_ok("primary", false, 1, Duration::from_secs(9)), "grace period");
@@ -3743,7 +3785,11 @@ fn observe(ctx: &Ctx, cpu: Option<f64>) -> (crate::research::Obs, crate::store::
             rate += w.rate;
             if w.rate > 0.0 {
                 let (id, host) = who_of(w);
-                obs.rates.push((if id.is_empty() { w.addr.clone() } else { id }, host, w.rate));
+                let id = if id.is_empty() { w.addr.clone() } else { id };
+                // "CPU model/threads" of the selector class (its RAM part would split the same CPU into two groups)
+                let class = w.attrs.get("class").map(|c| c.rsplitn(2, '/').last().unwrap_or("").to_string()).unwrap_or_default();
+                obs.class.insert(id.clone(), class);
+                obs.rates.push((id, host, w.rate));
             }
         }
     }

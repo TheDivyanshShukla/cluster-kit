@@ -141,6 +141,7 @@ pub fn breakdown(job: u64, a: &Acct, wall: f64, paused: f64) -> Value {
 #[derive(Default, Clone)]
 pub struct Obs {
     pub rates: Vec<(String, String, f64)>, // (node id, host, numbers/s) of PCs that are working
+    pub class: HashMap<String, String>,    // node id -> hardware class (CPU model/threads); a PC is compared with its own class only
     pub losses: HashMap<String, u32>,      // node.lost events in the last 24 h
     pub head_cpu: Option<f64>,             // head process CPU, percent of one core
     pub standby_lag: u64,                  // worst standby lag, changes
@@ -189,16 +190,25 @@ fn median(v: &mut [f64]) -> f64 {
 /// The alert rules (docs/API.md). Pure.
 pub fn conditions(o: &Obs, c: &Cfg) -> Vec<Cond> {
     let mut out = vec![];
-    if o.rates.len() >= 3 {
-        let mut r: Vec<f64> = o.rates.iter().map(|x| x.2).collect();
+    // slow_pc compares a PC with PCs of the same hardware class: an i3 among i5s is slower, not broken (it used to be
+    // flagged against the fleet median, and the advisor then offered to cordon a healthy PC). A class needs 3 working PCs.
+    let mut groups: HashMap<&str, Vec<&(String, String, f64)>> = HashMap::new();
+    for x in &o.rates {
+        groups.entry(o.class.get(&x.0).map_or("", |c| c.as_str())).or_default().push(x);
+    }
+    let mut slow = vec![];
+    for g in groups.values().filter(|g| g.len() >= 3) {
+        let mut r: Vec<f64> = g.iter().map(|x| x.2).collect();
         let med = median(&mut r);
-        let mut dev: Vec<f64> = o.rates.iter().map(|x| (x.2 - med).abs()).collect();
+        let mut dev: Vec<f64> = g.iter().map(|x| (x.2 - med).abs()).collect();
         // ponytail: identical PCs have MAD ~ 0, so any wobble would flag; floor the spread at 10 % of the median
         let mad = median(&mut dev).max(0.1 * med);
         let limit = med - c.slow_mad * mad;
-        for (id, host, rate) in o.rates.iter().filter(|x| x.2 < limit) {
-            out.push(Cond { kind: "slow_pc", severity: "warn", node: Some(id.clone()), detail: format!("{host}: {rate:.3e} numbers/s, fleet median {med:.3e}"), hold_s: c.slow_min_s });
-        }
+        slow.extend(g.iter().filter(|x| x.2 < limit).map(|x| (x.0.clone(), x.1.clone(), x.2, med)));
+    }
+    slow.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order must not reorder the alerts
+    for (id, host, rate, med) in slow {
+        out.push(Cond { kind: "slow_pc", severity: "warn", node: Some(id), detail: format!("{host}: {rate:.3e} numbers/s, median of its hardware class {med:.3e}"), hold_s: c.slow_min_s });
     }
     for (id, n) in o.losses.iter().filter(|(_, n)| **n as f64 > c.flaky_losses) {
         out.push(Cond { kind: "flaky_pc", severity: "warn", node: Some(id.clone()), detail: format!("lost {n} times in 24 h"), hold_s: 0.0 });
@@ -544,6 +554,18 @@ mod tests {
         }
         assert!(s.alerts(false, 10).is_empty());
         assert!(conditions(&Obs { rates: vec![("a".into(), "a".into(), 1.0), ("b".into(), "b".into(), 100.0)], ..Default::default() }, &cfg()).is_empty(), "under 3 PCs there is no fleet to compare with");
+        // mixed hardware: 5 fast PCs and 4 slower-by-design ones; only the PC that is slow for its own class is flagged
+        let mut o = Obs::default();
+        for i in 0..5 {
+            o.rates.push((format!("f{i}"), "h".into(), 21.0e6));
+            o.class.insert(format!("f{i}"), "i5".into());
+        }
+        for i in 0..4 {
+            o.rates.push((format!("s{i}"), "h".into(), if i == 3 { 7.0e6 } else { 14.0e6 }));
+            o.class.insert(format!("s{i}"), "i3".into());
+        }
+        let c = conditions(&o, &cfg());
+        assert_eq!(c.iter().filter(|c| c.kind == "slow_pc").map(|c| c.node.clone().unwrap()).collect::<Vec<_>>(), vec!["s3".to_string()]);
     }
 
     #[test]

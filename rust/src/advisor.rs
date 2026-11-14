@@ -864,6 +864,7 @@ mod tests {
         let o = crate::research::Obs {
             rates: vec![("a".into(), "a".into(), 1.0), ("b".into(), "b".into(), 100.0), ("c".into(), "c".into(), 100.0), ("d".into(), "d".into(), 100.0)],
             losses: [("a".to_string(), 9u32)].into(), head_cpu: Some(99.0), standby_lag: 10_000_000, standbys: 1, target_standbys: 2, reserves_short: vec!["r".into()],
+            ..Default::default()
         };
         let mut kinds: Vec<&str> = crate::research::conditions(&o, &crate::research::Cfg { slow_mad: 3.0, slow_min_s: 1.0, flaky_losses: 3.0, head_cpu_pct: 85.0, standby_lag: 5000.0, no_standby_s: 1.0 }).iter().map(|c| c.kind).collect();
         kinds.sort();

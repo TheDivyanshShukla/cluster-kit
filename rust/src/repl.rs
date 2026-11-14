@@ -1042,6 +1042,15 @@ pub fn has_quorum(connected: usize, membership: usize) -> bool {
     membership == 0 || connected * 2 > membership
 }
 
+/// Take the next epoch (stored before it is beaconed). For a head that found another head on its own epoch
+/// (head::watch_epoch): with a strictly higher epoch the other head fences itself and every agent follows.
+pub fn bump_epoch(ctx: &Ctx) -> u64 {
+    let mut g = init(ctx);
+    g.epoch += 1;
+    let _ = ctx.store.set_meta("epoch", &g.epoch.to_string());
+    g.epoch
+}
+
 /// The epoch a head beacons and stamps on its work; stored in the database (store meta "epoch").
 pub fn epoch(ctx: &Ctx) -> u64 {
     init(ctx).epoch

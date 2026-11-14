@@ -244,6 +244,26 @@ pub fn speculate(inflight: &[Inflight], idle_nodes: usize) -> Vec<(u64, u64, u64
     v.into_iter().take(idle_nodes).map(|x| x.1).collect()
 }
 
+/// No-wait tail: an idle PC (rate `my_rate`, units/s) takes a copy of the in-flight chunk that would otherwise finish
+/// last, as soon as it can finish that chunk sooner than its holder will. Chunks are idempotent and the first result
+/// wins (the slower copy is cancelled), so nobody waits for a slow PC. Holder's time left = expected - age, or for an
+/// overdue chunk (a stalled or slowed holder) as long again as it has already run. Only chunks with a single copy.
+pub fn steal(inflight: &[Inflight], my_rate: f64) -> Option<(u64, u64, u64)> {
+    if my_rate <= 0.0 {
+        return None;
+    }
+    inflight
+        .iter()
+        .filter(|c| c.copies == 1 && c.expected_secs > 0.0)
+        .map(|c| {
+            let left = if c.age_secs < c.expected_secs { c.expected_secs - c.age_secs } else { c.age_secs };
+            (left, (c.b - c.a) as f64 / my_rate, c)
+        })
+        .filter(|(left, mine, _)| mine < left)
+        .max_by(|x, y| x.0.total_cmp(&y.0))
+        .map(|(_, _, c)| (c.job, c.a, c.b))
+}
+
 /// Seconds left at the fleet's current rate (SCH-03); None when the rate is 0 or unknown.
 pub fn eta_secs(remaining: u64, fleet_rate: f64) -> Option<f64> {
     (fleet_rate > 0.0).then(|| remaining as f64 / fleet_rate)
@@ -662,6 +682,18 @@ mod tests {
         assert_eq!(speculate(&v, 2), vec![(1, 10, 20), (1, 0, 10)]);
         assert_eq!(speculate(&v, 0), vec![]);
         assert_eq!(speculate(&[], 3), vec![]);
+    }
+
+    #[test]
+    fn steal_takes_the_chunk_that_finishes_last_when_faster() {
+        // chunks of 10 units; holders: 0 needs 4 s more, 10 needs 1 s more, 20 is overdue (ran 6 s, expected 2 s), 30 already copied
+        let v = [fl(1, 0, 1.0, 5.0, 1), fl(1, 10, 1.0, 2.0, 1), fl(1, 20, 6.0, 2.0, 1), fl(1, 30, 1.0, 50.0, 2)];
+        assert_eq!(steal(&v, 10.0), Some((1, 20, 30))); // 1 s for me; the overdue one is assumed 6 s away: the latest
+        assert_eq!(steal(&v[..2], 10.0), Some((1, 0, 10))); // 4 s left > my 1 s
+        assert_eq!(steal(&v[..2], 2.0), None); // I need 5 s: slower than every holder, take nothing
+        assert_eq!(steal(&v[1..2], 20.0), Some((1, 10, 20))); // 1 s left, I need 0.5 s
+        assert_eq!(steal(&v, 0.0), None); // my speed unknown
+        assert_eq!(steal(&[], 10.0), None);
     }
 
     #[test]
