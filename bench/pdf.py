@@ -40,16 +40,20 @@ e = html.escape
 hf = json.loads((d / "heff.json").read_text()) if (d / "heff.json").exists() else None  # written by report.py --head
 heff = {int(k): v for k, v in hf["eff"].items()} if hf else {}
 tail = {int(k): v for k, v in hf["tail"].items()} if hf else {}
+geff = {int(k): v for k, v in hf.get("group", {}).items()} if hf else {}      # vs the sum of each hardware group's speed
+gideal = {int(k): v for k, v in hf.get("group_ideal", {}).items()} if hf else {}
+groups = hf.get("groups", {}) if hf else {}                                    # group -> [PCs, M/s each]
 
 table = "".join(
     f"<tr><td>{p}</td><td>{med[p]:.1f}</td><td>{min(by[p]):.1f} – {max(by[p]):.1f}</td><td>{one * p:.1f}</td>"
-    f"<td>{100 * med[p] / (one * p):.0f}%</td>" + (f"<td><b>{heff[p]:.1f}%</b></td><td>{tail[p]:.1f}%</td>" if heff else "") +
+    f"<td>{100 * med[p] / (one * p):.0f}%</td>" + (f"<td>{gideal[p]:.1f}</td><td><b>{geff[p]:.1f}%</b></td>" if geff else "") +
+    (f"<td>{heff[p]:.1f}%</td><td>{tail[p]:.1f}%</td>" if heff else "") +
     f"<td>{med[p] / one:.1f}×</td><td>{statistics.median(secs[p]):.2f}</td></tr>" for p in pcs)
 hwrows = "".join(f"<tr><td>{c}</td><td>{e(m)}</td><td>{ph} / {lg}</td><td>{ram} GiB</td><td>{e(o)}</td></tr>"
                  for (m, ph, lg, ram, o), c in hw.most_common()) or "<tr><td colspan=5>not available</td></tr>"
 runrows = "".join(f"<tr><td>{r['repeat']}</td><td>{r['config']}</td><td>{r['job']}</td><td>{r['n'] / 1e9:.1f} G</td>"
                   f"<td>{r['seconds']:.3f}</td><td>{r['n'] / r['seconds'] / 1e6:.1f}</td></tr>" for r in runs)
-eff_top = heff.get(top, 100 * med[top] / (one * top))
+eff_top = geff.get(top, heff.get(top, 100 * med[top] / (one * top)))
 eff_naive = 100 * med[top] / (one * top)
 models = sorted({m for (m, *_rest) in hw})
 overhead = statistics.median(secs[top]) - statistics.median(secs[pcs[0]])
@@ -71,24 +75,25 @@ img {{ width: 100%; }} .break {{ break-before: page; }} .note {{ color: #57606a;
 <div class=kpis>
 <div class=kpi><b>{med[top]:.1f} M/s</b><span>throughput with all {top} PCs</span></div>
 <div class=kpi><b>{med[top] / one:.1f}×</b><span>speed-up over one PC</span></div>
-<div class=kpi><b>{eff_top:.0f}%</b><span>scaling efficiency at {top} PCs</span></div>
+<div class=kpi><b>{eff_top:.1f}%</b><span>{'of what this hardware can do' if geff else 'scaling efficiency'} at {top} PCs</span></div>
 <div class=kpi><b>{one:.1f} M/s</b><span>one PC on its own</span></div>
 </div>
 
 <h2>Summary</h2>
 <p>Every PC was given the same amount of work ({per_pc / 1e9:.1f} billion SHA-256 hashes), and the number of PCs grew from {pcs[0]} to {top}.
 With perfect scaling the run time stays flat and the throughput rises in a straight line. The cluster reached {med[top]:.1f} M hashes/s on {top} PCs.
-{f'''The head measured that the PCs spent <b>{eff_top:.1f}%</b> of their time computing at {top} PCs (median of the repeats); the rest was idle time
-at the end of the job ({tail[top]:.1f}%) and dispatch. This figure judges every PC at its own speed, so it is the fair one when the PCs differ:
-this fleet mixes {len(models)} CPU models ({", ".join(e(m.replace("Intel(R) Core(TM) ", "").replace(" CPU", "")) for m in models)}).
-Compared with {top} copies of the first PC the figure is {eff_naive:.0f}%, which mostly measures that the other PCs are slower, not lost work.''' if heff else
+{f'''That is <b>{eff_top:.1f}%</b> of what this hardware can do: the ideal adds up every PC at the speed of its own hardware group
+({"; ".join(f"{n} × {e(g)} at {v:.1f} M/s" for g, (n, v) in groups.items())}), {gideal[top]:.0f} M hashes/s in total.
+A group is one CPU model with one thread count; its speed is the median compute rate of its PCs in the {top}-PC runs.
+The head's own time accounting agrees: the PCs spent {heff[top]:.1f}% of the job computing, {tail[top]:.1f}% idle at the end of the job.
+Compared with {top} copies of the first PC the figure is {eff_naive:.0f}%; that number mostly says the other PCs are slower models, not that work was lost.''' if geff else
 f'''That is {eff_top:.0f}% of {top} × the single-PC rate.'''}
 Going from {pcs[0]} PC to {top} PCs added {overhead:.2f} s per run ({100 * overhead / statistics.median(secs[pcs[0]]):.1f}%).
 Efficiency figures slightly above 100% are measurement noise: the single-PC reference itself varied between {min(by[pcs[0]]):.1f} and {max(by[pcs[0]]):.1f} M/s.</p>
 
 <h2>Results</h2>
-<table><tr><th>PCs</th><th>median M/s</th><th>range M/s</th><th>N × one PC</th><th>vs N × one PC</th>{'<th>head-measured eff.</th><th>tail idle</th>' if heff else ''}<th>speed-up</th><th>median s</th></tr>{table}</table>
-<p class=note>Median of {len(by[top])} repeats per size. "N × one PC" = number of PCs × the single-PC median.{' Head-measured efficiency = compute time ÷ (PCs × wall time), from the head’s per-job time breakdown; tail idle = PCs waiting for the last chunks.' if heff else ''}</p>
+<table><tr><th>PCs</th><th>median M/s</th><th>range M/s</th><th>N × one PC</th><th>vs N × one PC</th>{'<th>ideal for this hardware</th><th>hardware-group eff.</th>' if geff else ''}{'<th>head-measured</th><th>tail idle</th>' if heff else ''}<th>speed-up</th><th>median s</th></tr>{table}</table>
+<p class=note>Median of {len(by[top])} repeats per size. "N × one PC" = number of PCs × the single-PC median.{' Ideal for this hardware = sum over the PCs in the run of their hardware group’s speed; hardware-group efficiency = measured ÷ that.' if geff else ''}{' Head-measured = compute time ÷ (PCs × wall time), from the head’s per-job time breakdown; tail idle = PCs waiting for the last chunks.' if heff else ''}</p>
 
 <h2>Charts</h2>
 <img src="data:image/png;base64,{png}">

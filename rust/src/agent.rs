@@ -558,6 +558,11 @@ fn ack(s: &mut TcpStream, key: &[u8]) -> io::Result<(FrameMac, FrameMac)> {
 }
 
 /// Presence (SCH-10) and calibration (FLT-06) frames for one connection; ends when a send fails (connection gone).
+/// CTRL body with this PC's CPU use (tenths of a percent) and memory (bytes used, total). Pure.
+fn load_ctrl(cpu_x10: u64, mem_used: u64, mem_total: u64) -> String {
+    format!(r#"{{"load":[{cpu_x10},{mem_used},{mem_total}]}}"#)
+}
+
 fn extras(w: Arc<Mutex<Out>>) {
     let ctrl = |body: String| w.lock().unwrap().put(CTRL, body.as_bytes()).is_ok();
     let on = crate::presence::enabled();
@@ -569,6 +574,7 @@ fn extras(w: Arc<Mutex<Out>>) {
     let mut next_probe = Instant::now();
     static RAPL: OnceLock<Option<Mutex<crate::presence::Rapl>>> = OnceLock::new();
     let mut next_energy = Instant::now();
+    let mut next_load = Instant::now() + Duration::from_secs(2); // after the sampler's first reading
     loop {
         if on && Instant::now() >= next_probe {
             next_probe = Instant::now() + crate::tune::secs("presence_probe_s");
@@ -587,6 +593,14 @@ fn extras(w: Arc<Mutex<Out>>) {
                 return;
             }
         }
+        // Live CPU and memory every 5 s. RESULT frames carry them too, but an idle PC sends none, so the head kept showing
+        // the reading of the PC's last chunk (100 % on a PC that had been idle for an hour). A head without this ignores it.
+        if Instant::now() >= next_load {
+            next_load = Instant::now() + Duration::from_secs(5);
+            if !ctrl(load_ctrl(CPU_X10.load(Relaxed), MEM_USED.load(Relaxed), MEM_TOTAL.load(Relaxed))) {
+                return;
+            }
+        }
         // OBS-03: package energy every 10 s, when this PC exposes RAPL (one reader per process: virtual agents share it)
         if let Some(r) = RAPL.get_or_init(|| crate::presence::Rapl::open().map(Mutex::new)) {
             if Instant::now() >= next_energy {
@@ -596,8 +610,6 @@ fn extras(w: Arc<Mutex<Out>>) {
                     return;
                 }
             }
-        } else if !on && calib_sent {
-            return;
         }
         thread::sleep(Duration::from_millis(250));
     }
@@ -978,6 +990,7 @@ mod tests {
 
     #[test]
     fn beacon_and_cap_parsing() {
+        assert_eq!(load_ctrl(125, 4000, 8000), r#"{"load":[125,4000,8000]}"#); // what head::load_of reads
         let from: std::net::IpAddr = "10.0.0.9".parse().unwrap();
         let b = |n: &str, a: &str, r| Beacon { name: n.into(), addr: a.into(), relayed: r, epoch: 0 };
         assert_eq!(parse_beacon("ck/1 lab 10.1.2.3:7700", from), Some(b("lab", "10.1.2.3:7700", false)));

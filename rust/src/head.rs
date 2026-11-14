@@ -2017,6 +2017,13 @@ fn note_files(f: &serde_json::Value) {
     g.insert((j, a, b), v);
 }
 
+/// CTRL {"load": [cpu x10, mem used, mem total]} from an agent (every 5 s, also while idle): (CPU percent, bytes, bytes).
+/// Pure. CPU is capped at 100 %; anything that is not three whole numbers is ignored.
+fn load_of(v: &serde_json::Value) -> Option<(f64, u64, u64)> {
+    let l = v["load"].as_array().filter(|l| l.len() == 3)?;
+    Some((l[0].as_u64()?.min(1000) as f64 / 10.0, l[1].as_u64()?, l[2].as_u64()?))
+}
+
 /// FLT-07: node id -> epoch ms until which the PC shows "identify".
 static IDENT: Mutex<BTreeMap<String, i64>> = Mutex::new(BTreeMap::new());
 
@@ -2079,6 +2086,9 @@ fn ctrl_in(ctx: &Ctx, wid: u64, p: &[u8]) {
     }
     if let Some(j) = v["energy_j"].as_f64().filter(|_| !w.hello.as_ref().is_some_and(|h| h.virtual_node)) {
         w.energy_j = j;
+    }
+    if let Some((cpu, used, total)) = load_of(&v) {
+        (w.cpu, w.mem_used, w.mem_total) = (cpu, used, total);
     }
     if v["standby_started"].as_bool() == Some(true) {
         if let Some(id) = &node {
@@ -3685,6 +3695,13 @@ mod tests {
         assert_eq!(higher_epoch("ck/1 other 10.0.0.2:7700 e=9", "lab", own, 2), None, "another cluster");
         assert_eq!(higher_epoch("ck/1 my lab 10.0.0.2:7700 e=4", "my lab", own, 1), Some(4));
         assert_eq!(higher_epoch("ck/1 lab 10.0.0.2:7700", "lab", own, 1), None, "old head without epoch");
+        // an idle agent's load report
+        let v = |t: &str| serde_json::from_str::<serde_json::Value>(t).unwrap();
+        assert_eq!(load_of(&v(r#"{"load":[125,4000,8000]}"#)), Some((12.5, 4000, 8000)));
+        assert_eq!(load_of(&v(r#"{"load":[5000,1,2]}"#)), Some((100.0, 1, 2)), "capped");
+        assert_eq!(load_of(&v(r#"{"load":[1,2]}"#)), None);
+        assert_eq!(load_of(&v(r#"{"load":["x",2,3]}"#)), None);
+        assert_eq!(load_of(&v(r#"{"energy_j":3.0}"#)), None);
         // a tie: same epoch, another head of this cluster
         assert_eq!(tied_epoch("ck/1 lab 10.0.0.2:7700 e=2", "lab", own, 2), Some("10.0.0.2:7700".to_string()));
         assert_eq!(tied_epoch("ck/1 lab 10.0.0.2:7700 e=2 relay", "lab", own, 2), Some("10.0.0.2:7700".to_string()));
