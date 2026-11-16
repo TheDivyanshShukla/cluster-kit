@@ -6,12 +6,17 @@ if ($errors.Count) { throw ($errors | Out-String) }
 $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Install-CkRelease' }, $true)
 if (-not $fn) { throw 'Missing Install-CkRelease: Windows still requires a local compiler' }
 . ([scriptblock]::Create($fn.Extent.Text))
+foreach ($helper in 'Opt', 'Get-CkDownload') {
+    $helperFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $helper }, $true)
+    . ([scriptblock]::Create($helperFn.Extent.Text))
+}
+
 function Assert($ok, $message) { if (-not $ok) { throw $message } }
 $root = Join-Path ([IO.Path]::GetTempPath()) ('ck release [test] ' + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
     $Repo = 'fixture/repository'
-    $commit = 'a' * 40
+    $commit = '7dda27805f02f21e0fd80ccc747a398a557f67f9'
     $tag = 'windows-' + $commit
     $fixture = Join-Path $root 'fixture.exe'
     [IO.File]::WriteAllBytes($fixture, [byte[]](77,90,1,2,3,4))
@@ -21,11 +26,12 @@ try {
     function Stop-Ck { $script:stops++ }
     function Invoke-RestMethod {
         param($Uri, [switch]$UseBasicParsing, $ErrorAction)
-        if ($Uri -like 'https://api.github.com/*') { return @([pscustomobject]@{tag_name=$tag; draft=$false; prerelease=$false}) }
-        $script:manifest
+        throw 'Release discovery must not use the GitHub API'
     }
     function Invoke-WebRequest {
-        param($Uri, $OutFile, [switch]$UseBasicParsing, $ErrorAction)
+        param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec, $Headers, $ErrorAction)
+        Assert ($TimeoutSec -eq 60) 'Download timeout missing'
+        if ($Uri -like '*/windows-manifest.json') { $script:manifest | ConvertTo-Json | Set-Content -LiteralPath $OutFile; return }
         Assert ($Uri -eq "https://github.com/$Repo/releases/download/$tag/ck-windows-x86_64.exe") 'Unexpected executable download URL'
         $script:downloads++
         Copy-Item -LiteralPath $fixture -Destination $OutFile
@@ -58,6 +64,24 @@ try {
     try { Install-CkRelease $stage $bin $stamp } catch { $failed = $true }
     Assert $failed 'Manifest/release identity mismatch accepted'
     Write-Host 'PASS: mismatched release identity rejected'
+
+    $script:attempts = 0
+    function Invoke-WebRequest {
+        param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec, $Headers, $ErrorAction)
+        $script:attempts++
+        if ($script:attempts -lt 3) { throw 'temporary connection failure' }
+        Set-Content -LiteralPath $OutFile -Value 'recovered'
+    }
+    function Get-Command { param($Name, $ErrorAction) }
+    function Start-Sleep { }
+    Get-CkDownload 'https://example.invalid/retry' (Join-Path $root 'retry')
+    Assert ($script:attempts -eq 3) 'Transient failures were not retried'
+    $script:attempts = 0
+    function Invoke-WebRequest { $script:attempts++; throw '403 Forbidden' }
+    $failed = $false
+    try { Get-CkDownload 'https://example.invalid/fail' (Join-Path $root 'retry') } catch { $failed = $true }
+    Assert ($failed -and $script:attempts -eq 3) 'Persistent failure must stop after three attempts'
+    Write-Host 'PASS: transient recovery and bounded permanent download failure'
 
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Install-Task' }, $true)
     . ([scriptblock]::Create($fn.Extent.Text))

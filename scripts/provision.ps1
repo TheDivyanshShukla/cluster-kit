@@ -4,8 +4,10 @@
 # Settings (environment variables): CK_HEAD_IP   pin the head (default: workers find it by broadcast)
 #   CK_BRANCH (main)   CK_ADMIN_KEY (an ssh public key line to allow in)   CK_ROLE=head (also run the head here)
 #   CK_AUTH (off = open mode: no login, no token)   CK_FLEET (open)
+#   CK_INSTALL_SSH (1 = attempt optional SSH installation, timeout 120 seconds)
+#   CK_WINDOWS_RELEASE (override the pinned tested windows-<commit> release)
 #   CK_BUILD_SOURCE (1 = optional developer build; default downloads the tested Windows x64 worker)
-#   CK_FOLLOW (1 = show live worker logs after setup; default 1, Ctrl+C closes the view)
+#   CK_FOLLOW (1 = show live worker logs after setup; default 0, Ctrl+C closes the view)
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'  # downloads are much faster without the progress bar
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -52,14 +54,35 @@ function Stop-Ck {
   Start-Sleep 2
 }
 
+# Bounded retries, including a native curl fallback for PowerShell proxy/connection failures.
+function Get-CkDownload($uri, $outFile) {
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    Write-Host "   download attempt $attempt/3: $uri"
+    try {
+      Invoke-WebRequest $uri -OutFile $outFile -UseBasicParsing -TimeoutSec 60 -Headers @{'User-Agent'='Cluster-Kit-Setup'} -ErrorAction Stop
+      return
+    } catch {
+      $reason = $_.Exception.Message
+      if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        & curl.exe --fail --location --connect-timeout 15 --max-time 90 --output $outFile $uri
+        if ($LASTEXITCODE -eq 0) { return }
+      }
+      if ($attempt -eq 3) { throw "Download failed after 3 attempts ($uri): $reason" }
+      Start-Sleep -Seconds (2 * $attempt)
+    }
+  }
+}
+
 # A lab PC needs the worker, not a multi-GB development toolchain. Releases are built and tested on Windows CI.
 function Install-CkRelease($stage, $bin, $stamp) {
-  $releases = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases?per_page=20" -UseBasicParsing -ErrorAction Stop
-  $release = @($releases) | Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -cmatch '^windows-[0-9a-f]{40}$' } | Select-Object -First 1
-  if (-not $release) { throw 'No tested Windows release is available yet. Rerun setup after the Windows release build completes.' }
-  $tag = $release.tag_name
+  New-Item -ItemType Directory -Force -Path $stage -ErrorAction Stop | Out-Null
+  # Pin a tested immutable release: shared lab IPs must not query the rate-limited API.
+  $tag = Opt $env:CK_WINDOWS_RELEASE 'windows-7dda27805f02f21e0fd80ccc747a398a557f67f9'
+  if ($tag -cnotmatch '^windows-[0-9a-f]{40}$') { throw 'Invalid Windows release tag' }
   $base = "https://github.com/$Repo/releases/download/$tag"
-  $manifest = Invoke-RestMethod "$base/windows-manifest.json" -UseBasicParsing -ErrorAction Stop
+  $manifestPath = Join-Path $stage 'windows-manifest.json'
+  Get-CkDownload "$base/windows-manifest.json" $manifestPath
+  $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
   if ($manifest.commit -cne $tag.Substring(8) -or $manifest.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or $manifest.target -cne 'x86_64-pc-windows-msvc') {
     throw 'Windows release manifest has invalid identity, target or checksum'
   }
@@ -70,7 +93,7 @@ function Install-CkRelease($stage, $bin, $stamp) {
   New-Item -ItemType Directory -Force -Path $stage -ErrorAction Stop | Out-Null
   $download = Join-Path $stage 'ck-windows-x86_64.exe'
   Write-Host "   downloading tested Windows worker ($($manifest.commit.Substring(0, 10)))"
-  Invoke-WebRequest "$base/ck-windows-x86_64.exe" -OutFile $download -UseBasicParsing -ErrorAction Stop
+  Get-CkDownload "$base/ck-windows-x86_64.exe" $download
   if ((Get-FileHash -LiteralPath $download -Algorithm SHA256 -ErrorAction Stop).Hash -ne $manifest.sha256) {
     throw 'Windows worker checksum mismatch; existing worker has not been stopped or replaced'
   }
@@ -252,22 +275,6 @@ if (-not (Get-NetFirewallRule -DisplayName 'Cluster Kit' -ErrorAction SilentlyCo
   New-NetFirewallRule -DisplayName 'Cluster Kit UDP' -Direction Inbound -Action Allow -Profile Any -Protocol UDP -LocalPort 7701 | Out-Null
   Fixed 'opened ports 7700-7703 (tcp) and 7701 (udp)'
 } else { Ok 'cluster ports are open' }
-$cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($cap -and $cap.State -ne 'Installed' -and $online) { Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
-if (Get-Service sshd -ErrorAction SilentlyContinue) {
-  Set-Service sshd -StartupType Automatic; if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd }
-  if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 | Out-Null }
-  if ((Get-Service sshd).Status -eq 'Running') { Ok 'ssh server running' } else { Bad 'ssh server would not start' }
-  if ($env:CK_ADMIN_KEY) {
-    $f = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-    $body = ($env:CK_ADMIN_KEY -split ' ')[1]
-    if (-not ((Test-Path $f) -and (Select-String -Path $f -SimpleMatch $body -Quiet))) {
-      Add-Content -Path $f -Value $env:CK_ADMIN_KEY
-      icacls $f /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
-      Fixed 'admin ssh key added'
-    } else { Ok 'admin ssh key allowed' }
-  }
-} else { Bad 'ssh server is not installed (Windows capability OpenSSH.Server)' }
 
 Step 'worker (starts at boot, restarts if it stops)'
 if (Test-Path $Bin) {
@@ -303,13 +310,42 @@ if (Test-Path $Bin) {
   if ($line -match 'connected to head') { Ok $line } else { Bad "not connected to a head ($line). Start the head; if broadcast is blocked set CK_HEAD_IP" }
 } else { Bad 'no ck.exe, so no worker' }
 
+Step 'optional SSH'
+# SSH is optional for cluster jobs; DISM can hang on managed Windows Update servers.
+# Only install on explicit request, in a bounded background job.
+if ($env:CK_INSTALL_SSH -eq '1' -and -not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+  $sshJob = Start-Job {
+    $ErrorActionPreference = 'Stop'
+    $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
+    if ($cap -and $cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
+  }
+  if (Wait-Job $sshJob -Timeout 120) {
+    Receive-Job $sshJob -ErrorAction Continue
+  } else { Stop-Job $sshJob; Write-Host '   SSH installation timed out; cluster worker setup continues' -ForegroundColor Yellow }
+  Remove-Job $sshJob -Force
+}
+if (Get-Service sshd -ErrorAction SilentlyContinue) {
+  Set-Service sshd -StartupType Automatic; if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd }
+  if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 22 | Out-Null }
+  if ((Get-Service sshd).Status -eq 'Running') { Ok 'ssh server running' } else { Bad 'ssh server would not start' }
+  if ($env:CK_ADMIN_KEY) {
+    $f = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+    $body = ($env:CK_ADMIN_KEY -split ' ')[1]
+    if (-not ((Test-Path $f) -and (Select-String -Path $f -SimpleMatch $body -Quiet))) {
+      Add-Content -Path $f -Value $env:CK_ADMIN_KEY
+      icacls $f /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+      Fixed 'admin ssh key added'
+    } else { Ok 'admin ssh key allowed' }
+  }
+} else { Write-Host '   optional SSH unavailable; cluster jobs do not require SSH (CK_INSTALL_SSH=1 to request installation)' -ForegroundColor Yellow }
+
 Step 'result'
 $ips = @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -ExpandProperty IPAddress -Unique)
 Write-Host ('=' * 72) -ForegroundColor Cyan
 Write-Host "   CLUSTER KIT | $env:COMPUTERNAME" -ForegroundColor Cyan
 foreach ($ip in $ips) {
   Write-Host "   IP: $ip" -ForegroundColor Cyan
-  Write-Host "   SSH: ssh $env:USERNAME@$ip"
+  if ((Get-Service sshd -ErrorAction SilentlyContinue).Status -eq 'Running') { Write-Host "   SSH: ssh $env:USERNAME@$ip" }
 }
 if (-not $ips.Count) { Bad 'no usable IPv4 address found' }
 Write-Host "   Build: $(if (Test-Path $Stamp) { (Get-Content $Stamp -Raw).Trim() } else { 'none' })"
@@ -323,7 +359,7 @@ else {
 try { [Console]::Beep(880, 200) } catch { }
 Stop-Transcript | Out-Null
 $workerLog = Join-Path $LogDir 'ck-worker.log'
-if ((Opt $env:CK_FOLLOW '1') -eq '1' -and (Test-Path $workerLog)) {
+if ((Opt $env:CK_FOLLOW '0') -eq '1' -and (Test-Path $workerLog)) {
   Write-Host 'Live worker log; Ctrl+C closes this view. The scheduled worker keeps running.' -ForegroundColor Cyan
   Get-Content -LiteralPath $workerLog -Tail 40 -Wait
 }
