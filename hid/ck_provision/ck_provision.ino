@@ -32,7 +32,7 @@
 USBHIDKeyboard Keyboard;
 const int MODE_PIN = 0;  // B (BOOT) button on the Xiao: 1 press or none = Windows (default), 2 presses = Ubuntu
 const char *URL_SH = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/" CK_PROVISION_BRANCH "/scripts/provision.sh";
-const char *URL_PS = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.ps1";
+const char *URL_PS = "https://cdn.ice.naravirtual.ai/cluster-kit/setup/windows-r2-v1.ps1";
 
 // Status light. Boards with an RGB LED get the colour; a plain LED (Xiao: GPIO21) lights for any colour.
 void led(uint8_t r, uint8_t g, uint8_t b) {
@@ -110,9 +110,10 @@ void setup() {
     delay(120);
     Keyboard.releaseAll();
     delay(1800);  // the Run box must be open before the text goes in
-    String cmd = String("powershell -NoExit -NoProfile -ExecutionPolicy RemoteSigned -Command \"$p=$env:TEMP+'/ck.ps1';Invoke-WebRequest -UseBasicParsing ") + URL_PS + " -OutFile $p -ErrorAction Stop;& $p\"";
+    String cmd = String("powershell -NoExit -NoProfile -ExecutionPolicy RemoteSigned -Command \"$p=$env:TEMP+'/ck.ps1';Invoke-WebRequest -UseBasicParsing ") + URL_PS + " -OutFile $p -TimeoutSec 45 -ErrorAction Stop;& $p\"";
     led(1, 0, 0);
-    typeText(cmd);
+    typeText(cmd, 8);
+    delay(100);
     // Run's Ctrl+Shift+Enter requests Administrator rights; UAC is approved by the person.
     Keyboard.press(KEY_LEFT_CTRL);
     Keyboard.press(KEY_LEFT_SHIFT);

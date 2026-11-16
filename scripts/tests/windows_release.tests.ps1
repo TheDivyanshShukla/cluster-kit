@@ -16,6 +16,7 @@ $root = Join-Path ([IO.Path]::GetTempPath()) ('ck release [test] ' + [guid]::New
 New-Item -ItemType Directory -Path $root | Out-Null
 try {
     $Repo = 'fixture/repository'
+    $ReleaseMirror = 'https://mirror.example.invalid/cluster-kit'
     $commit = '7dda27805f02f21e0fd80ccc747a398a557f67f9'
     $tag = 'windows-' + $commit
     $fixture = Join-Path $root 'fixture.exe'
@@ -32,7 +33,7 @@ try {
         param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec, $Headers, $ErrorAction)
         Assert ($TimeoutSec -eq 60) 'Download timeout missing'
         if ($Uri -like '*/windows-manifest.json') { $script:manifest | ConvertTo-Json | Set-Content -LiteralPath $OutFile; return }
-        Assert ($Uri -eq "https://github.com/$Repo/releases/download/$tag/ck-windows-x86_64.exe") 'Unexpected executable download URL'
+        Assert ($Uri -eq "$ReleaseMirror/releases/$tag/ck-windows-x86_64.exe") 'Unexpected executable download URL'
         $script:downloads++
         Copy-Item -LiteralPath $fixture -Destination $OutFile
     }
@@ -66,15 +67,18 @@ try {
     Write-Host 'PASS: mismatched release identity rejected'
 
     $script:attempts = 0
+    $script:downloadUrls = @()
     function Invoke-WebRequest {
         param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec, $Headers, $ErrorAction)
         $script:attempts++
+        $script:downloadUrls += $Uri
         if ($script:attempts -lt 3) { throw 'temporary connection failure' }
         Set-Content -LiteralPath $OutFile -Value 'recovered'
     }
     function Get-Command { param($Name, $ErrorAction) }
     function Start-Sleep { }
-    Get-CkDownload 'https://example.invalid/retry' (Join-Path $root 'retry')
+    Get-CkDownload 'https://example.invalid/retry' (Join-Path $root 'retry') 'https://github.com/fallback'
+    Assert ($script:downloadUrls[1] -eq 'https://github.com/fallback') 'Second attempt must try GitHub fallback'
     Assert ($script:attempts -eq 3) 'Transient failures were not retried'
     $script:attempts = 0
     function Invoke-WebRequest { $script:attempts++; throw '403 Forbidden' }

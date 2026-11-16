@@ -13,6 +13,7 @@ $ProgressPreference = 'SilentlyContinue'  # downloads are much faster without th
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 function Opt($v, $d) { if ($v) { $v } else { $d } }
 $Repo = 'TheDivyanshShukla/cluster-kit'
+$ReleaseMirror = 'https://cdn.ice.naravirtual.ai/cluster-kit'
 $Branch = Opt $env:CK_BRANCH 'main'
 $Fleet = Opt $env:CK_FLEET 'open'
 $Auth = Opt $env:CK_AUTH 'off'
@@ -55,16 +56,17 @@ function Stop-Ck {
 }
 
 # Bounded retries, including a native curl fallback for PowerShell proxy/connection failures.
-function Get-CkDownload($uri, $outFile) {
+function Get-CkDownload($uri, $outFile, $fallback = '') {
   for ($attempt = 1; $attempt -le 3; $attempt++) {
-    Write-Host "   download attempt $attempt/3: $uri"
+    $downloadUri = if ($fallback -and $attempt -eq 2) { $fallback } else { $uri }
+    Write-Host "   download attempt $attempt/3: $downloadUri"
     try {
-      Invoke-WebRequest $uri -OutFile $outFile -UseBasicParsing -TimeoutSec 60 -Headers @{'User-Agent'='Cluster-Kit-Setup'} -ErrorAction Stop
+      Invoke-WebRequest $downloadUri -OutFile $outFile -UseBasicParsing -TimeoutSec 60 -Headers @{'User-Agent'='Cluster-Kit-Setup'} -ErrorAction Stop
       return
     } catch {
       $reason = $_.Exception.Message
       if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
-        & curl.exe --fail --location --connect-timeout 15 --max-time 90 --output $outFile $uri
+        & curl.exe --fail --location --connect-timeout 15 --max-time 90 --output $outFile $downloadUri
         if ($LASTEXITCODE -eq 0) { return }
       }
       if ($attempt -eq 3) { throw "Download failed after 3 attempts ($uri): $reason" }
@@ -79,9 +81,10 @@ function Install-CkRelease($stage, $bin, $stamp) {
   # Pin a tested immutable release: shared lab IPs must not query the rate-limited API.
   $tag = Opt $env:CK_WINDOWS_RELEASE 'windows-7dda27805f02f21e0fd80ccc747a398a557f67f9'
   if ($tag -cnotmatch '^windows-[0-9a-f]{40}$') { throw 'Invalid Windows release tag' }
-  $base = "https://github.com/$Repo/releases/download/$tag"
+  $github = "https://github.com/$Repo/releases/download/$tag"
+  $base = if ($ReleaseMirror) { "$ReleaseMirror/releases/$tag" } else { $github }
   $manifestPath = Join-Path $stage 'windows-manifest.json'
-  Get-CkDownload "$base/windows-manifest.json" $manifestPath
+  Get-CkDownload "$base/windows-manifest.json" $manifestPath "$github/windows-manifest.json"
   $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
   if ($manifest.commit -cne $tag.Substring(8) -or $manifest.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or $manifest.target -cne 'x86_64-pc-windows-msvc') {
     throw 'Windows release manifest has invalid identity, target or checksum'
@@ -93,7 +96,7 @@ function Install-CkRelease($stage, $bin, $stamp) {
   New-Item -ItemType Directory -Force -Path $stage -ErrorAction Stop | Out-Null
   $download = Join-Path $stage 'ck-windows-x86_64.exe'
   Write-Host "   downloading tested Windows worker ($($manifest.commit.Substring(0, 10)))"
-  Get-CkDownload "$base/ck-windows-x86_64.exe" $download
+  Get-CkDownload "$base/ck-windows-x86_64.exe" $download "$github/ck-windows-x86_64.exe"
   if ((Get-FileHash -LiteralPath $download -Algorithm SHA256 -ErrorAction Stop).Hash -ne $manifest.sha256) {
     throw 'Windows worker checksum mismatch; existing worker has not been stopped or replaced'
   }

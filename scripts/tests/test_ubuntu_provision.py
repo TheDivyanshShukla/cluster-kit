@@ -361,7 +361,7 @@ int main() {
         command = sketch[begin:sketch.index('\n', begin)]
         cpp = self.base / 'windows-command.cpp'
         cpp.write_text('#include <string>\n#include <iostream>\nusing String = std::string;\n'
-                       'const char *URL_PS = "https://raw.githubusercontent.com/TheDivyanshShukla/cluster-kit/main/scripts/provision.ps1";\n'
+                       'const char *URL_PS = "https://cdn.ice.naravirtual.ai/cluster-kit/setup/windows-r2-v1.ps1";\n'
                        'int main() {\n' + command + '\nstd::cout << cmd;\n}\n')
         binary = self.base / 'windows-command'
         subprocess.run(['c++', str(cpp), '-o', str(binary)], check=True, capture_output=True)
